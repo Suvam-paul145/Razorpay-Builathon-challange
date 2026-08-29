@@ -1,0 +1,29 @@
+{
+  "project": "AI Revenue Recovery",
+  "levels": {
+    "0_governance": [
+      "00-governance"
+    ],
+    "1_discovery": [
+      "01-deep-research",
+      "02-critical-product-review"
+    ],
+    "2_design": [
+      "03-system-architecture",
+      "04-financial-workflow-safety",
+      "05-llm-engineering"
+    ],
+    "3_build": [
+      "09-backend-api-development",
+      "10-frontend-ux"
+    ],
+    "4_assurance": [
+      "06-security-review",
+      "07-testing-failure-analysis"
+    ],
+    "5_proof": [
+      "08-data-evaluation",
+      "11-demo-pitch"
+    ]
+  }
+}
