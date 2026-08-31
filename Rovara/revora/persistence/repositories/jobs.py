@@ -18,10 +18,11 @@ to another. Everything the worker does after that goes through
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from revora.persistence.models import Job, JobAttempt
@@ -31,11 +32,61 @@ from revora.persistence.repositories.session import for_update_skip_locked
 
 __all__ = ["JobAttemptRepository", "JobRepository", "claimable_merchant_ids"]
 
+_DEDUPE_INDEX_WHERE = text(f"state = '{PENDING_STATE}' AND dedupe_key IS NOT NULL")
+
 
 class JobRepository(MerchantScopedRepository[Job]):
     """Merchant-scoped queue reads and claims."""
 
     model = Job
+
+    def enqueue(
+        self,
+        merchant_id: uuid.UUID,
+        *,
+        kind: str,
+        payload: Mapping[str, object],
+        run_after: datetime,
+        dedupe_key: str | None = None,
+        case_id: uuid.UUID | None = None,
+        correlation_id: uuid.UUID | None = None,
+        max_attempts: int = 5,
+    ) -> uuid.UUID | None:
+        """Enqueue a job, returning its id, or ``None`` if a dedupe key collided.
+
+        Participates in the caller's transaction — it issues no commit — so a job is
+        enqueued atomically with the state change it follows (ADR-3). That is the
+        whole reason the queue is a table: a broker's ``apply_async`` cannot join the
+        transaction, so it can be lost after commit or fire against uncommitted
+        state.
+
+        ``dedupe_key`` collides against the partial unique index
+        ``one_pending_job_per_dedupe_key`` (pending rows only). ``None`` means the
+        periodic sweep already has a pending job with this key and this enqueue is a
+        no-op — which is exactly what stops two overlapping schedulers from
+        double-enqueuing a sweep. A job with no dedupe key is always inserted.
+
+        The payload carries ids and the correlation id only. A handler reads
+        everything else from the row an id points at, inside its own scoped
+        transaction — never from the payload, which is the least protected durable
+        object in the system (R17.C7).
+        """
+        statement = insert(Job).values(
+            merchant_id=merchant_id,
+            kind=kind,
+            payload=dict(payload),
+            state=PENDING_STATE,
+            run_after=run_after,
+            dedupe_key=dedupe_key,
+            case_id=case_id,
+            correlation_id=correlation_id,
+            max_attempts=max_attempts,
+        )
+        if dedupe_key is not None:
+            statement = statement.on_conflict_do_nothing(
+                index_elements=[Job.dedupe_key], index_where=_DEDUPE_INDEX_WHERE
+            )
+        return self.session.execute(statement.returning(Job.id)).scalar_one_or_none()
 
     def claim_pending(
         self,

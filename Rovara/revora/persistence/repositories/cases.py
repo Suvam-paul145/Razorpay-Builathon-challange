@@ -21,18 +21,32 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from revora.domain.enums import CaseState
+from revora.domain.payment_event import RECOVERY_SIGNAL_EVENTS, PaymentStatus
 from revora.domain.transitions import TERMINAL_STATES
-from revora.persistence.models import RecoveryCase, WebhookEvent
+from revora.persistence.models import DetectionVerdictRecord, RecoveryCase, WebhookEvent
+from revora.persistence.models.cases import TERMINAL_STATE_SQL
 from revora.persistence.repositories.base import MerchantScopedRepository
 from revora.persistence.repositories.session import for_update
 
-__all__ = ["RecoveryCaseRepository", "WebhookEventRepository"]
+__all__ = [
+    "DetectionVerdictRepository",
+    "RecoveryCaseRepository",
+    "WebhookEventRepository",
+]
 
 _TERMINAL_VALUES: tuple[str, ...] = tuple(sorted(state.value for state in TERMINAL_STATES))
+
+#: The predicate of the ``one_open_case_per_payment`` partial unique index, rendered
+#: from the same declaration the index is generated from. ``ON CONFLICT`` against a
+#: partial index must repeat its ``WHERE`` clause, and repeating it from a second
+#: source is how the two drift.
+_OPEN_CASE_INDEX_WHERE = text(f"state NOT IN ({TERMINAL_STATE_SQL})")
+_CAPTURED_STATUS = PaymentStatus.CAPTURED.value
+_RECOVERY_SIGNAL_VALUES: tuple[str, ...] = tuple(sorted(RECOVERY_SIGNAL_EVENTS))
 
 
 class WebhookEventRepository(MerchantScopedRepository[WebhookEvent]):
@@ -76,6 +90,56 @@ class WebhookEventRepository(MerchantScopedRepository[WebhookEvent]):
         )
         return self.session.execute(statement).scalar_one_or_none()
 
+    def newest_provider_created_at_for_payment(
+        self,
+        merchant_id: uuid.UUID,
+        provider_payment_id: str,
+        *,
+        exclude_event_id: uuid.UUID | None = None,
+    ) -> datetime | None:
+        """The newest provider timestamp already seen for a payment, if any.
+
+        The out-of-order guard (task 9.5) compares an arriving event against this. The
+        current event is excluded so an event is never judged stale against itself.
+        Matched on the canonical ``provider_payment_id`` because that identifier is
+        stable across a payment's events, whereas ``provider_event_id`` is per
+        delivery.
+        """
+        statement = self.scoped(merchant_id).where(
+            WebhookEvent.canonical["provider_payment_id"].astext == provider_payment_id,
+            WebhookEvent.provider_created_at.is_not(None),
+        )
+        if exclude_event_id is not None:
+            statement = statement.where(WebhookEvent.id != exclude_event_id)
+        statement = statement.order_by(WebhookEvent.provider_created_at.desc()).limit(1)
+        row = self.session.execute(statement).scalars().first()
+        return None if row is None else row.provider_created_at
+
+    def has_capture_signal_for_payment(
+        self, merchant_id: uuid.UUID, provider_payment_id: str
+    ) -> bool:
+        """Whether any persisted event for a payment signals it was captured.
+
+        The detection rule "no verified captured state for the payment id" (R1) reads
+        persisted rows rather than calling the provider. A prior ``payment.captured``,
+        ``order.paid`` or ``payment_link.paid``, or any event whose canonical status
+        is ``captured``, means a late ``payment.failed`` must not open a case for a
+        payment that already succeeded. Matched on the canonical ``provider_payment_id``
+        because that is the stable identifier across a payment's events.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                WebhookEvent.canonical["provider_payment_id"].astext == provider_payment_id,
+                or_(
+                    WebhookEvent.canonical["status"].astext == _CAPTURED_STATUS,
+                    WebhookEvent.event_name.in_(_RECOVERY_SIGNAL_VALUES),
+                ),
+            )
+            .limit(1)
+        )
+        return self.session.execute(statement).first() is not None
+
     def list_by_correlation_id(
         self, merchant_id: uuid.UUID, correlation_id: uuid.UUID
     ) -> Sequence[WebhookEvent]:
@@ -101,6 +165,33 @@ class RecoveryCaseRepository(MerchantScopedRepository[RecoveryCase]):
         """
         statement = self._open(merchant_id).where(
             RecoveryCase.provider_payment_id == provider_payment_id
+        )
+        return self.session.execute(statement).scalar_one_or_none()
+
+    def insert_if_absent(
+        self, merchant_id: uuid.UUID, *, values: dict[str, object]
+    ) -> uuid.UUID | None:
+        """Open a case, returning its id, or ``None`` if one is already open.
+
+        A single ``INSERT ... ON CONFLICT DO NOTHING`` against the
+        ``one_open_case_per_payment`` partial unique index. ``None`` is not an error:
+        it means an open case already exists for this payment, and the caller's
+        correct response is to attach the event to it and leave its ``payment_amount``
+        and detection timestamp unchanged (R1.C10). Two concurrent detections of one
+        failed payment reach this together and exactly one wins — the guarantee is the
+        index, not a check-then-insert that would race.
+
+        A *terminal* case on the same payment does not conflict: the partial index
+        does not cover it, so a payment that failed again gets a genuinely new case.
+        """
+        statement = (
+            insert(RecoveryCase)
+            .values(merchant_id=merchant_id, **values)
+            .on_conflict_do_nothing(
+                index_elements=[RecoveryCase.merchant_id, RecoveryCase.provider_payment_id],
+                index_where=_OPEN_CASE_INDEX_WHERE,
+            )
+            .returning(RecoveryCase.id)
         )
         return self.session.execute(statement).scalar_one_or_none()
 
@@ -199,3 +290,22 @@ class RecoveryCaseRepository(MerchantScopedRepository[RecoveryCase]):
             RecoveryCase.merchant_id == merchant_id,
             RecoveryCase.state.notin_(_TERMINAL_VALUES),
         )
+
+
+class DetectionVerdictRepository(MerchantScopedRepository[DetectionVerdictRecord]):
+    """The one-verdict-per-event record, and the idempotency guard around it."""
+
+    model = DetectionVerdictRecord
+
+    def exists_for_event(self, merchant_id: uuid.UUID, webhook_event_id: uuid.UUID) -> bool:
+        """Whether this event already has a verdict.
+
+        Detection is enqueued as a job and a job can be retried, so the service reads
+        this before doing anything. The definitive guard is the
+        ``uq_detection_verdict_webhook_event_id`` unique constraint — this only lets
+        a retry return early cleanly instead of hitting it.
+        """
+        statement = self.scoped(merchant_id).where(
+            DetectionVerdictRecord.webhook_event_id == webhook_event_id
+        )
+        return self.session.execute(statement).first() is not None
