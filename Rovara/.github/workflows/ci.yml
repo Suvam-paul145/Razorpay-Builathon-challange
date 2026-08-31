@@ -1,0 +1,94 @@
+# CI mirrors the design's Cost Tiers and the "What CI Enforces Beyond Tests" list.
+#
+# The gates that are structural claims, not behaviour, run first and cheapest:
+# import contracts (the mechanism behind policy AI-isolation), the no-float check,
+# strict typing on the money-bearing modules, and lint. Then the pure and model
+# test tiers on every push. The Postgres tier runs against a service container
+# because the concurrency and constraint claims cannot be tested any other way.
+#
+# The full synthetic harness (the null-scenario build gate) is a nightly job and is
+# added when task 27 exists; it has no code to run yet, so it is intentionally absent.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: Rovara
+
+jobs:
+  static:
+    name: static checks (lint, types, contracts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,ml]"
+      - name: Ruff
+        run: ruff check revora tests scripts
+      - name: Ruff format check
+        run: ruff format --check revora tests scripts
+      - name: Import contracts
+        # The structural half of Property 2: policy cannot import the AI layer.
+        run: lint-imports
+      - name: No float in currency modules
+        run: python scripts/check_no_float.py
+      - name: Strict typing on money-bearing modules
+        run: mypy -p revora.domain -p revora.policy -p revora.optimizer
+
+  test-fast:
+    name: pure + model test tiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,ml]"
+      - name: Pure and model tiers
+        run: pytest -m "pure or model" -q
+
+  test-postgres:
+    name: postgres test tier
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: revora
+          POSTGRES_PASSWORD: revora_ci
+          POSTGRES_DB: revora
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U revora -d revora"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,ml]"
+      - name: Postgres tier
+        # The service container is the test database directly, so testcontainers is
+        # not needed on CI. The pg fixtures read REVORA_TEST_DATABASE_URL when set.
+        env:
+          REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
+        run: pytest -m pg -q

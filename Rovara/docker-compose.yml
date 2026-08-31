@@ -1,0 +1,56 @@
+# Local development only. Not a deployment topology.
+#
+# Brings up a Postgres for local work and both process roles from the one image, so
+# a developer can see the API and the worker running against the same database the
+# way production will. The automated test suite does NOT use this — the pg test tier
+# spins up its own throwaway Postgres via testcontainers, so tests stay isolated
+# from whatever state a dev session left behind.
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: revora
+      POSTGRES_PASSWORD: revora_local_dev
+      POSTGRES_DB: revora
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # The app and worker must not start migrating or polling before Postgres can
+      # accept connections, or the first transaction fails on an empty schema.
+      test: ["CMD-SHELL", "pg_isready -U revora -d revora"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - revora_pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    environment:
+      REVORA_ROLE: api
+      REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_local_dev@db:5432/revora
+    env_file:
+      # Secrets (Razorpay keys, encryption keys, webhook secrets) come from .env,
+      # which is gitignored. The DB URL above deliberately overrides any value in
+      # .env so local compose always points at the compose database.
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    environment:
+      REVORA_ROLE: worker
+      REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_local_dev@db:5432/revora
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  revora_pgdata:

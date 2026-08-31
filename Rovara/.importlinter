@@ -1,0 +1,97 @@
+; Import contracts are the mechanism behind Property 2 (policy decisions are
+; independent of AI output) and the structural AI-isolation claim in design.md.
+; They are written before the modules have content because they cannot be
+; retrofitted cheaply. A violation fails CI and fails pytest.
+
+[importlinter]
+root_package = revora
+include_external_packages = True
+
+[importlinter:contract:policy-isolation]
+name = Policy engine may not reach AI, estimation, optimizer or memory
+type = forbidden
+source_modules =
+    revora.policy
+forbidden_modules =
+    revora.reasoning
+    revora.estimation
+    revora.optimizer
+    revora.memory
+    revora.providers
+    revora.execution
+    revora.synthetic
+    revora.persistence
+
+[importlinter:contract:domain-purity]
+name = Domain imports only the standard library
+type = forbidden
+source_modules =
+    revora.domain
+forbidden_modules =
+    revora.platform
+    revora.persistence
+    revora.ingestion
+    revora.detection
+    revora.cases
+    revora.diagnosis
+    revora.reasoning
+    revora.estimation
+    revora.optimizer
+    revora.policy
+    revora.execution
+    revora.providers
+    revora.outcome
+    revora.experiment
+    revora.metrics
+    revora.audit
+    revora.memory
+    revora.synthetic
+    revora.jobs
+    revora.api
+    pydantic
+    sqlalchemy
+    httpx
+    fastapi
+    numpy
+    sklearn
+    cryptography
+
+[importlinter:contract:optimizer-isolation]
+name = Value optimizer may not reach AI output or the provider
+type = forbidden
+source_modules =
+    revora.optimizer
+forbidden_modules =
+    revora.reasoning
+    revora.providers
+    revora.synthetic
+
+[importlinter:contract:synthetic-containment]
+name = Synthetic data is unreachable from the decision and action path
+type = forbidden
+source_modules =
+    revora.domain
+    revora.policy
+    revora.optimizer
+    revora.execution
+    revora.providers
+    revora.cases
+    revora.detection
+    revora.ingestion
+forbidden_modules =
+    revora.synthetic
+
+[importlinter:contract:layering]
+name = Feature modules depend downward only
+type = layers
+layers =
+    revora.api | revora.jobs
+    revora.experiment | revora.metrics | revora.outcome | revora.execution
+    revora.optimizer | revora.policy
+    revora.estimation | revora.diagnosis | revora.memory
+    revora.detection | revora.ingestion
+    revora.cases
+    revora.audit
+    revora.persistence
+    revora.platform
+    revora.domain
