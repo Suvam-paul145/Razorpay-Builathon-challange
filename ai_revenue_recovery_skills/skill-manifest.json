@@ -24,6 +24,13 @@
     "5_proof": [
       "08-data-evaluation",
       "11-demo-pitch"
+    ],
+    "6_orchestration": [
+      "12-multi-agent-orchestration",
+      "13-parallel-workstream-design",
+      "14-agent-contracts-and-ownership",
+      "15-integration-quality-gates",
+      "16-cross-agent-review"
     ]
   }
 }
