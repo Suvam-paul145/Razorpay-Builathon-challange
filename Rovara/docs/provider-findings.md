@@ -32,6 +32,58 @@ hand-made payments is honest evidence about very little.
 
 ---
 
+## 0. Fetch All Payments request shape — **RESOLVED FROM DOCUMENTATION**
+
+**Design tag:** the design verifies the *capability* (list payments in a window) but not
+the wire shape — no parameter names, no bounds, no response envelope.
+**Resolved by:** the official documentation, not a spike.
+**Source:** <https://razorpay.com/docs/api/payments/fetch-all-payments/>
+**Blocks:** task 22, the detection-gap backfill.
+
+This one needed no live call, because the endpoint is read-only and fully documented. It is
+recorded here anyway, since the backfill's correctness depends on it and a future reader
+should not have to guess which parts were checked.
+
+### What the documentation states
+
+`GET /v1/payments`
+
+| Parameter | Type | Documented constraint |
+| --- | --- | --- |
+| `from` | integer | UNIX seconds. Must be between `946684800` and `4765046400`; outside this the API returns 400 `from must be between 946684800 and 4765046400` |
+| `to` | integer | UNIX seconds |
+| `count` | integer | Default 10, **maximum 100**, minimum 1. 400 on `count=0` and on `count>100` |
+| `skip` | integer | Minimum 0. 400 on a negative value |
+
+Response envelope:
+
+```json
+{ "entity": "collection", "count": 2, "items": [ { "id": "pay_...", "entity": "payment", ... } ] }
+```
+
+Item fields match the `PaymentEntity` already parsed on the `fetch_payment` path — `id`,
+`status` (`created` / `authorized` / `captured` / `refunded` / `failed`), `captured`,
+`amount`, `amount_refunded`, `currency`, `order_id`, `method`, and the `error_*` group.
+
+### What this decides in code
+
+| Decision | Where | Why |
+| --- | --- | --- |
+| The 100-record page cap is a named constant and the backfill pages with `skip` | `MAX_PAYMENTS_PAGE_SIZE` in `providers/razorpay.py` | A backfill that asked for a whole lookback window at once would silently ignore everything past the first 100 records — the same detection gap it exists to close |
+| `from` / `to` / `count` / `skip` bounds are checked client-side **before** the call | `RazorpayClient.list_payments` | A bound violation earns a documented 400, which classifies as a *definitive* `ClientError`. A careless caller reads a definitive failure on a list endpoint as "the window held nothing". Refusing locally keeps a caller's arithmetic mistake distinguishable from the provider's verdict — and "nothing" is precisely the answer that leaves a gap open |
+| `parse_payment_list` requires a mapping with `items`, refusing a bare array | `providers/classification.py` | Stricter than `extract_entity_list`, deliberately. That function tolerates an unnamed array because the payment-*links* envelope is unverified; this envelope is documented, so anything else is drift. A bare `[]` under a permissive reading reports an empty window |
+| The fake enforces the identical bounds | `tests/fakes/razorpay.py` | A fake more permissive than the real client would let the backfill ship with a window the provider rejects, and a rejected backfill is an undetected outage |
+
+### Still unverified about this endpoint
+
+| Item | Why it is not resolved here |
+| --- | --- |
+| Whether `from` / `to` filter on `created_at` or on last update | Not stated. The backfill therefore overlaps its windows rather than assuming an exact partition, so a payment near a boundary is seen twice — harmless, because the dedup index makes re-ingestion idempotent — instead of risking being seen never |
+| Whether the window is inclusive at both ends | Same mitigation: overlapping windows make it moot |
+| Ordering of `items` | The backfill does not depend on order; it ingests every failed payment it sees and lets the dedup index settle repeats |
+
+---
+
 ## 1. Payment-link listing freshness after create
 
 **Spike:** `scripts/spikes/link_listing_freshness.py`
