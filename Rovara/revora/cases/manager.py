@@ -54,7 +54,12 @@ try:  # pragma: no cover - typing convenience only
 except ImportError:  # pragma: no cover
     sessionmaker = object  # type: ignore[assignment,misc]
 
-__all__ = ["TransitionOutcome", "TransitionResult", "apply_transition"]
+__all__ = [
+    "TransitionOutcome",
+    "TransitionResult",
+    "apply_locked_transition",
+    "apply_transition",
+]
 
 _logger = get_logger(__name__)
 
@@ -158,79 +163,24 @@ def apply_transition(
             _logger.warning("transition on missing case", case_id=str(case_id))
             return TransitionResult(TransitionOutcome.NOT_FOUND, case_id)
 
-        current = CaseState(case.state)
-        rule = rule_for(current, target_state)
-
-        if case.version != expected_version:
-            rejection = _Rejection(
-                TransitionOutcome.VERSION_CONFLICT,
-                VERSION_CONFLICT,
-                current,
-                target_state,
-                reason,
-                case.version,
-            )
-        elif rule is None:
-            rejection = _Rejection(
-                TransitionOutcome.ILLEGAL,
-                ILLEGAL_TRANSITION,
-                current,
-                target_state,
-                reason,
-                case.version,
-            )
-        elif rule.requires_verified_capture and not verified_capture:
-            rejection = _Rejection(
-                TransitionOutcome.CAPTURE_NOT_VERIFIED,
-                ILLEGAL_TRANSITION,
-                current,
-                target_state,
-                "reconciliation to RECOVERED requires a verified captured read",
-                case.version,
-            )
-        else:
-            # Apply. Counters move here, never down.
-            effects = rule.effects
-            case.executed_action_count += effects.executed_action_delta
-            if (
-                effects.customer_message_delta_if_visible
-                and action is not None
-                and is_customer_visible(action)
-            ):
-                case.customer_message_count += effects.customer_message_delta_if_visible
-            case.decision_cycle_count += effects.decision_cycle_delta
-            moment = now()
-            if effects.sets_last_outbound_at:
-                case.last_outbound_at = moment
-            case.state = target_state.value
-            case.version += 1
-            if terminal_reason is not None and is_terminal(target_state):
-                case.terminal_reason = terminal_reason.value
-
-            AuditWriter(session, **writer_kwargs).write_for_case(
-                merchant_id,
-                case_id,
-                AuditEntry(
-                    event_type=STATE_TRANSITION,
-                    actor=actor,
-                    previous_state=current.value,
-                    new_state=target_state.value,
-                    action=action.value if action is not None else None,
-                    decision={"reason": reason},
-                ),
-                correlation_id=correlation_id,
-                occurred_at=moment,
-            )
-            new_version = case.version
-            if on_success is not None:
-                on_success(session, case)
-            return TransitionResult(
-                TransitionOutcome.APPLIED,
-                case_id,
-                previous_state=current,
-                new_state=target_state,
-                version=new_version,
-            )
+        result, rejection = apply_locked_transition(
+            session,
+            merchant_id,
+            case,
+            expected_version=expected_version,
+            target_state=target_state,
+            reason=reason,
+            actor=actor,
+            action=action,
+            terminal_reason=terminal_reason,
+            verified_capture=verified_capture,
+            correlation_id=correlation_id,
+            on_success=on_success,
+            disclosure_length=disclosure_length,
+            max_field_length=max_field_length,
+        )
+        if rejection is None:
+            return result
 
     # Phase two: record the rejection, now that the attempt has committed and the
     # row lock is released. Its own transaction, so it survives a rollback of the
@@ -254,6 +204,155 @@ def apply_transition(
         previous_state=rejection.current,
         new_state=None,
         version=rejection.observed_version,
+    )
+
+
+def apply_locked_transition(
+    session: Session,
+    merchant_id: uuid.UUID,
+    case: RecoveryCase,
+    *,
+    expected_version: int,
+    target_state: CaseState,
+    reason: str,
+    actor: str,
+    action: CandidateAction | None = None,
+    terminal_reason: TerminalReason | None = None,
+    verified_capture: bool = False,
+    correlation_id: uuid.UUID | None = None,
+    on_success: OnSuccess | None = None,
+    disclosure_length: int | None = None,
+    max_field_length: int | None = None,
+) -> tuple[TransitionResult, _Rejection | None]:
+    """Apply one transition to a case row the caller already holds locked.
+
+    The same rules as :func:`apply_transition`, minus the transaction management. Split
+    out because the execution engine cannot use the wrapper: it needs the intent insert,
+    this transition, the decision consumption and the audit record to reach disk in *one*
+    transaction, and ``apply_transition`` opens its own — which, since it takes the case
+    row ``FOR UPDATE`` on a fresh connection, would deadlock against the caller that is
+    already holding that row.
+
+    Extracted rather than reimplemented in the engine. The transition table, the counter
+    effects and the ``verified_capture`` gate are the mechanism behind the customer-contact
+    bounds, and a second copy of them in the module that talks to the payment provider is
+    the copy that would drift.
+
+    Args:
+        session: an open, tenant-bound transaction.
+        case: the case row, already held ``FOR UPDATE`` by this transaction. The caller
+            holding the lock is what makes the audit sequence allocation safe.
+
+    Returns:
+        ``(result, None)`` when applied. ``(result, rejection)`` when refused, where the
+        rejection carries the event type and reason for a caller that wants to record it.
+        The rejection is *not* written here, because a refusal is recorded in its own
+        transaction after this one releases the row lock — and a caller that is about to
+        roll back may want to record something else entirely.
+    """
+    writer_kwargs = _writer_kwargs(disclosure_length, max_field_length)
+    case_id = case.id
+    current = CaseState(case.state)
+    rule = rule_for(current, target_state)
+
+    if case.version != expected_version:
+        return (
+            TransitionResult(
+                TransitionOutcome.VERSION_CONFLICT,
+                case_id,
+                previous_state=current,
+                version=case.version,
+            ),
+            _Rejection(
+                TransitionOutcome.VERSION_CONFLICT,
+                VERSION_CONFLICT,
+                current,
+                target_state,
+                reason,
+                case.version,
+            ),
+        )
+
+    if rule is None:
+        return (
+            TransitionResult(
+                TransitionOutcome.ILLEGAL,
+                case_id,
+                previous_state=current,
+                version=case.version,
+            ),
+            _Rejection(
+                TransitionOutcome.ILLEGAL,
+                ILLEGAL_TRANSITION,
+                current,
+                target_state,
+                reason,
+                case.version,
+            ),
+        )
+
+    if rule.requires_verified_capture and not verified_capture:
+        return (
+            TransitionResult(
+                TransitionOutcome.CAPTURE_NOT_VERIFIED,
+                case_id,
+                previous_state=current,
+                version=case.version,
+            ),
+            _Rejection(
+                TransitionOutcome.CAPTURE_NOT_VERIFIED,
+                ILLEGAL_TRANSITION,
+                current,
+                target_state,
+                "reconciliation to RECOVERED requires a verified captured read",
+                case.version,
+            ),
+        )
+
+    # Apply. Counters move here, never down.
+    effects = rule.effects
+    case.executed_action_count += effects.executed_action_delta
+    if (
+        effects.customer_message_delta_if_visible
+        and action is not None
+        and is_customer_visible(action)
+    ):
+        case.customer_message_count += effects.customer_message_delta_if_visible
+    case.decision_cycle_count += effects.decision_cycle_delta
+    moment = now()
+    if effects.sets_last_outbound_at:
+        case.last_outbound_at = moment
+    case.state = target_state.value
+    case.version += 1
+    if terminal_reason is not None and is_terminal(target_state):
+        case.terminal_reason = terminal_reason.value
+
+    AuditWriter(session, **writer_kwargs).write_for_case(
+        merchant_id,
+        case_id,
+        AuditEntry(
+            event_type=STATE_TRANSITION,
+            actor=actor,
+            previous_state=current.value,
+            new_state=target_state.value,
+            action=action.value if action is not None else None,
+            decision={"reason": reason},
+        ),
+        correlation_id=correlation_id,
+        occurred_at=moment,
+    )
+    new_version = case.version
+    if on_success is not None:
+        on_success(session, case)
+    return (
+        TransitionResult(
+            TransitionOutcome.APPLIED,
+            case_id,
+            previous_state=current,
+            new_state=target_state,
+            version=new_version,
+        ),
+        None,
     )
 
 

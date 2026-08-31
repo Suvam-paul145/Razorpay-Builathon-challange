@@ -54,6 +54,7 @@ from revora.domain.enums import (
     PolicyVerdict,
     RiskCause,
 )
+from revora.domain.keys import execution_key
 from revora.domain.transitions import is_terminal
 from revora.policy.input import PolicyInput
 from revora.policy.rules import RuleSet
@@ -123,14 +124,20 @@ def idempotency_key_for(
     same, so a fetch-by-reference answers "does this effect already exist" authoritatively
     instead of a second call creating a second payment link.
 
-    Minted at decision time rather than at execution time so that the key is recorded on
-    the authorization itself. Capped at 40 characters, which is the provider's documented
-    ``reference_id`` limit; the case id's hex is truncated to keep the whole key inside it
-    while remaining collision-safe within one case (the action and ordinal disambiguate,
-    and the merchant scope is implicit in the case).
+    Minted here, at decision time rather than at execution time, so the key is recorded on
+    the authorization itself — an approval that did not name the effect it authorizes could
+    not be matched to that effect afterwards.
+
+    The construction is :func:`revora.domain.keys.execution_key`, and it is deliberately
+    *not* duplicated here. The same string is also the provider's ``reference_id``, built
+    by ``revora.providers.payment_link``; this package cannot import that one (the
+    ``policy-isolation`` contract forbids it, because the engine's purity is what makes
+    Property 2 checkable), so the shared construction lives in ``domain`` where both can
+    reach it. Two copies of this format would let the ``Idempotency_Key`` and the
+    ``reference_id`` drift apart, and the failure that produces is a duplicate payment
+    link that nothing detects.
     """
-    short = str(case_id).replace("-", "")[:20]
-    return f"{short}-{action.value[:12]}-{attempt_ordinal}"[:40]
+    return execution_key(case_id, action.value, attempt_ordinal)
 
 
 def evaluate(candidate: PolicyInput, rules: RuleSet) -> PolicyEvaluation:

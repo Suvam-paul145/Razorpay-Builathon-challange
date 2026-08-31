@@ -48,8 +48,9 @@ from revora.domain.actions import (
 )
 from revora.domain.enums import RiskCause
 from revora.domain.money import Minor
+from revora.platform.config import Configuration
 
-__all__ = ["DEFAULT_RULES_VERSION", "RuleSet", "default_rule_set"]
+__all__ = ["DEFAULT_RULES_VERSION", "RuleSet", "default_rule_set", "rule_set_from_config"]
 
 _NO_MONEY: Final[Minor] = Minor(0)
 _NO_PROBABILITY: Final[Decimal] = Decimal("0")
@@ -189,4 +190,30 @@ def default_rule_set(
         eligibility=MappingProxyType(dict(ELIGIBILITY)),
         min_net_value_threshold=min_net_value_threshold,
         min_incremental_probability=min_incremental_probability,
+    )
+
+
+def rule_set_from_config(config: Configuration) -> RuleSet:
+    """Lift the configured bounds into a versioned rule set.
+
+    The boundary between configuration and the pure engine. Every bound the twelve checks
+    compare against is read once, here, and packed into an immutable value — which is what
+    lets ``evaluate`` stay pure and what makes the recorded ``rule_set_version`` a faithful
+    description of what actually ran.
+
+    Lives here rather than with the decision pipeline because the execution engine
+    re-requests policy evaluation at the moment of acting, and the layering contract puts
+    ``revora.jobs`` above ``revora.execution`` — so a rule set built in the pipeline is
+    unreachable from the component that most needs to rebuild it. Since a re-evaluation
+    against a *differently constructed* rule set would silently be answering a different
+    question, the construction belongs next to the rules themselves.
+    """
+    return default_rule_set(
+        max_recovery_attempts=config.MAX_RECOVERY_ATTEMPTS,
+        max_customer_messages=config.MAX_CUSTOMER_MESSAGES,
+        cooldown_interval=config.COOLDOWN_INTERVAL,
+        policy_decision_validity=config.POLICY_DECISION_VALIDITY,
+        risk_reason_codes=config.RISK_REASON_CODES,
+        min_net_value_threshold=config.MIN_NET_VALUE_THRESHOLD,
+        min_incremental_probability=config.MIN_INCREMENTAL_PROBABILITY,
     )

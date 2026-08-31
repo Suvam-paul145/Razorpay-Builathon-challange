@@ -28,6 +28,9 @@ CURRENCY_BEARING: tuple[str, ...] = (
     "revora/optimizer",
     "revora/metrics",
     "revora/estimation",
+    "revora/execution",
+    "revora/outcome",
+    "revora/providers/payment_link.py",
 )
 """Paths where a float is a bug rather than a style question.
 
@@ -35,6 +38,15 @@ CURRENCY_BEARING: tuple[str, ...] = (
 may use floats internally, but anything it hands to the optimizer is a ``Decimal``
 probability or an integer cost. If that ever stops being true, the exclusion
 belongs in this list with a reason next to it, not as a silent local override.
+
+``execution``, ``outcome`` and ``providers/payment_link.py`` were added when Phase 3
+landed, and the omission is worth recording because a probe caught it rather than a
+reader: the guard reported "12 files clean" while the three modules that actually
+send an amount to a payment provider and record a recovered amount were outside its
+scope. These are the last places a float could do damage — ``payment_link`` puts the
+figure on the wire, ``execution`` decides what to send, and ``outcome`` decides what
+to report as recovered — so a rounding error here is a customer charged the wrong
+amount or a revenue figure that does not match its own rows.
 """
 
 ALLOWED_SUBSTRINGS: tuple[str, ...] = (

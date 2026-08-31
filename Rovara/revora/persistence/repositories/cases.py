@@ -140,6 +140,28 @@ class WebhookEventRepository(MerchantScopedRepository[WebhookEvent]):
         )
         return self.session.execute(statement).first() is not None
 
+    def has_event_for_payment(
+        self, merchant_id: uuid.UUID, provider_payment_id: str
+    ) -> bool:
+        """Whether any event at all is already persisted for a payment.
+
+        The detection-gap backfill's pre-check. It cannot use the dedup index for this: the
+        index keys on ``provider_event_id``, and a payment delivered by webhook carries the
+        *provider's* event id while a backfill would mint a synthetic one — so the index sees
+        two different keys for one payment and correctly inserts both. Matching on the
+        canonical ``provider_payment_id`` instead is what makes backfilling an
+        already-known payment a no-op.
+
+        Matched on the canonical column rather than a dedicated one because that identifier
+        is stable across every event a payment produces, whichever route each arrived by.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(WebhookEvent.canonical["provider_payment_id"].astext == provider_payment_id)
+            .limit(1)
+        )
+        return self.session.execute(statement).first() is not None
+
     def list_by_correlation_id(
         self, merchant_id: uuid.UUID, correlation_id: uuid.UUID
     ) -> Sequence[WebhookEvent]:
