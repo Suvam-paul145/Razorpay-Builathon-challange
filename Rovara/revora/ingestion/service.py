@@ -64,7 +64,13 @@ except ImportError:  # pragma: no cover
     Session = object  # type: ignore[assignment,misc]
     sessionmaker = object  # type: ignore[assignment,misc]
 
-__all__ = ["DETECTION_JOB_KIND", "IngestionOutcome", "IngestionResult", "ingest_webhook"]
+__all__ = [
+    "DETECTION_JOB_KIND",
+    "IngestionOutcome",
+    "IngestionResult",
+    "ingest_webhook",
+    "persist_and_enqueue",
+]
 
 _logger = get_logger(__name__)
 
@@ -258,7 +264,7 @@ def ingest_webhook(
             )
         return IngestionResult(IngestionOutcome.QUARANTINED)
 
-    return _persist_and_enqueue(
+    return persist_and_enqueue(
         merchant_id,
         provider_event_id=provider_event_id,
         body=body,
@@ -270,7 +276,7 @@ def ingest_webhook(
     )
 
 
-def _persist_and_enqueue(
+def persist_and_enqueue(
     merchant_id: uuid.UUID,
     *,
     provider_event_id: str,
@@ -281,6 +287,17 @@ def _persist_and_enqueue(
     moment: datetime,
     factory: sessionmaker[Session] | None,
 ) -> IngestionResult:
+    """Encrypt, deduplicate, persist and enqueue detection for one canonical event.
+
+    Public because it has two callers, and the second one is the reason the first is safe
+    to trust. :func:`ingest_webhook` reaches here only after HMAC verification; the
+    detection-gap backfill in :mod:`revora.ingestion.backfill` reaches here after an
+    authenticated provider read. Both have established provenance, by different means, and
+    both must land on the *same* dedup index and the *same* detection path — because
+    ``UNIQUE (merchant_id, provider_event_id)`` is what guarantees one case per payment no
+    matter which route the event took. A backfill with its own persistence path would be a
+    second way to create a case, and therefore a way to create two.
+    """
     canonical = canonical_result.canonical
     try:
         encrypted = payload_cipher().encrypt(body)
