@@ -26,6 +26,7 @@ from revora.persistence.repositories.audit import AUDIT_MUTATION_REJECTED
 from revora.platform.secrets import CREDENTIAL_UNAVAILABLE
 
 __all__ = [
+    "ACTION_CANCELLED_PAYMENT_RECEIVED",
     "ALL_EVENT_TYPES",
     "AUDIT_MUTATION_REJECTED",
     "AUDIT_WRITE_FAILED",
@@ -40,27 +41,43 @@ __all__ = [
     "CASE_DETECTED",
     "CASE_ESCALATED",
     "CASE_EXPIRED",
+    "CONCURRENT_EXECUTION_PREVENTED",
     "CREDENTIAL_UNAVAILABLE",
     "DECISION_CYCLE_LIMIT_REACHED",
+    "DELAYED_RECOVERY_RECONCILED",
     "DETECTION_VERDICT_RECORDED",
     "DIAGNOSIS_ALREADY_RECORDED",
     "DIAGNOSIS_RECORDED",
     "DIAGNOSIS_SUBSTITUTED_TO_UNKNOWN",
     "DIAGNOSIS_UNMAPPED_REASON",
     "DUPLICATE_EVENT_DISCARDED",
+    "DUPLICATE_RECOVERY_EVENT_DISCARDED",
     "EVENT_ATTACHED_TO_CASE",
     "EVENT_INGESTED",
     "EVENT_QUARANTINED",
+    "EXECUTION_ABANDONED_POLICY",
+    "EXECUTION_INTENT_PROMOTED",
+    "EXECUTION_REFUSED",
+    "EXECUTION_RESULT_UNKNOWN",
+    "EXECUTION_RESULT_UNVERIFIABLE",
+    "EXECUTION_STARTED",
     "ILLEGAL_TRANSITION",
     "INVALID_ESTIMATE",
     "JOB_DEAD_LETTERED",
     "MALFORMED_EVENT",
     "MERCHANT_INTEGRATION_FAULT",
     "OUT_OF_ORDER_EVENT",
+    "PARTIAL_PAYMENT_OBSERVED",
+    "PAYMENT_STATE_CONFLICT",
+    "PAYMENT_STATE_READ_RECORDED",
+    "PAYMENT_STATE_READ_UNAVAILABLE",
+    "PAYMENT_STATE_UNVERIFIABLE",
     "POLICY_DECISION_RECORDED",
+    "POST_PAYMENT_ACTION",
     "RATE_LIMIT_APPLIED",
     "RECOMMENDATION_RECORDED",
     "RECONCILED_TO_RECOVERED",
+    "RECOVERY_RECORDED",
     "SCHEDULE_REJECTED",
     "SIGNATURE_REJECTED",
     "STATE_TRANSITION",
@@ -264,6 +281,153 @@ RECONCILED_TO_RECOVERED: Final = "RECONCILED_TO_RECOVERED"
 verified captured read. At most once per case."""
 
 # ---------------------------------------------------------------------------
+# Execution — R9
+# ---------------------------------------------------------------------------
+
+CONCURRENT_EXECUTION_PREVENTED: Final = "CONCURRENT_EXECUTION_PREVENTED"
+"""``pg_try_advisory_xact_lock`` refused: another worker is already executing this
+case. Abandoned with zero external calls (R9.C13).
+
+Written **unattached**, unlike every other execution record. Allocating a case-attached
+sequence number requires the case row under ``FOR UPDATE``, and the worker that holds
+the advisory lock is holding that row — so recording "someone else is executing" against
+the case would block on the very worker being reported. The case id travels in the
+record's fields instead."""
+
+EXECUTION_ABANDONED_POLICY: Final = "EXECUTION_ABANDONED_POLICY"
+"""Policy was re-evaluated against freshly reloaded state and did not return
+``APPROVED``. Zero external calls.
+
+The re-evaluation is not a formality. The approval that scheduled this action was
+computed against state that is now older than the job's time in the queue, and anything
+could have happened in between — the customer may have paid, the window may have closed,
+the merchant may have withdrawn consent. This record is the evidence that authority was
+re-checked at the moment of acting rather than inherited from the past."""
+
+EXECUTION_REFUSED: Final = "EXECUTION_REFUSED"
+"""A structural precondition on the approval failed: absent, mismatched, expired or
+already consumed. Names the failed check. State and both counters unchanged (R9.C12).
+
+Distinct from ``EXECUTION_ABANDONED_POLICY`` on purpose. That one means the policy engine
+said no, which is the system working. This one means the request did not carry a valid
+authorization at all, which is either a bug or an attempt to replay one — and those
+should not be searchable under the same name."""
+
+EXECUTION_STARTED: Final = "EXECUTION_STARTED"
+"""The intent is durable as ``ATTEMPTED``, the case is ``EXECUTING``, the decision is
+consumed and the counters have moved — all committed **before** the provider call.
+
+The ordering is the whole guarantee. After this record exists, a crash cannot lose the
+knowledge that a call may have gone out; before it exists, no call can have gone out.
+There is no window where the two disagree."""
+
+EXECUTION_RESULT_UNKNOWN: Final = "EXECUTION_RESULT_UNKNOWN"
+"""The call returned a timeout, a 5xx or an unparseable body, so whether the effect
+exists is not known. The intent is ``UNCERTAIN`` and **every external call for that case
+stops** until reconciliation resolves it (R9.C9).
+
+Also written when a stale ``ATTEMPTED`` intent is promoted, because the two situations are
+the same fact arriving by different routes: nobody knows whether the provider acted."""
+
+EXECUTION_INTENT_PROMOTED: Final = "EXECUTION_INTENT_PROMOTED"
+"""An ``ATTEMPTED`` intent older than ``PROVIDER_CALL_TIMEOUT`` was moved to
+``UNCERTAIN``, by the sweeper or by the startup sequence.
+
+``ATTEMPTED`` past the call timeout means the worker that owned it died mid-call. The
+promotion routes it to reconciliation, which reads, and never to a retry, which would
+call again. Counters are left exactly as they were until the resolution persists."""
+
+EXECUTION_RESULT_UNVERIFIABLE: Final = "EXECUTION_RESULT_UNVERIFIABLE"
+"""Reconciliation used its whole attempt bound without establishing whether the effect
+exists. The case escalates to a human and **no further external call is ever issued for
+it** (R9.C17).
+
+The deliberately unsatisfying ending. The alternative — guess, and act on the guess — is
+either a duplicate payment request or a case abandoned while a live link is outstanding.
+An escalation a human can pick up is worse for the metrics and better for the customer."""
+
+# ---------------------------------------------------------------------------
+# Outcome — R10
+# ---------------------------------------------------------------------------
+
+PAYMENT_STATE_READ_RECORDED: Final = "PAYMENT_STATE_READ_RECORDED"
+"""One authoritative ``fetch_payment`` was performed and persisted. Carries the status,
+whether it was captured, and the amounts.
+
+Written for every read, including the ones that change nothing. A recovery figure is only
+defensible if the reads behind it are enumerable, and a read that happened without a record
+is a number nobody can check."""
+
+PAYMENT_STATE_READ_UNAVAILABLE: Final = "PAYMENT_STATE_READ_UNAVAILABLE"
+"""The authoritative read could not be completed — a 5xx, a timeout, or a body that would
+not parse. No recovery is declared and no state moves.
+
+The *count of consecutive* records of this type for a case is the attempt counter behind
+R10.C7. Derived from the audit log rather than from a column, because the log is
+append-only and gap-free per case, so the count cannot be lost or quietly reset — and
+because a failed read produces no ``payment_state_read`` row to count instead."""
+
+RECOVERY_RECORDED: Final = "RECOVERY_RECORDED"
+"""A recovery was declared and counted, naming the read that verified it.
+
+The only event type that may accompany money being reported as recovered. Its presence
+without a ``verified_by_read_id`` is impossible by schema, which is the point."""
+
+PAYMENT_STATE_CONFLICT: Final = "PAYMENT_STATE_CONFLICT"
+"""Two or more signals disagree about a payment's state. The case holds in
+``WAITING_FOR_OUTCOME``, no recovery is declared, and the read is retried.
+
+Names both signals. Most of these resolve themselves on the next read — the design marks
+read-lag after a webhook ``[EVIDENCE INSUFFICIENT]``, so a webhook arriving before the read
+catches up looks exactly like a conflict."""
+
+PAYMENT_STATE_UNVERIFIABLE: Final = "PAYMENT_STATE_UNVERIFIABLE"
+"""The read attempt bound was exhausted without establishing the payment's state. The case
+escalates, the last known state and the unresolved amount are preserved, and **no recovery
+is declared** (R10.C7).
+
+Declaring recovery here would be the single most damaging thing this system could do: it
+would report money as recovered on the strength of a webhook nobody could corroborate."""
+
+PARTIAL_PAYMENT_OBSERVED: Final = "PARTIAL_PAYMENT_OBSERVED"
+"""A partial payment was observed. **Not recovery** (R10.C11); the case holds.
+
+``accept_partial`` is false on every link Revora creates precisely so this is rare, but a
+customer can still part-pay through another channel. Counting a partial as recovery would
+inflate every figure by the difference."""
+
+DUPLICATE_RECOVERY_EVENT_DISCARDED: Final = "DUPLICATE_RECOVERY_EVENT_DISCARDED"
+"""A success signal arrived for a case already ``RECOVERED``. Discarded: no read is issued,
+nothing changes, and the amount is not counted again (R10.C13).
+
+Verified at-least-once delivery makes duplicate success signals ordinary, not exceptional.
+The record exists so the discard is visible rather than silent."""
+
+ACTION_CANCELLED_PAYMENT_RECEIVED: Final = "ACTION_CANCELLED_PAYMENT_RECEIVED"
+"""A confirmed payment arrived while an action was scheduled and **no** intent existed, so
+the action was cancelled before any external call. Counters unchanged (R10.C4).
+
+The good outcome of the race: the customer paid on their own and we noticed in time to stay
+quiet."""
+
+POST_PAYMENT_ACTION: Final = "POST_PAYMENT_ACTION"
+"""An intent already existed when the payment was confirmed, so the action went out after
+the customer had already paid. Recorded ``is_post_payment`` and counted in
+``unnecessary_action_count`` (R10.C5).
+
+Deliberately visible. This is the cost of Revora being wrong — a customer contacted for
+money they had already sent — and a system that hid it would be optimising its own numbers
+rather than the merchant's outcome."""
+
+DELAYED_RECOVERY_RECONCILED: Final = "DELAYED_RECOVERY_RECONCILED"
+"""A case that had already ended for another reason turned out to have been paid. One
+reconciliation transition to ``RECOVERED``, naming the superseded terminal state, with the
+amount counted exactly once (R10.C14).
+
+Permitted only against a verified capture, and at most once per case — the transition rule
+carries both conditions, so this cannot become a second count of the same money."""
+
+# ---------------------------------------------------------------------------
 # Audit integrity and infrastructure — R11, R16
 # ---------------------------------------------------------------------------
 
@@ -314,6 +478,23 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         DECISION_CYCLE_LIMIT_REACHED,
         WITHHELD_ACTION_DISCARDED,
         RECONCILED_TO_RECOVERED,
+        CONCURRENT_EXECUTION_PREVENTED,
+        EXECUTION_ABANDONED_POLICY,
+        EXECUTION_REFUSED,
+        EXECUTION_STARTED,
+        EXECUTION_RESULT_UNKNOWN,
+        EXECUTION_INTENT_PROMOTED,
+        EXECUTION_RESULT_UNVERIFIABLE,
+        PAYMENT_STATE_READ_RECORDED,
+        PAYMENT_STATE_READ_UNAVAILABLE,
+        RECOVERY_RECORDED,
+        PAYMENT_STATE_CONFLICT,
+        PAYMENT_STATE_UNVERIFIABLE,
+        PARTIAL_PAYMENT_OBSERVED,
+        DUPLICATE_RECOVERY_EVENT_DISCARDED,
+        ACTION_CANCELLED_PAYMENT_RECEIVED,
+        POST_PAYMENT_ACTION,
+        DELAYED_RECOVERY_RECONCILED,
         AUDIT_WRITE_FAILED,
         JOB_DEAD_LETTERED,
         AUDIT_MUTATION_REJECTED,

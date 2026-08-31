@@ -64,7 +64,7 @@ from revora.platform.config import Configuration
 from revora.platform.logging import get_logger
 from revora.policy.engine import PolicyEvaluation, evaluate, idempotency_key_for
 from revora.policy.input import PolicyInput
-from revora.policy.rules import RuleSet, default_rule_set
+from revora.policy.rules import rule_set_from_config
 
 __all__ = [
     "CANDIDATE_JOB_KIND",
@@ -315,25 +315,6 @@ def handle_policy(
 # ---------------------------------------------------------------------------
 # Policy evaluation: the row-reading and row-writing around the pure engine
 # ---------------------------------------------------------------------------
-
-
-def rule_set_from_config(config: Configuration) -> RuleSet:
-    """Lift the configured bounds into a versioned rule set.
-
-    The boundary between configuration and the pure engine. Every bound the twelve checks
-    compare against is read once, here, and packed into an immutable value — which is what
-    lets ``evaluate`` stay pure and what makes the recorded ``rule_set_version`` a faithful
-    description of what actually ran.
-    """
-    return default_rule_set(
-        max_recovery_attempts=config.MAX_RECOVERY_ATTEMPTS,
-        max_customer_messages=config.MAX_CUSTOMER_MESSAGES,
-        cooldown_interval=config.COOLDOWN_INTERVAL,
-        policy_decision_validity=config.POLICY_DECISION_VALIDITY,
-        risk_reason_codes=config.RISK_REASON_CODES,
-        min_net_value_threshold=config.MIN_NET_VALUE_THRESHOLD,
-        min_incremental_probability=config.MIN_INCREMENTAL_PROBABILITY,
-    )
 
 
 @dataclass(frozen=True, slots=True)

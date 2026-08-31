@@ -27,6 +27,8 @@ from typing import Final
 
 from revora.cases.sweeper import sweep_expired_cases
 from revora.detection.service import run_detection
+from revora.execution.reconcile import reconcile_intents
+from revora.ingestion.backfill import backfill_detection_gap
 from revora.ingestion.service import DETECTION_JOB_KIND
 from revora.jobs.pipeline import (
     CANDIDATE_JOB_KIND,
@@ -47,11 +49,13 @@ from revora.jobs.scheduler import (
     LIFECYCLE_EVALUATION_KIND,
     PAYMENT_STATE_RECONCILIATION_KIND,
 )
+from revora.outcome.monitor import sweep_payment_state
 from revora.persistence.repositories.config import ConfigurationRepository
 from revora.persistence.repositories.jobs import claimable_merchant_ids
 from revora.persistence.repositories.session import tenant_transaction, transaction
 from revora.platform.clock import now
 from revora.platform.logging import correlation_context, get_logger
+from revora.providers.razorpay import PaymentProviderClient, RazorpayClient
 
 try:  # pragma: no cover - typing convenience only
     from sqlalchemy.orm import Session as _Session
@@ -143,8 +147,73 @@ def _handle_not_yet_implemented(claimed: ClaimedJob) -> None:
     _logger.debug("sweep handler not yet implemented; completing as no-op", kind=claimed.kind)
 
 
-def build_registry() -> dict[str, Handler]:
-    """The kind-to-handler map. One place, so a job kind cannot be dispatched two ways."""
+_provider_lock = threading.Lock()
+_shared_provider: PaymentProviderClient | None = None
+
+
+def shared_provider() -> PaymentProviderClient:
+    """The process-wide Razorpay client, built on first use.
+
+    One client per process, not one per job. The connection pool is the whole point — a client
+    per sweep would pay a TLS handshake on every reconciliation read — and the client is
+    documented thread-safe because its only mutable state is a semaphore.
+
+    Built lazily rather than at import so a worker that never reaches a provider-touching
+    sweep never resolves a credential, and so importing this module in a test does not require
+    Razorpay keys to exist.
+    """
+    global _shared_provider
+    with _provider_lock:
+        if _shared_provider is None:
+            _shared_provider = RazorpayClient()
+        return _shared_provider
+
+
+def _handle_execution_reconciliation(
+    claimed: ClaimedJob, provider: PaymentProviderClient
+) -> None:
+    """Resolve unresolved execution intents by reading. Never repeats a create."""
+    reconcile_intents(
+        claimed.merchant_id, provider=provider, correlation_id=claimed.correlation_id
+    )
+
+
+def _handle_payment_state_reconciliation(
+    claimed: ClaimedJob, provider: PaymentProviderClient
+) -> None:
+    """Re-read every case waiting on an outcome, so none depends on a webhook arriving."""
+    sweep_payment_state(
+        claimed.merchant_id, provider=provider, correlation_id=claimed.correlation_id
+    )
+
+
+def _handle_detection_gap_backfill(
+    claimed: ClaimedJob, provider: PaymentProviderClient
+) -> None:
+    """List provider payments and ingest failures no webhook delivered.
+
+    The job that stops a disabled webhook from being invisible. Its report is logged at
+    warning level when it finds anything, because a non-zero count means detection is running
+    on this job alone.
+    """
+    backfill_detection_gap(
+        claimed.merchant_id, provider=provider, correlation_id=claimed.correlation_id
+    )
+
+
+def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str, Handler]:
+    """The kind-to-handler map. One place, so a job kind cannot be dispatched two ways.
+
+    ``provider`` is injectable so a test can substitute the scriptable fake, and defaults to
+    the shared client resolved on first use. The three provider-touching sweeps close over it
+    here rather than reaching for a global inside the handler, which keeps "what can make an
+    external call" answerable by reading this function.
+    """
+    client = provider
+
+    def _resolve() -> PaymentProviderClient:
+        return client if client is not None else shared_provider()
+
     return {
         DETECTION_JOB_KIND: _handle_detection,
         DIAGNOSIS_JOB_KIND: _handle_diagnosis,
@@ -152,9 +221,15 @@ def build_registry() -> dict[str, Handler]:
         OPTIMIZER_JOB_KIND: _handle_optimization,
         POLICY_JOB_KIND: _handle_policy,
         LIFECYCLE_EVALUATION_KIND: _handle_lifecycle,
-        EXECUTION_RECONCILIATION_KIND: _handle_not_yet_implemented,
-        PAYMENT_STATE_RECONCILIATION_KIND: _handle_not_yet_implemented,
-        DETECTION_GAP_BACKFILL_KIND: _handle_not_yet_implemented,
+        EXECUTION_RECONCILIATION_KIND: lambda claimed: _handle_execution_reconciliation(
+            claimed, _resolve()
+        ),
+        PAYMENT_STATE_RECONCILIATION_KIND: lambda claimed: (
+            _handle_payment_state_reconciliation(claimed, _resolve())
+        ),
+        DETECTION_GAP_BACKFILL_KIND: lambda claimed: _handle_detection_gap_backfill(
+            claimed, _resolve()
+        ),
         CALIBRATION_REPORT_KIND: _handle_not_yet_implemented,
     }
 
