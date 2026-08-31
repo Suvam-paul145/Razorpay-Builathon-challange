@@ -29,6 +29,7 @@ from sqlalchemy import Engine, text
 
 from revora.cases.sweeper import sweep_expired_cases
 from revora.domain.enums import CaseState, DetectionVerdict, TerminalReason
+from revora.domain.transitions import NON_TERMINAL_STATES
 from revora.ingestion.service import IngestionOutcome, ingest_webhook
 from revora.jobs.worker import run_once
 from revora.persistence.repositories.engine import (
@@ -47,6 +48,10 @@ _PROVIDER_EVENT_ID = "evt_checkpoint_0001"
 _PAYMENT_ID = "pay_checkpoint_0001"
 
 _WEBHOOK_SECRET_PREFIX = "REVORA_WEBHOOK_SECRETS_"
+
+_NON_TERMINAL_VALUES = frozenset(state.value for state in NON_TERMINAL_STATES)
+"""Read from the state machine rather than listed, so this test and the partial unique index
+cannot disagree about what "open" means."""
 
 
 class _Resolver:
@@ -169,6 +174,17 @@ def _case_row(engine: Engine, merchant_id: uuid.UUID) -> tuple[uuid.UUID, str, s
     return uuid.UUID(str(row[0])), str(row[1]), (None if row[2] is None else str(row[2]))
 
 
+def _assert_gap_free(engine: Engine, case_id: uuid.UUID) -> None:
+    """The per-case audit sequence is 1..n with no holes and no duplicates.
+
+    The phase-1 invariant (R11.C4, P12), stated independently of how many records happen to
+    exist. Gap-freeness is the property; the count is an implementation detail of whatever
+    ran.
+    """
+    seqs = _audit_seqs(engine, case_id)
+    assert seqs == list(range(1, len(seqs) + 1)), f"audit sequence has a gap: {seqs}"
+
+
 def _audit_seqs(engine: Engine, case_id: uuid.UUID) -> list[int]:
     with engine.connect() as connection:
         rows = connection.execute(
@@ -248,12 +264,20 @@ def test_ingest_to_lifecycle_end_to_end(
     assert case_count == 1
 
     case_id, state, _ = _case_row(engine, merchant_id)
-    assert state == CaseState.DETECTED.value
+    assert state in _NON_TERMINAL_VALUES, (
+        "detection must leave the case open; which non-terminal state it reaches depends on "
+        "how far the decision pipeline ran, which is phase 2's concern"
+    )
 
-    # The audit trail for the case is gap-free: one record so far, at seq 1.
-    assert _audit_seqs(engine, case_id) == [1]
+    # The audit trail is gap-free. Deliberately *not* asserted as exactly ``[1]``: since the
+    # decision pipeline was wired in, detection enqueues diagnosis and the worker drains the
+    # whole chain in one pass, so the trail legitimately holds a record per step. The phase-1
+    # guarantee is that the per-case sequence has no holes and no duplicates whatever runs —
+    # pinning the count would make this test fail every time a downstream step is added,
+    # which would be the test asserting the pipeline's length rather than the invariant.
+    _assert_gap_free(engine, case_id)
 
-    # Re-running the worker is a no-op: the detection job is done and detection is
+    # Re-running the worker is a no-op for detection: the job is done and detection is
     # idempotent, so no second verdict and no second case appear.
     run_once("checkpoint-worker")
     assert (
@@ -264,6 +288,7 @@ def test_ingest_to_lifecycle_end_to_end(
         )
         == 1
     )
+    assert verdict_count == 1
 
     # The window elapses while the worker is idle; a lifecycle sweep expires the case.
     manual_clock.advance(config.RECOVERY_WINDOW_DURATION + timedelta(minutes=1))
@@ -274,5 +299,7 @@ def test_ingest_to_lifecycle_end_to_end(
     assert terminal_state == CaseState.EXPIRED.value
     assert terminal_reason == TerminalReason.RECOVERY_WINDOW_ELAPSED.value
 
-    # Still gap-free after the terminal transition: detection at 1, expiry at 2.
-    assert _audit_seqs(engine, case_id) == [1, 2]
+    # Still gap-free after the terminal transition, and the expiry is the newest record.
+    seqs = _audit_seqs(engine, case_id)
+    _assert_gap_free(engine, case_id)
+    assert len(seqs) >= 2, "the expiry adds a record to whatever the pipeline wrote"

@@ -28,6 +28,17 @@ from typing import Final
 from revora.cases.sweeper import sweep_expired_cases
 from revora.detection.service import run_detection
 from revora.ingestion.service import DETECTION_JOB_KIND
+from revora.jobs.pipeline import (
+    CANDIDATE_JOB_KIND,
+    DIAGNOSIS_JOB_KIND,
+    OPTIMIZER_JOB_KIND,
+    POLICY_JOB_KIND,
+    enqueue_after_detection,
+    handle_candidates,
+    handle_diagnosis,
+    handle_optimizer,
+    handle_policy,
+)
 from revora.jobs.queue import ClaimedJob, claim_one, complete, fail
 from revora.jobs.scheduler import (
     CALIBRATION_REPORT_KIND,
@@ -61,17 +72,61 @@ picks up any it did not reach."""
 
 
 def _handle_detection(claimed: ClaimedJob) -> None:
-    """Classify one persisted event and open or attach a case, in one transaction."""
+    """Classify one persisted event, open or attach a case, start the decision pipeline.
+
+    The verdict, the case and the diagnosis job all commit together. A case that exists with
+    no job to advance it would sit until the lifecycle sweeper expired it, which is a silent
+    way to lose a recovery — so the enqueue shares the transaction that created the case.
+    """
     webhook_event_id = uuid.UUID(str(claimed.payload["webhook_event_id"]))
     with tenant_transaction(claimed.merchant_id) as session:
         config = ConfigurationRepository(session).load(claimed.merchant_id)
-        run_detection(
+        result = run_detection(
             session,
             claimed.merchant_id,
             webhook_event_id,
             config,
             correlation_id=claimed.correlation_id,
         )
+        enqueue_after_detection(
+            session,
+            claimed.merchant_id,
+            result,
+            correlation_id=claimed.correlation_id,
+        )
+
+
+def _case_id_of(claimed: ClaimedJob) -> uuid.UUID:
+    """The case id a pipeline job carries. Payloads hold ids and nothing else."""
+    return uuid.UUID(str(claimed.payload["case_id"]))
+
+
+def _handle_diagnosis(claimed: ClaimedJob) -> None:
+    """Determine the risk cause and advance to ``DIAGNOSED``."""
+    handle_diagnosis(
+        claimed.merchant_id, _case_id_of(claimed), correlation_id=claimed.correlation_id
+    )
+
+
+def _handle_estimation(claimed: ClaimedJob) -> None:
+    """Estimate the baseline and price every candidate action."""
+    handle_candidates(
+        claimed.merchant_id, _case_id_of(claimed), correlation_id=claimed.correlation_id
+    )
+
+
+def _handle_optimization(claimed: ClaimedJob) -> None:
+    """Rank the candidates and record the recommendation."""
+    handle_optimizer(
+        claimed.merchant_id, _case_id_of(claimed), correlation_id=claimed.correlation_id
+    )
+
+
+def _handle_policy(claimed: ClaimedJob) -> None:
+    """Evaluate the twelve checks and persist the decision."""
+    handle_policy(
+        claimed.merchant_id, _case_id_of(claimed), correlation_id=claimed.correlation_id
+    )
 
 
 def _handle_lifecycle(claimed: ClaimedJob) -> None:
@@ -92,6 +147,10 @@ def build_registry() -> dict[str, Handler]:
     """The kind-to-handler map. One place, so a job kind cannot be dispatched two ways."""
     return {
         DETECTION_JOB_KIND: _handle_detection,
+        DIAGNOSIS_JOB_KIND: _handle_diagnosis,
+        CANDIDATE_JOB_KIND: _handle_estimation,
+        OPTIMIZER_JOB_KIND: _handle_optimization,
+        POLICY_JOB_KIND: _handle_policy,
         LIFECYCLE_EVALUATION_KIND: _handle_lifecycle,
         EXECUTION_RECONCILIATION_KIND: _handle_not_yet_implemented,
         PAYMENT_STATE_RECONCILIATION_KIND: _handle_not_yet_implemented,
