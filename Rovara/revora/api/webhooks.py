@@ -18,6 +18,12 @@ because an unauthenticated endpoint must not be an oracle for which slugs exist.
 **Answer, don't work.** No detection runs on this path. The handler does at most one
 insert and one enqueue, then returns inside the acknowledgement budget; everything
 after that is a job.
+
+**The blocking work runs in a worker thread.** The handler has to be ``async def`` — it awaits
+``request.body()`` to get the exact bytes — but everything after that is synchronous SQLAlchemy, and
+doing it inline holds the event loop for the whole of three round trips. Under any concurrency that
+makes the acknowledgement budget a function of how many other webhooks are in flight, which is the
+one thing ``INGEST_ACK_TIMEOUT`` is supposed not to be. ``run_in_threadpool`` moves it off the loop.
 """
 
 from __future__ import annotations
@@ -25,11 +31,13 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Request, Response
+from starlette.concurrency import run_in_threadpool
 
 from revora.ingestion import (
     EVENT_ID_HEADER,
     SIGNATURE_HEADER,
     IngestionOutcome,
+    IngestionResult,
     ingest_webhook,
 )
 from revora.persistence.repositories.config import ConfigurationRepository
@@ -53,31 +61,53 @@ async def razorpay_webhook(merchant_slug: str, request: Request) -> Response:
 
     with correlation_context() as correlation:
         correlation_id = uuid.UUID(correlation)
-
-        # Resolve the merchant in its own transaction. Extract the id and slug while
-        # the row is live — the commit expires ORM attributes, so nothing downstream
-        # touches a detached instance.
-        with transaction() as session:
-            merchant = merchant_by_slug(session, merchant_slug)
-            if merchant is None:
-                _logger.warning("webhook for unknown merchant slug")
-                return Response(status_code=401)
-            merchant_id = merchant.id
-            resolved_slug = merchant.slug
-
-        with tenant_transaction(merchant_id) as session:
-            config = ConfigurationRepository(session).load(merchant_id)
-
-        result = ingest_webhook(
-            merchant_id,
-            resolved_slug,
-            body=body,
-            provided_signature=signature,
-            provider_event_id=event_id,
-            config=config,
-            correlation_id=correlation_id,
+        result = await run_in_threadpool(
+            _ingest, merchant_slug, body, signature, event_id, correlation_id
         )
 
+    if result is None:
+        return Response(status_code=401)
     if result.outcome is IngestionOutcome.ACCEPTED:
         _logger.info("webhook accepted", webhook_event_id=str(result.webhook_event_id))
     return Response(status_code=result.http_status)
+
+
+def _ingest(
+    merchant_slug: str,
+    body: bytes,
+    signature: str | None,
+    event_id: str | None,
+    correlation_id: uuid.UUID,
+) -> IngestionResult | None:
+    """The blocking half: resolve the merchant, load configuration, ingest.
+
+    ``None`` means the slug is unknown, which the caller answers 401 — the same answer as a bad
+    signature, because an unauthenticated endpoint must not be an oracle for which slugs exist.
+
+    Runs in a worker thread. Every call inside is synchronous, and the correlation id is passed
+    explicitly rather than read from the ambient context because a thread does not inherit the
+    caller's ``ContextVar`` binding — a detail that would otherwise show up as audit records with
+    unrelated correlation ids, which is the hardest kind of trail bug to notice.
+    """
+    # Resolve the merchant in its own transaction. Extract the id and slug while the row is live —
+    # the commit expires ORM attributes, so nothing downstream touches a detached instance.
+    with transaction() as session:
+        merchant = merchant_by_slug(session, merchant_slug)
+        if merchant is None:
+            _logger.warning("webhook for unknown merchant slug")
+            return None
+        merchant_id = merchant.id
+        resolved_slug = str(merchant.slug)
+
+    with tenant_transaction(merchant_id) as session:
+        config = ConfigurationRepository(session).load(merchant_id)
+
+    return ingest_webhook(
+        merchant_id,
+        resolved_slug,
+        body=body,
+        provided_signature=signature,
+        provider_event_id=event_id,
+        config=config,
+        correlation_id=correlation_id,
+    )
