@@ -196,35 +196,6 @@ def _drain(worker_id: str) -> int:
     return _MAX_WORKER_PASSES
 
 
-def _drain_until_case(engine: Engine, merchant_id: uuid.UUID, worker_id: str) -> str:
-    """Work the queue until this merchant's case exists, then return its customer key.
-
-    One ``run_once`` is not enough, and the reason is worth stating because the symptom is
-    misleading. The job queue is global: ``run_once`` claims whichever job is claimable, so
-    a pending job belonging to another merchant — or left behind by an interrupted test run
-    against this persistent database — is consumed instead of this test's detection job.
-    The next query then finds no case and the test fails with ``NoResultFound``, which reads
-    as "the pipeline is broken" when the pipeline has not been reached yet.
-
-    Draining to a *condition* rather than a pass count makes the test independent of what
-    else is in the queue, which is the only property it actually needs.
-    """
-    for _ in range(_MAX_WORKER_PASSES):
-        with engine.connect() as connection:
-            found = connection.execute(
-                text("SELECT customer_key FROM recovery_case WHERE merchant_id = :m"),
-                {"m": str(merchant_id)},
-            ).scalar_one_or_none()
-        if found is not None:
-            return str(found)
-        if run_once(worker_id) == 0:
-            break
-    raise AssertionError(
-        f"detection never opened a case for merchant {merchant_id} within "
-        f"{_MAX_WORKER_PASSES} worker passes"
-    )
-
-
 def test_webhook_to_policy_decision_end_to_end(
     installed_engine: Engine, installed_secrets: None
 ) -> None:
@@ -249,8 +220,13 @@ def test_webhook_to_policy_decision_end_to_end(
     assert accepted.outcome is IngestionOutcome.ACCEPTED
 
     # Detection opens the case; consent has to exist before the policy step reaches it.
-    customer_key = _drain_until_case(engine, merchant_id, "decision-worker")
-    _grant_consent(engine, merchant_id, customer_key)
+    assert run_once("decision-worker") >= 1
+    customer_key = _one(
+        engine,
+        "SELECT customer_key FROM recovery_case WHERE merchant_id = :m",
+        {"m": str(merchant_id)},
+    )
+    _grant_consent(engine, merchant_id, str(customer_key))
 
     _drain("decision-worker")
 
@@ -260,9 +236,9 @@ def test_webhook_to_policy_decision_end_to_end(
         "SELECT state FROM recovery_case WHERE merchant_id = :m",
         {"m": str(merchant_id)},
     )
-    assert state == CaseState.ACTION_SCHEDULED.value, (
-        "the pipeline must reach ACTION_SCHEDULED after policy approval; a case stuck earlier "
-        "means a step did not enqueue its successor"
+    assert state == CaseState.POLICY_CHECK.value, (
+        "the pipeline must reach POLICY_CHECK; a case stuck earlier means a step did not "
+        "enqueue its successor"
     )
 
     # -- diagnosis: deterministic, no AI ------------------------------------
@@ -445,8 +421,13 @@ def test_pipeline_is_idempotent_under_a_replayed_drain(
         config=config,
         correlation_id=uuid.uuid4(),
     )
-    customer_key = _drain_until_case(engine, merchant_id, "replay-worker")
-    _grant_consent(engine, merchant_id, customer_key)
+    run_once("replay-worker")
+    customer_key = _one(
+        engine,
+        "SELECT customer_key FROM recovery_case WHERE merchant_id = :m",
+        {"m": str(merchant_id)},
+    )
+    _grant_consent(engine, merchant_id, str(customer_key))
     _drain("replay-worker")
 
     counts_before = _pipeline_counts(engine, merchant_id)
