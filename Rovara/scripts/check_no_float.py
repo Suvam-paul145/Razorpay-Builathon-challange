@@ -25,12 +25,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CURRENCY_BEARING: tuple[str, ...] = (
     "revora/domain/money.py",
     "revora/domain/probability.py",
+    "revora/domain/segments.py",
     "revora/optimizer",
     "revora/metrics",
     "revora/estimation",
     "revora/execution",
     "revora/outcome",
     "revora/providers/payment_link.py",
+    "revora/experiment",
+    "revora/memory",
+    "revora/synthetic",
+    "revora/api",
 )
 """Paths where a float is a bug rather than a style question.
 
@@ -47,6 +52,36 @@ scope. These are the last places a float could do damage — ``payment_link`` pu
 figure on the wire, ``execution`` decides what to send, and ``outcome`` decides what
 to report as recovered — so a rounding error here is a customer charged the wrong
 amount or a revenue figure that does not match its own rows.
+
+``domain/segments.py`` is listed explicitly rather than by directory, and that is the
+lesson from moving it: it was covered while it sat under ``revora/estimation`` and
+silently stopped being covered the moment it moved to ``revora/domain``, where only two
+named files are checked. The count in this script's own output is what caught it — 23
+files became 22 with no file deleted. A path-based guard needs its paths re-checked
+whenever code moves, so the count is worth reading rather than skimming.
+
+``experiment`` and ``memory`` joined in Phase 4. ``experiment`` is arguably the most
+important entry in this list: it computes the lift interval, and a float there could
+narrow an interval enough to exclude zero — which is the single condition that unlocks
+a claim of incremental revenue. A rounding error elsewhere misplaces a paisa; one here
+manufactures a causal claim.
+
+``synthetic`` joined with it, and its inclusion is about a subtler failure than a wrong
+amount. The generator compares an integer draw against an integer probability to decide
+which side of its own ground truth a case falls on. In floating point, a case sitting
+exactly on a boundary could be recorded as recovering while the true-lift arithmetic
+counted it as not — so the answer sheet and the world it describes would disagree, and
+every measured-versus-true comparison built on them would be quietly wrong in a
+direction nobody could predict. The design sketched ``numpy.random.default_rng`` here;
+this entry is what keeps the integer implementation from drifting back toward it.
+
+``api`` joined with the dashboard, and it is the last place a currency figure is touched
+before it leaves the system. ``api/rendering.py`` divides minor units by a power of ten
+to produce the string a merchant reads, and that is exactly the operation somebody would
+"simplify" into ``value / 100``. The integer division and ``divmod`` there are what make
+the rendered string agree with the stored integer beside it; a float would let the two
+disagree in the last digit, on the surface where the disagreement is most visible and
+least explicable.
 """
 
 ALLOWED_SUBSTRINGS: tuple[str, ...] = (

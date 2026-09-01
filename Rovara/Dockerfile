@@ -52,9 +52,9 @@ USER revora
 #   api    -> uvicorn serving the FastAPI app (webhook intake + dashboard API)
 #   worker -> the job-queue poll loop
 #
-# The api/worker entrypoint modules are built in later phases (tasks 29 and 7). Until
-# they exist this validates the role and exits, which is the correct behaviour for a
-# foundation-phase image: it proves the container boots and reads its role.
+# Both entrypoint modules now exist. The find_spec guard stays: it is what turns a
+# renamed or removed entrypoint into a clear message at container start rather than a
+# traceback from runpy, and it costs one import check.
 ENTRYPOINT ["python", "-c", "import sys; from revora.platform.role import current_role, Role; r = current_role(); print(f'revora role={r.value}', flush=True); \
 mod = 'revora.api.main' if r is Role.API else 'revora.jobs.worker'; \
 import importlib, runpy; \

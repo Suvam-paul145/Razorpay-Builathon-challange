@@ -66,6 +66,12 @@ forbidden_modules =
     revora.providers
     revora.synthetic
 
+; Widened in Phase 4. design.md's intent is "no Revora component imports synthetic except the
+; generator entrypoint and the reporter", and the original eight sources left estimation,
+; diagnosis, memory, metrics and outcome free to import it — which would have been enough to
+; make a synthetic ground truth reachable from the figures it is supposed to be checking.
+; revora.experiment is deliberately absent: the harness lives in revora.synthetic and imports
+; the experiment engine, which is the one direction that has to stay open.
 [importlinter:contract:synthetic-containment]
 name = Synthetic data is unreachable from the decision and action path
 type = forbidden
@@ -78,6 +84,14 @@ source_modules =
     revora.cases
     revora.detection
     revora.ingestion
+    revora.estimation
+    revora.diagnosis
+    revora.memory
+    revora.metrics
+    revora.outcome
+    revora.audit
+    revora.persistence
+    revora.platform
 forbidden_modules =
     revora.synthetic
 

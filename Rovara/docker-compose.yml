@@ -8,7 +8,11 @@
 
 services:
   db:
-    image: postgres:15
+    # Pinned to 18 to match the managed Neon instance, which is the one version nobody
+    # here controls. Local and CI drifting below production is how a migration passes
+    # every gate and then fails on deploy against a feature or a lock behaviour that
+    # only the newer server has.
+    image: postgres:18
     environment:
       POSTGRES_USER: revora
       POSTGRES_PASSWORD: revora_local_dev

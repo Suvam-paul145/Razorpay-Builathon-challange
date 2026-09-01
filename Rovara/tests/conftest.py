@@ -26,6 +26,17 @@ from hypothesis import HealthCheck, Verbosity, settings
 
 from revora.platform import clock
 
+pytest_plugins = ("tests.pg_support",)
+"""The migrated-PostgreSQL fixtures, registered suite-wide.
+
+Here rather than in a per-directory conftest because two tiers need them — the persistence
+constraint tests and the synthetic evidence harness — and a conftest's fixtures are visible only
+to tests below it. Registering the plugin costs nothing at collection: every fixture in it is
+session-scoped and lazy, so a run that touches no ``pg`` test never contacts a database.
+
+Plugin registration has to happen in the *root* conftest; pytest rejects ``pytest_plugins`` in a
+nested one."""
+
 settings.register_profile(
     "default",
     max_examples=100,
