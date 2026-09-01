@@ -31,6 +31,7 @@ __all__ = [
     "AUDIT_MUTATION_REJECTED",
     "AUDIT_WRITE_FAILED",
     "AUTHENTICATION_FAILED",
+    "AUTHORIZATION_DENIED",
     "BASELINE_ALREADY_RECORDED",
     "BASELINE_ESTIMATE_RECORDED",
     "BASELINE_ESTIMATION_FAILED",
@@ -42,7 +43,11 @@ __all__ = [
     "CASE_ESCALATED",
     "CASE_EXPIRED",
     "CONCURRENT_EXECUTION_PREVENTED",
+    "CONSENT_RECORDED",
+    "CONTROL_ACTION_SUPPRESSED",
+    "CONTROL_CONTAMINATED",
     "CREDENTIAL_UNAVAILABLE",
+    "CUSTOMER_DATA_REDACTED",
     "DECISION_CYCLE_LIMIT_REACHED",
     "DELAYED_RECOVERY_RECONCILED",
     "DETECTION_VERDICT_RECORDED",
@@ -61,11 +66,19 @@ __all__ = [
     "EXECUTION_RESULT_UNKNOWN",
     "EXECUTION_RESULT_UNVERIFIABLE",
     "EXECUTION_STARTED",
+    "EXPERIMENT_ANALYSED",
+    "EXPERIMENT_ASSIGNMENT_RECORDED",
+    "EXPERIMENT_ASSIGNMENT_SKIPPED",
+    "EXPERIMENT_INVALIDATED",
+    "HUMAN_OWNER_ASSIGNED",
+    "HUMAN_OWNER_RELEASED",
     "ILLEGAL_TRANSITION",
     "INVALID_ESTIMATE",
     "JOB_DEAD_LETTERED",
     "MALFORMED_EVENT",
     "MERCHANT_INTEGRATION_FAULT",
+    "MODEL_PROMOTED",
+    "MODEL_VERSION_RECORDED",
     "OUT_OF_ORDER_EVENT",
     "PARTIAL_PAYMENT_OBSERVED",
     "PAYMENT_STATE_CONFLICT",
@@ -79,6 +92,8 @@ __all__ = [
     "RECONCILED_TO_RECOVERED",
     "RECOVERY_RECORDED",
     "SCHEDULE_REJECTED",
+    "SESSION_ESTABLISHED",
+    "SESSION_REVOKED",
     "SIGNATURE_REJECTED",
     "STATE_TRANSITION",
     "VERSION_CONFLICT",
@@ -113,7 +128,30 @@ RATE_LIMIT_APPLIED: Final = "RATE_LIMIT_APPLIED"
 already persisted."""
 
 AUTHENTICATION_FAILED: Final = "AUTHENTICATION_FAILED"
-"""A dashboard authentication attempt failed. Unattached to any case."""
+"""A dashboard authentication attempt failed. Unattached to any case.
+
+Covers a wrong operator key, an unknown token, a revoked session and an expired one. They are
+one event type because they get one answer — 401 with no body — and distinguishing them to the
+caller would make the endpoint an oracle. The *record* names which it was, because an operator
+debugging a locked-out colleague needs the difference and an attacker never sees it."""
+
+AUTHORIZATION_DENIED: Final = "AUTHORIZATION_DENIED"
+"""An authenticated session asked for a record belonging to another merchant (R17.C3).
+
+Answered **404, not 403**, so the response does not confirm the record exists. The record
+carries the requester, the requested id and the timestamp, which is the trail a cross-tenant
+probe leaves — and the reason the wrong answer to the caller is the right one here: the
+information the caller is denied is exactly the information the record must keep."""
+
+SESSION_ESTABLISHED: Final = "SESSION_ESTABLISHED"
+"""A dashboard session was minted, naming the merchant user it acts as.
+
+Recorded because the credential that mints it is a shared per-merchant operator key rather
+than a user password. The key cannot say who used it; this record says which user the session
+will be attributed to, so every later action has a named actor."""
+
+SESSION_REVOKED: Final = "SESSION_REVOKED"
+"""A session was explicitly ended. The reason a session is a row and not a signed token."""
 
 EVENT_INGESTED: Final = "EVENT_INGESTED"
 """A signature-verified, canonical, deduplicated event was persisted and a detection
@@ -347,6 +385,75 @@ either a duplicate payment request or a case abandoned while a live link is outs
 An escalation a human can pick up is worse for the metrics and better for the customer."""
 
 # ---------------------------------------------------------------------------
+# Recovery memory and experiments — R13, R15
+# ---------------------------------------------------------------------------
+
+RECOVERY_OBSERVATION_RECORDED: Final = "RECOVERY_OBSERVATION_RECORDED"
+"""One resolved case was flattened into a training observation, in the same transaction as its
+terminal transition (R15.C1).
+
+Carries ``intervention_status`` and whether the row is usable as a baseline training label,
+because that is the field that decides whether this case can teach the estimator anything.
+Most cannot: only a control-arm case with zero confirmed actions qualifies, and the count of
+those is the real measure of how much Revora knows about what happens when it does nothing."""
+
+EXPERIMENT_ASSIGNMENT_RECORDED: Final = "EXPERIMENT_ASSIGNMENT_RECORDED"
+"""A case was assigned to an experiment arm, before any diagnosis ran (R13.C1, C2).
+
+Before, not after, and the record proves the ordering. An arm chosen once the cause is known
+is an arm chosen on the strength of the case, which destroys the comparison — so the audit
+trail has to show that assignment preceded knowledge."""
+
+EXPERIMENT_ASSIGNMENT_SKIPPED: Final = "EXPERIMENT_ASSIGNMENT_SKIPPED"
+"""No arm was assigned, and the case runs the baseline workflow (R13.C14).
+
+Either no experiment was active or the assignment could not be persisted. The important part
+is what does *not* happen: an unassigned case is never quietly treated as treatment, because
+that would put cases into the treatment arm that the randomization never selected."""
+
+CONTROL_ACTION_SUPPRESSED: Final = "CONTROL_ACTION_SUPPRESSED"
+"""A control-arm case produced a recommendation and it was withheld (R13.C3).
+
+The recommendation is recorded, not discarded — that is what makes the control arm a
+counterfactual record rather than an absence. For every control case we know what Revora would
+have done, which is the comparison the whole experiment rests on."""
+
+CONTROL_CONTAMINATED: Final = "CONTROL_CONTAMINATED"
+"""A confirmed action reached a control case. The case is excluded from every reported result.
+
+Contamination invalidates the comparison; hiding it would invalidate the claim instead. Note
+the limit of what this can detect: a merchant phoning a customer is invisible to Revora, so an
+uncontaminated control arm means "no contamination we could see"."""
+
+EXPERIMENT_INVALIDATED: Final = "EXPERIMENT_INVALIDATED"
+"""A frozen component changed while the experiment was ``ACTIVE`` (R13.C16).
+
+Assignment stops and the experiment is labelled. A mid-experiment model promotion silently
+changes what the treatment arm *is*, and the measured difference stops meaning anything — so
+this is detected and recorded rather than absorbed."""
+
+EXPERIMENT_ANALYSED: Final = "EXPERIMENT_ANALYSED"
+"""An experiment result was computed: per-arm counts, the lift, its interval, and the labels.
+
+Written for every analysis, including the ones that establish nothing. An interval containing
+zero is a real finding and the most likely one, and a system that only recorded the flattering
+analyses would be a system whose history could not be checked."""
+
+MODEL_VERSION_RECORDED: Final = "MODEL_VERSION_RECORDED"
+"""A model version row was created, ``INACTIVE`` (R15.C5, C11).
+
+Training completing does not activate anything. The split between recording a version and
+promoting it is what makes activation a decision a person takes rather than a side effect of a
+job finishing."""
+
+MODEL_PROMOTED: Final = "MODEL_PROMOTED"
+"""A named person activated a model version (R15.C6).
+
+``approving_user_id`` is ``NOT NULL`` in the schema, which is the same reasoning that puts the
+tunable bounds in database rows rather than environment variables: a redeploy cannot supply an
+approving user, and "why did the numbers move" should always have a name attached to it."""
+
+# ---------------------------------------------------------------------------
 # Outcome — R10
 # ---------------------------------------------------------------------------
 
@@ -440,6 +547,37 @@ JOB_DEAD_LETTERED: Final = "JOB_DEAD_LETTERED"
 """A job exhausted its attempt cap and moved to ``DEAD_LETTER``. Recorded so a poison
 job is visible rather than silently abandoned."""
 
+# ---------------------------------------------------------------------------
+# Dashboard actions — R14, R17
+# ---------------------------------------------------------------------------
+
+HUMAN_OWNER_ASSIGNED: Final = "HUMAN_OWNER_ASSIGNED"
+"""A merchant user took ownership of a case, suspending all automated action.
+
+This is not a display preference. Policy check 7 fails while an owner is set, so this record
+is the reason a case stopped producing actions — and without it, an operator looking at a
+silent case would be reading the absence of automation as a bug."""
+
+HUMAN_OWNER_RELEASED: Final = "HUMAN_OWNER_RELEASED"
+"""Ownership was released and automation may resume from the next decision cycle."""
+
+CONSENT_RECORDED: Final = "CONSENT_RECORDED"
+"""A consent or opt-out was recorded against a ``customer_key``, with its source.
+
+Keyed on the customer rather than the case, so it is authoritative for every policy
+evaluation beginning after its ``effective_at`` — across the cases that already exist and the
+ones that do not yet (R17.C10). Recorded unattached, because it is a statement about a person
+and not about any one payment."""
+
+CUSTOMER_DATA_REDACTED: Final = "CUSTOMER_DATA_REDACTED"
+"""Contact data was deleted or irreversibly masked after ``CUSTOMER_DATA_RETENTION`` elapsed.
+
+Names the applied retention configuration version (R17.C11), because "we deleted it on time"
+is a claim about the bound that was in force, and the bound is configurable. The non-identifying
+fields metrics depend on are retained — a retention sweep that also destroyed the amount would
+make every historical figure irreproducible, which is a different failure from a privacy one and
+just as real."""
+
 
 ALL_EVENT_TYPES: frozenset[str] = frozenset(
     {
@@ -495,10 +633,26 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         ACTION_CANCELLED_PAYMENT_RECEIVED,
         POST_PAYMENT_ACTION,
         DELAYED_RECOVERY_RECONCILED,
+        RECOVERY_OBSERVATION_RECORDED,
+        EXPERIMENT_ASSIGNMENT_RECORDED,
+        EXPERIMENT_ASSIGNMENT_SKIPPED,
+        CONTROL_ACTION_SUPPRESSED,
+        CONTROL_CONTAMINATED,
+        EXPERIMENT_INVALIDATED,
+        EXPERIMENT_ANALYSED,
+        MODEL_VERSION_RECORDED,
+        MODEL_PROMOTED,
         AUDIT_WRITE_FAILED,
         JOB_DEAD_LETTERED,
         AUDIT_MUTATION_REJECTED,
         CREDENTIAL_UNAVAILABLE,
+        AUTHORIZATION_DENIED,
+        SESSION_ESTABLISHED,
+        SESSION_REVOKED,
+        HUMAN_OWNER_ASSIGNED,
+        HUMAN_OWNER_RELEASED,
+        CONSENT_RECORDED,
+        CUSTOMER_DATA_REDACTED,
     }
 )
 """Every event type declared in this phase. A test asserts a writer's type is a

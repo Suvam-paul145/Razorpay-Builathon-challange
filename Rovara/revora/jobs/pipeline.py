@@ -27,9 +27,17 @@ row-writing around it live here, in the one layer permitted to see both. The tas
 sketched this as ``revora/policy/service.py``; the contract is the stronger authority and
 the behaviour is the same.
 
-**Zero external calls anywhere in this file.** The whole decision pipeline is reads,
-arithmetic and writes. Nothing here can reach the provider — ``revora.providers`` is not
-imported and the execution engine that will use it is task 20.
+**The decision steps make zero external calls, and the two that can are named.** Diagnosis,
+estimation, optimization and policy are reads, arithmetic and writes only — none of them can
+reach the provider, and none of them takes a client to reach it with. :func:`handle_execution`
+and :func:`handle_outcome` are the only functions here that touch the outside world, and both
+require a ``provider`` argument rather than resolving one. That is the structural form of
+"which steps can have an effect": it is answerable by reading the signatures.
+
+Both of those delegate entirely. The exactly-once guarantee lives in
+:mod:`revora.execution.engine` and the recovery decision lives in :mod:`revora.outcome.monitor`;
+the handlers here decide only what to enqueue next. A second opinion about either would be a
+second implementation of the guarantee.
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.orm import Session
 
@@ -50,7 +58,10 @@ from revora.domain.actions import CandidateAction
 from revora.domain.enums import CaseState, PolicyVerdict, RiskCause
 from revora.estimation.baseline import run_baseline_estimation
 from revora.estimation.candidates import run_candidate_estimation
+from revora.execution.engine import ExecutionOutcome, execute_approved_action
+from revora.experiment.control import assign_case
 from revora.optimizer.service import run_optimizer
+from revora.outcome.monitor import observe_payment_outcome
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.config import ConfigurationRepository
 from revora.persistence.repositories.consent import CustomerConsentRepository
@@ -66,16 +77,23 @@ from revora.policy.engine import PolicyEvaluation, evaluate, idempotency_key_for
 from revora.policy.input import PolicyInput
 from revora.policy.rules import rule_set_from_config
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from revora.providers.razorpay import PaymentProviderClient
+
 __all__ = [
     "CANDIDATE_JOB_KIND",
     "DIAGNOSIS_JOB_KIND",
+    "EXECUTION_JOB_KIND",
     "OPTIMIZER_JOB_KIND",
+    "OUTCOME_JOB_KIND",
     "POLICY_JOB_KIND",
     "PolicyOutcome",
     "enqueue_next",
     "handle_candidates",
     "handle_diagnosis",
+    "handle_execution",
     "handle_optimizer",
+    "handle_outcome",
     "handle_policy",
     "rule_set_from_config",
     "run_policy_evaluation",
@@ -89,9 +107,17 @@ DIAGNOSIS_JOB_KIND: Final[str] = "diagnosis"
 CANDIDATE_JOB_KIND: Final[str] = "estimation"
 OPTIMIZER_JOB_KIND: Final[str] = "optimization"
 POLICY_JOB_KIND: Final[str] = "policy_evaluation"
-"""The four decision-pipeline job kinds. Declared here rather than in ``scheduler`` because
+EXECUTION_JOB_KIND: Final[str] = "execution"
+OUTCOME_JOB_KIND: Final[str] = "outcome_observation"
+"""The six decision-pipeline job kinds. Declared here rather than in ``scheduler`` because
 these are event-driven follow-ons rather than periodic sweeps — each is enqueued by the step
-before it, not by a clock."""
+before it, not by a clock.
+
+``execution`` and ``outcome_observation`` are the two that close the loop, and they were the gap
+that made the pipeline stop at ``POLICY_CHECK``: an ``APPROVED`` decision was a durable
+authorization that nothing consumed. The two periodic sweeps — execution reconciliation and
+payment-state reconciliation — remain the safety nets underneath them, because a case must never
+*depend* on a job having run. These are the fast path when one does."""
 
 
 def enqueue_next(
@@ -101,6 +127,7 @@ def enqueue_next(
     kind: str,
     case_id: uuid.UUID,
     correlation_id: uuid.UUID | None,
+    extra_payload: dict[str, object] | None = None,
 ) -> uuid.UUID | None:
     """Enqueue the next pipeline step in the caller's transaction.
 
@@ -108,14 +135,18 @@ def enqueue_next(
     twice. The key collides only against *pending* jobs, so a later decision cycle can
     legitimately enqueue the same kind for the same case again once the first has been
     claimed.
+
+    ``extra_payload`` carries step-specific values — currently only the claimed status on an
+    outcome observation. It is merged *under* the two mandatory keys rather than over them, so a
+    caller cannot accidentally redirect a job to another case by supplying ``case_id``.
     """
+    payload: dict[str, object] = dict(extra_payload or {})
+    payload["case_id"] = str(case_id)
+    payload["correlation_id"] = None if correlation_id is None else str(correlation_id)
     return JobRepository(session).enqueue(
         merchant_id,
         kind=kind,
-        payload={
-            "case_id": str(case_id),
-            "correlation_id": None if correlation_id is None else str(correlation_id),
-        },
+        payload=payload,
         run_after=now(),
         dedupe_key=f"{kind}:{case_id}",
         case_id=case_id,
@@ -274,12 +305,19 @@ def handle_policy(
     *,
     correlation_id: uuid.UUID | None = None,
 ) -> None:
-    """Evaluate policy, persist the decision, and move the case to ``POLICY_CHECK``.
+    """Evaluate policy, persist the decision, move to ``POLICY_CHECK``, and schedule if approved.
 
-    The pipeline stops here in this phase. Execution is task 20, and until it exists an
-    ``APPROVED`` decision is a durable authorization that nothing consumes — which is the
-    correct intermediate state, because the decision record is complete and the effect has
-    not happened.
+    Two transitions rather than one, and they are separate states for a reason. ``POLICY_CHECK``
+    means "a decision has been recorded"; ``ACTION_SCHEDULED`` means "an authorization exists and
+    is waiting to be consumed". A case that stalls between them is a case whose decision is
+    durable and whose effect has not happened — which is the safe intermediate state, and the one a
+    crash should leave behind.
+
+    Only an ``APPROVED`` verdict schedules. ``BLOCKED``, ``DEFERRED`` and ``ESCALATE`` all stop at
+    ``POLICY_CHECK``: the decision is complete, it is on the record with its twelve check outcomes,
+    and no effect follows. A blocked case is not a failed case and must not be made to look like one
+    — the lifecycle sweeper will terminate it when its window closes, and the dashboard shows the
+    reason in the meantime.
     """
     with tenant_transaction(merchant_id) as session:
         config = _config(session, merchant_id)
@@ -300,7 +338,7 @@ def handle_policy(
         if version is None:
             return
 
-    apply_transition(
+    recorded = apply_transition(
         merchant_id,
         case_id,
         expected_version=version,
@@ -309,6 +347,111 @@ def handle_policy(
         actor=_POLICY_ACTOR,
         action=outcome.selected_action,
         correlation_id=correlation_id,
+    )
+    if not outcome.authorized or not recorded.applied:
+        return
+
+    # The scheduling edge, and the execution enqueue rides inside its transaction. If the enqueue
+    # were a separate commit, a crash between the two would leave a case in ``ACTION_SCHEDULED``
+    # with nothing to execute it — recoverable only by a sweep, and invisible until then.
+    apply_transition(
+        merchant_id,
+        case_id,
+        expected_version=recorded.version if recorded.version is not None else version + 1,
+        target_state=CaseState.ACTION_SCHEDULED,
+        reason="approved action scheduled",
+        actor=_POLICY_ACTOR,
+        action=outcome.selected_action,
+        correlation_id=correlation_id,
+        on_success=lambda session, case: _after(
+            session, merchant_id, case_id, EXECUTION_JOB_KIND, correlation_id
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 5: execution — the only step that can produce an external effect
+# ---------------------------------------------------------------------------
+
+
+def handle_execution(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    provider: PaymentProviderClient,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Execute the approved action at most once, then wait for the outcome.
+
+    Thin on purpose: :func:`revora.execution.engine.execute_approved_action` owns the whole
+    exactly-once guarantee — the reservation, the lock discipline, the transitions and the
+    refusals — and this handler must not add a second opinion about any of them. It decides one
+    thing the engine does not: whether to enqueue an outcome observation.
+
+    It enqueues one only on ``CONFIRMED`` — a link that demonstrably exists at the provider. On a
+    refusal there is nothing to observe. On ``UNCERTAIN`` the *reconciliation* sweep owns the case,
+    and enqueuing an observation instead would have the monitor read a payment whose link may not
+    exist: a read that cannot answer the question being asked, and one that would move the case out
+    of the state reconciliation looks for.
+    """
+    attempt = execute_approved_action(
+        merchant_id, case_id, provider=provider, correlation_id=correlation_id
+    )
+    _logger.info(
+        "execution attempt completed",
+        merchant_id=str(merchant_id),
+        case_id=str(case_id),
+        outcome=attempt.outcome.value,
+        made_external_call=attempt.made_external_call,
+    )
+    if attempt.outcome is not ExecutionOutcome.CONFIRMED:
+        return
+
+    with tenant_transaction(merchant_id) as session:
+        enqueue_next(
+            session,
+            merchant_id,
+            kind=OUTCOME_JOB_KIND,
+            case_id=case_id,
+            correlation_id=correlation_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 6: outcome observation — the only place a recovery may be declared
+# ---------------------------------------------------------------------------
+
+
+def handle_outcome(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    provider: PaymentProviderClient,
+    signal_status: str | None = None,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Read the provider and let the monitor decide whether this case recovered.
+
+    Idempotent at the monitor: a case already ``RECOVERED`` short-circuits before any read, so a
+    duplicate capture signal costs nothing and cannot count the amount twice.
+
+    ``signal_status`` is what the prompting webhook claimed. It is passed through for conflict
+    detection only — the recovery decision comes from the authoritative read, never from the
+    signal, which is the whole of R10.C1.
+    """
+    assessment = observe_payment_outcome(
+        merchant_id,
+        case_id,
+        provider=provider,
+        signal_status=signal_status,
+        correlation_id=correlation_id,
+    )
+    _logger.info(
+        "outcome observed",
+        merchant_id=str(merchant_id),
+        case_id=str(case_id),
+        verdict=assessment.verdict.value,
+        declared_recovery=assessment.declared_recovery,
     )
 
 
@@ -410,7 +553,15 @@ def run_policy_evaluation(
         case_id=case_id, action=action, attempt_ordinal=case.executed_action_count + 1
     )
     candidate = PolicyInput.from_persisted(
-        case=case,
+        # `RecoveryCase` satisfies `CaseFacts` at runtime and does not satisfy it structurally to
+        # mypy, and the reason is a known limitation rather than a defect on either side: a
+        # SQLAlchemy 2.0 mapped attribute is declared `Mapped[UUID]` and resolves to `UUID` through
+        # the descriptor protocol on *access*, but protocol matching compares the declared types.
+        # Restating the Protocol in terms of `Mapped[...]` would drag `sqlalchemy` into
+        # `revora.policy`, which the policy-isolation contract forbids and which is the whole point
+        # of the Protocol existing. Suppressed here, at the one call site, rather than weakened
+        # there.
+        case=case,  # type: ignore[arg-type]
         consent=consent,
         verified_captured=_verified_captured(case.verified_payment_status),
         verified_status=case.verified_payment_status,
@@ -610,21 +761,77 @@ def enqueue_after_detection(
     session: Session,
     merchant_id: uuid.UUID,
     result: DetectionServiceResult,
+    config: Configuration,
     *,
     correlation_id: uuid.UUID | None = None,
 ) -> uuid.UUID | None:
-    """Start the pipeline for a newly opened case, in detection's own transaction.
+    """Assign the arm and start the pipeline, in detection's own transaction.
 
     Only for a case that detection actually created. An event attached to an already-open
     case must not start a second pipeline — that case is already somewhere in the sequence,
-    and a second diagnosis job would race the first for the same decision cycle.
+    and a second diagnosis job would race the first for the same decision cycle. It must not
+    be re-assigned either: the arm is fixed for the life of the case.
+
+    ``config`` is passed positionally because the caller already has it loaded in this same
+    transaction, and re-reading it here would be a second query for a value that cannot have
+    changed since.
     """
     if not result.case_created or result.case_id is None:
         return None
+
+    # Experiment assignment happens here, and the position is the requirement (R13.C1, C2). This
+    # is detection's own transaction — the one that created the case — and it runs before the
+    # diagnosis job is even enqueued. So the arm is durable before anything can look at the
+    # case's cause, and a case cannot exist without its arm.
+    #
+    # `assign_case` never raises: an experiment that cannot be assigned leaves the case
+    # unassigned on the baseline workflow rather than failing the transaction. Losing a real
+    # payment failure because an experiment was misconfigured would be the wrong trade, since
+    # the experiment is the optional part.
+    assign_case(
+        session,
+        merchant_id,
+        result.case_id,
+        config=config,
+        correlation_id=correlation_id,
+    )
+
     return enqueue_next(
         session,
         merchant_id,
         kind=DIAGNOSIS_JOB_KIND,
         case_id=result.case_id,
         correlation_id=correlation_id,
+    )
+
+
+def enqueue_after_recovery_signal(
+    session: Session,
+    merchant_id: uuid.UUID,
+    result: DetectionServiceResult,
+    *,
+    correlation_id: uuid.UUID | None = None,
+) -> uuid.UUID | None:
+    """Enqueue an outcome observation for a payment-success signal, in detection's transaction.
+
+    A capture is ``NOT_AT_RISK`` — it is not a failure — so it opens no case, and before this
+    existed the pipeline did nothing with it. The case still reached ``RECOVERED``, but only when
+    the payment-state sweep next ran, up to ``PAYMENT_STATE_RECONCILIATION_INTERVAL`` later. R10.C1
+    wants an authoritative read within ``OUTCOME_READ_LATENCY_BOUND``, and a fifteen-minute sweep
+    cannot meet a sixty-second bound.
+
+    The sweep stays underneath as the safety net, because a case must never *depend* on a webhook
+    arriving. This is the fast path when one does, and the monitor's idempotence is what makes
+    having both harmless: whichever gets there first, the second finds the case already recovered
+    and issues no read at all.
+    """
+    if result.recovery_signal_case_id is None:
+        return None
+    return enqueue_next(
+        session,
+        merchant_id,
+        kind=OUTCOME_JOB_KIND,
+        case_id=result.recovery_signal_case_id,
+        correlation_id=correlation_id,
+        extra_payload={"signal_status": result.signal_status},
     )

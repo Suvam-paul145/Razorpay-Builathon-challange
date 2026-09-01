@@ -52,6 +52,7 @@ from sqlalchemy import select
 
 from revora.audit.events import (
     CONCURRENT_EXECUTION_PREVENTED,
+    CONTROL_ACTION_SUPPRESSED,
     EXECUTION_ABANDONED_POLICY,
     EXECUTION_REFUSED,
     EXECUTION_RESULT_UNKNOWN,
@@ -60,7 +61,13 @@ from revora.audit.events import (
 from revora.audit.writer import AuditEntry, AuditWriter, is_case_blocked
 from revora.cases.manager import apply_locked_transition
 from revora.domain.actions import CandidateAction
-from revora.domain.enums import CaseState, IntentState, PolicyVerdict
+from revora.domain.enums import (
+    SUPPRESSED_BY_CONTROL_ARM,
+    CaseState,
+    ExperimentGroup,
+    IntentState,
+    PolicyVerdict,
+)
 from revora.domain.money import Minor
 from revora.execution.authorization import evaluate_against_reloaded_state
 from revora.execution.contact import resolve_customer_contact
@@ -74,6 +81,7 @@ from revora.execution.messages import description_for
 from revora.persistence.models import Merchant
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.execution import ExecutionIntentRepository
+from revora.persistence.repositories.experiments import ExperimentAssignmentRepository
 from revora.persistence.repositories.policy import PolicyDecisionRepository
 from revora.persistence.repositories.session import (
     case_advisory_key,
@@ -138,6 +146,14 @@ class ExecutionOutcome(StrEnum):
 
     TRANSITION_REFUSED = "TRANSITION_REFUSED"
     """The case could not legally enter ``EXECUTING``. Rolled back, no call."""
+
+    CONTROL_ARM_SUPPRESSED = "CONTROL_ARM_SUPPRESSED"
+    """The case is in an experiment's control arm, so its action is withheld (R13.C3).
+
+    The recommendation and the approved decision both stand and are recorded — only the external
+    effect is suppressed. That is what makes the control arm a counterfactual record: we know
+    what Revora would have done here, and we know what happened without it. Skipping the pipeline
+    for control cases would be cheaper and would leave nothing to compare against."""
 
     CONTACT_UNAVAILABLE = "CONTACT_UNAVAILABLE"
     """The customer's contact could not be decrypted from the originating event, or the
@@ -281,6 +297,22 @@ def _reserve_under_lock(
 
         if is_case_blocked(merchant_id, case_id):
             return _refused(case_id, ExecutionOutcome.AUDIT_BLOCKED)
+
+        if _is_control_arm(session, merchant_id, case_id):
+            _audit_case(
+                session,
+                merchant_id,
+                case_id,
+                config,
+                event_type=CONTROL_ACTION_SUPPRESSED,
+                detail=SUPPRESSED_BY_CONTROL_ARM,
+                correlation_id=correlation_id,
+            )
+            return _refused(
+                case_id,
+                ExecutionOutcome.CONTROL_ARM_SUPPRESSED,
+                detail=SUPPRESSED_BY_CONTROL_ARM,
+            )
 
         decisions = PolicyDecisionRepository(session)
         decision = decisions.latest_approved_unconsumed(merchant_id, case_id)
@@ -639,6 +671,32 @@ def _refused(
         ),
         idempotency_key=key or "",
     )
+
+
+def _is_control_arm(session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID) -> bool:
+    """Whether this case is in an experiment's control arm, and must therefore not act.
+
+    **Why the check lives here rather than in** ``revora.experiment``. That package and this one
+    are siblings in the layering contract, so neither may import the other — and the contract is
+    right to forbid it. The question being asked is not "what does the experiment engine think",
+    it is "am I permitted to produce an external effect", and this module is the only thing that
+    produces external effects. So the engine reads the arm from persistence, which sits below
+    both, and applies the rule itself.
+
+    Checked once, at the boundary. Scattering "unless control" through diagnosis, estimation and
+    policy would give five places to forget it and forgetting it in any one contaminates the arm
+    — and a contaminated control case is excluded from the comparison, so the cost of the mistake
+    is a smaller experiment rather than a visible error.
+
+    Note what is *not* suppressed: the recommendation and the approved policy decision both stand
+    and are already recorded by the time this runs. That is the point. A control case with a
+    recorded recommendation and no effect is a counterfactual — we know what Revora wanted to do
+    and what happened without it. Suppressing earlier would leave nothing to compare against.
+    """
+    assignment = ExperimentAssignmentRepository(session).for_case(merchant_id, case_id)
+    if assignment is None:
+        return False
+    return ExperimentGroup(str(assignment.group)) is ExperimentGroup.CONTROL
 
 
 def _merchant_name(session: Session, merchant_id: uuid.UUID) -> str:

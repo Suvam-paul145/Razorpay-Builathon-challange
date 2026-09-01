@@ -55,6 +55,7 @@ from revora.execution.intents import (
     resolve_from_listing,
     stale_attempted_cutoff,
 )
+from revora.memory.store import observation_writer
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.persistence.repositories.session import (
@@ -412,6 +413,9 @@ def _escalate(
             action=CandidateAction(intent.action),
             terminal_reason=TerminalReason.EXECUTION_RESULT_UNVERIFIABLE,
             correlation_id=correlation_id,
+            # The observation is written in this transaction, not a follow-on job. A case that
+            # ends without one never gets a second chance — nothing revisits a terminal case.
+            on_success=observation_writer(config, correlation_id=correlation_id),
             disclosure_length=config.MASK_DISCLOSURE_LENGTH,
             max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
         )

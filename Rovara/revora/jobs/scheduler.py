@@ -37,12 +37,14 @@ except ImportError:  # pragma: no cover
 
 __all__ = [
     "CALIBRATION_REPORT_KIND",
+    "CUSTOMER_DATA_RETENTION_KIND",
     "DETECTION_GAP_BACKFILL_KIND",
     "EXECUTION_RECONCILIATION_KIND",
     "LIFECYCLE_EVALUATION_KIND",
     "PAYMENT_STATE_RECONCILIATION_KIND",
     "PERIODIC_SWEEP_KINDS",
     "enqueue_lifecycle_sweep",
+    "enqueue_sweep",
 ]
 
 _logger = get_logger(__name__)
@@ -52,6 +54,10 @@ EXECUTION_RECONCILIATION_KIND: Final[str] = "execution_reconciliation"
 PAYMENT_STATE_RECONCILIATION_KIND: Final[str] = "payment_state_reconciliation"
 DETECTION_GAP_BACKFILL_KIND: Final[str] = "detection_gap_backfill"
 CALIBRATION_REPORT_KIND: Final[str] = "calibration_report"
+CUSTOMER_DATA_RETENTION_KIND: Final[str] = "customer_data_retention"
+"""The privacy sweep. R17.C11 gives it a 24-hour deadline after ``CUSTOMER_DATA_RETENTION``
+elapses, which is why it is a scheduled sweep and not a monthly cron: a deadline measured in hours
+cannot be met by a job that runs on a calendar."""
 
 PERIODIC_SWEEP_KINDS: Final[tuple[str, ...]] = (
     LIFECYCLE_EVALUATION_KIND,
@@ -59,10 +65,47 @@ PERIODIC_SWEEP_KINDS: Final[tuple[str, ...]] = (
     PAYMENT_STATE_RECONCILIATION_KIND,
     DETECTION_GAP_BACKFILL_KIND,
     CALIBRATION_REPORT_KIND,
+    CUSTOMER_DATA_RETENTION_KIND,
 )
 """Every periodic sweep kind. The worker registers a handler for each; the ones whose
 owners do not exist yet are registered as no-ops so a scheduled sweep completes rather
 than dead-lettering."""
+
+
+def enqueue_sweep(
+    merchant_id: uuid.UUID,
+    kind: str,
+    *,
+    bucket_seconds: int,
+    moment: datetime | None = None,
+    factory: sessionmaker[Session] | None = None,
+) -> uuid.UUID | None:
+    """Enqueue one periodic sweep for a merchant, dedupe-keyed by kind and interval bucket.
+
+    ``bucket_seconds`` quantizes the current time so a key repeats within one interval and changes
+    across intervals — which is what makes the dedupe both prevent a double-enqueue this tick and
+    permit a fresh enqueue next tick. Returns the job id, or ``None`` if this bucket's sweep is
+    already pending.
+
+    One function for every sweep rather than one per kind. The kinds differ only in their interval,
+    and a per-kind function would be five copies of the same dedupe-key construction — which is
+    precisely the code where a subtle difference between two copies produces a sweep that either
+    doubles or never runs again.
+    """
+    if kind not in PERIODIC_SWEEP_KINDS:
+        raise ValueError(f"{kind!r} is not a periodic sweep kind; expected one of "
+                         f"{PERIODIC_SWEEP_KINDS}")
+    moment = moment or now()
+    bucket = int(moment.timestamp()) // max(1, bucket_seconds)
+    with tenant_transaction(merchant_id, factory) as session:
+        return enqueue(
+            session,
+            merchant_id,
+            kind=kind,
+            payload={"bucket": bucket},
+            run_after=moment,
+            dedupe_key=f"{kind}:{merchant_id}:{bucket}",
+        )
 
 
 def enqueue_lifecycle_sweep(
@@ -72,21 +115,11 @@ def enqueue_lifecycle_sweep(
     moment: datetime | None = None,
     factory: sessionmaker[Session] | None = None,
 ) -> uuid.UUID | None:
-    """Enqueue one lifecycle-evaluation sweep for a merchant, dedupe-keyed by bucket.
-
-    ``bucket_seconds`` quantizes the current time so a key repeats within one interval
-    and changes across intervals — which is what makes the dedupe both prevent a
-    double-enqueue this tick and permit a fresh enqueue next tick. Returns the job id,
-    or ``None`` if this bucket's sweep is already pending.
-    """
-    moment = moment or now()
-    bucket = int(moment.timestamp()) // max(1, bucket_seconds)
-    with tenant_transaction(merchant_id, factory) as session:
-        return enqueue(
-            session,
-            merchant_id,
-            kind=LIFECYCLE_EVALUATION_KIND,
-            payload={"bucket": bucket},
-            run_after=moment,
-            dedupe_key=f"{LIFECYCLE_EVALUATION_KIND}:{merchant_id}:{bucket}",
-        )
+    """Enqueue one lifecycle-evaluation sweep. Kept as a named entry point for its callers."""
+    return enqueue_sweep(
+        merchant_id,
+        LIFECYCLE_EVALUATION_KIND,
+        bucket_seconds=bucket_seconds,
+        moment=moment,
+        factory=factory,
+    )

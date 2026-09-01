@@ -1,8 +1,8 @@
 """The approved payment-link descriptions. Every word a customer reads is in this file.
 
-**This copy needs product sign-off.** The wording below is a working default, not an
-approved one, and it is isolated here precisely so that approving or replacing it is a
-one-file review rather than an audit of the execution engine.
+**Signed off.** The wording below is approved copy. It stays isolated in this one module so
+that revising it is a one-file review rather than an audit of the execution engine, and so
+that "what did we say to customers" is answerable by reading a single screen.
 
 Templates, not free text, and that is a deliberate narrowing. Even in the design's optional
 reasoning path the model's role is *selecting* among approved templates rather than drafting
@@ -79,14 +79,19 @@ PAYMENT_LINK_NEUTRAL = MessageTemplate(
     "Your earlier payment did not go through, so nothing has been charged. "
     "You can pay securely using this link.",
 )
-"""**[AWAITING PRODUCT SIGN-OFF]** The default, and the only one used today.
+"""**Approved.** The default, and the only wording used today.
 
 Written to be the least presumptuous sentence that still explains why the customer received
-it. "Nothing has been charged" is there because the most likely thing a customer worries
-about on receiving a second payment request is being charged twice — and stating it plainly
-prevents a support contact. It is also true by construction: Revora only opens a case on a
-payment the provider reported as failed, and ``accept_partial`` is false so a partial capture
-cannot have occurred either."""
+it. "Nothing has been charged" is there because the most likely thing a customer worries about
+on receiving a second payment request is being charged twice — and stating it plainly prevents
+a support contact. It is also true by construction: Revora only opens a case on a payment the
+provider reported as failed, and ``accept_partial`` is false, so a partial capture cannot have
+occurred either.
+
+Revising this string is a customer-visible change. Mint a new id rather than editing this one
+in place — ``payment_link.neutral.v2`` — because audit records name the id, and editing the
+body under a fixed id makes every historical record silently describe wording that was never
+sent."""
 
 
 _BY_ACTION: Final[dict[CandidateAction, MessageTemplate]] = {

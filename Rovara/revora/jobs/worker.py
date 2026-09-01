@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Callable
 from typing import Final
 
+from revora.cases.retention import sweep_customer_data_retention
 from revora.cases.sweeper import sweep_expired_cases
 from revora.detection.service import run_detection
 from revora.execution.reconcile import reconcile_intents
@@ -33,22 +34,29 @@ from revora.ingestion.service import DETECTION_JOB_KIND
 from revora.jobs.pipeline import (
     CANDIDATE_JOB_KIND,
     DIAGNOSIS_JOB_KIND,
+    EXECUTION_JOB_KIND,
     OPTIMIZER_JOB_KIND,
+    OUTCOME_JOB_KIND,
     POLICY_JOB_KIND,
     enqueue_after_detection,
+    enqueue_after_recovery_signal,
     handle_candidates,
     handle_diagnosis,
+    handle_execution,
     handle_optimizer,
+    handle_outcome,
     handle_policy,
 )
-from revora.jobs.queue import ClaimedJob, claim_one, complete, fail
+from revora.jobs.queue import ClaimedJob, claim_one, complete, enqueue, fail
 from revora.jobs.scheduler import (
     CALIBRATION_REPORT_KIND,
+    CUSTOMER_DATA_RETENTION_KIND,
     DETECTION_GAP_BACKFILL_KIND,
     EXECUTION_RECONCILIATION_KIND,
     LIFECYCLE_EVALUATION_KIND,
     PAYMENT_STATE_RECONCILIATION_KIND,
 )
+from revora.memory.store import observation_writer
 from revora.outcome.monitor import sweep_payment_state
 from revora.persistence.repositories.config import ConfigurationRepository
 from revora.persistence.repositories.jobs import claimable_merchant_ids
@@ -92,10 +100,19 @@ def _handle_detection(claimed: ClaimedJob) -> None:
             config,
             correlation_id=claimed.correlation_id,
         )
+        # A failure starts the decision pipeline; a success routes to an outcome observation.
+        # Both in detection's own transaction, so a case never exists with no job to advance it.
+        enqueue_after_recovery_signal(
+            session,
+            claimed.merchant_id,
+            result,
+            correlation_id=claimed.correlation_id,
+        )
         enqueue_after_detection(
             session,
             claimed.merchant_id,
             result,
+            config,
             correlation_id=claimed.correlation_id,
         )
 
@@ -134,8 +151,51 @@ def _handle_policy(claimed: ClaimedJob) -> None:
 
 
 def _handle_lifecycle(claimed: ClaimedJob) -> None:
-    """Expire every non-terminal case whose recovery window has closed."""
-    sweep_expired_cases(claimed.merchant_id)
+    """Expire every non-terminal case whose recovery window has closed.
+
+    Supplies the recovery-memory writer as the sweep's terminal callback. The sweeper cannot
+    import ``revora.memory`` itself — it sits a layer below — so this is where the two are
+    composed, in the top layer that may see both.
+    """
+    with transaction() as session:
+        config = ConfigurationRepository(session).load(claimed.merchant_id)
+    sweep_expired_cases(
+        claimed.merchant_id,
+        on_terminal=observation_writer(config, correlation_id=claimed.correlation_id),
+    )
+
+
+def _handle_customer_data_retention(claimed: ClaimedJob) -> None:
+    """Redact contact data past ``CUSTOMER_DATA_RETENTION``, re-enqueuing while a backlog remains.
+
+    R17.C11 gives a 24-hour window after the bound elapses. A merchant with a large backlog cannot
+    meet that if each sweep does one batch and then waits for the next tick, so a sweep that reports
+    ``more_remaining`` enqueues its own successor immediately. The dedupe key uses the batch index
+    rather than the time bucket, so the follow-up is not swallowed as a duplicate of the tick that
+    scheduled the first one.
+    """
+    with transaction() as session:
+        config = ConfigurationRepository(session).load(claimed.merchant_id)
+
+    batch = int(claimed.payload.get("batch", 0))
+    report = sweep_customer_data_retention(
+        claimed.merchant_id, config=config, correlation_id=claimed.correlation_id
+    )
+    if not report.more_remaining:
+        return
+
+    with tenant_transaction(claimed.merchant_id) as session:
+        enqueue(
+            session,
+            claimed.merchant_id,
+            kind=CUSTOMER_DATA_RETENTION_KIND,
+            payload={"batch": batch + 1},
+            run_after=now(),
+            dedupe_key=(
+                f"{CUSTOMER_DATA_RETENTION_KIND}:{claimed.merchant_id}:continue:{batch + 1}"
+            ),
+            correlation_id=claimed.correlation_id,
+        )
 
 
 def _handle_not_yet_implemented(claimed: ClaimedJob) -> None:
@@ -167,6 +227,36 @@ def shared_provider() -> PaymentProviderClient:
         if _shared_provider is None:
             _shared_provider = RazorpayClient()
         return _shared_provider
+
+
+def _handle_execution(claimed: ClaimedJob, provider: PaymentProviderClient) -> None:
+    """Execute the case's approved action at most once. The only handler with an effect.
+
+    Idempotent by the engine's reservation, not by this handler: a redelivered job, a restarted
+    worker and a retried attempt all reach the same intent and the second one refuses.
+    """
+    handle_execution(
+        claimed.merchant_id,
+        _case_id_of(claimed),
+        provider=provider,
+        correlation_id=claimed.correlation_id,
+    )
+
+
+def _handle_outcome(claimed: ClaimedJob, provider: PaymentProviderClient) -> None:
+    """Read the provider and decide whether the case recovered.
+
+    ``signal_status`` rides in the payload when a webhook prompted this. It is used for conflict
+    detection only — the recovery decision comes from the read, which is the whole of R10.C1.
+    """
+    claimed_status = claimed.payload.get("signal_status")
+    handle_outcome(
+        claimed.merchant_id,
+        _case_id_of(claimed),
+        provider=provider,
+        signal_status=None if claimed_status is None else str(claimed_status),
+        correlation_id=claimed.correlation_id,
+    )
 
 
 def _handle_execution_reconciliation(
@@ -220,6 +310,8 @@ def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str
         CANDIDATE_JOB_KIND: _handle_estimation,
         OPTIMIZER_JOB_KIND: _handle_optimization,
         POLICY_JOB_KIND: _handle_policy,
+        EXECUTION_JOB_KIND: lambda claimed: _handle_execution(claimed, _resolve()),
+        OUTCOME_JOB_KIND: lambda claimed: _handle_outcome(claimed, _resolve()),
         LIFECYCLE_EVALUATION_KIND: _handle_lifecycle,
         EXECUTION_RECONCILIATION_KIND: lambda claimed: _handle_execution_reconciliation(
             claimed, _resolve()
@@ -230,6 +322,7 @@ def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str
         DETECTION_GAP_BACKFILL_KIND: lambda claimed: _handle_detection_gap_backfill(
             claimed, _resolve()
         ),
+        CUSTOMER_DATA_RETENTION_KIND: _handle_customer_data_retention,
         CALIBRATION_REPORT_KIND: _handle_not_yet_implemented,
     }
 

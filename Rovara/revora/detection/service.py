@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,7 @@ from revora.audit.writer import AuditEntry, AuditWriter
 from revora.detection.rules import DetectionResult, classify
 from revora.domain.enums import CaseState, DetectionVerdict, Provenance
 from revora.domain.payment_event import (
+    RECOVERY_SIGNAL_EVENTS,
     SUPPORTED_CURRENCIES,
     CanonicalPaymentEvent,
     PaymentStatus,
@@ -68,6 +70,24 @@ class DetectionServiceResult:
     case_id: uuid.UUID | None
     case_created: bool
     already_processed: bool = False
+
+    recovery_signal_case_id: uuid.UUID | None = None
+    """The case a payment-success signal refers to, when there is one.
+
+    A capture is ``NOT_AT_RISK`` — it is not a failure — so it opens no case and, before this
+    field existed, the pipeline did nothing with it. The case still reached ``RECOVERED``, but only
+    when the payment-state sweep next ran, up to ``PAYMENT_STATE_RECONCILIATION_INTERVAL`` later.
+    R10.C1 wants an authoritative read within ``OUTCOME_READ_LATENCY_BOUND`` of the signal, and a
+    fifteen-minute sweep cannot meet a sixty-second bound.
+
+    So this names the case, and the worker enqueues an outcome observation for it. The sweep stays
+    as the safety net — a case must never *depend* on a webhook arriving — and this is the fast
+    path when one does.
+    """
+
+    signal_status: str | None = None
+    """The payment status the signal claimed. Passed to the outcome monitor for conflict detection
+    only; the recovery decision comes from the authoritative read alone."""
 
 
 def run_detection(
@@ -118,11 +138,13 @@ def run_detection(
 
     case_id: uuid.UUID | None = None
     case_created = False
+    signal_case_id: uuid.UUID | None = None
     if result.verdict is DetectionVerdict.AT_RISK:
         case_id, case_created = _open_or_attach(
             cases, writer, merchant_id, canonical, event, config, result, correlation_id, moment
         )
     else:
+        signal_case_id = _recovery_signal_case(cases, merchant_id, canonical)
         writer.write_unattached(
             merchant_id,
             AuditEntry(
@@ -133,6 +155,12 @@ def run_detection(
                     "reason": result.reason,
                     "applied_rules": list(result.applied_rules),
                     "event_name": canonical.event_name,
+                    # Named on the record so a capture that routed to a case is visible in the
+                    # trail. A recovery signal that matched nothing is the more interesting case —
+                    # it means money arrived for a payment Revora never opened a case for.
+                    "recovery_signal_case_id": (
+                        None if signal_case_id is None else str(signal_case_id)
+                    ),
                 },
             ),
             correlation_id=correlation_id,
@@ -150,7 +178,38 @@ def run_detection(
             latency_ms=latency_ms,
         ),
     )
-    return DetectionServiceResult(result.verdict, case_id, case_created=case_created)
+    return DetectionServiceResult(
+        result.verdict,
+        case_id,
+        case_created=case_created,
+        recovery_signal_case_id=signal_case_id,
+        signal_status=canonical.status if signal_case_id is not None else None,
+    )
+
+
+def _recovery_signal_case(
+    cases: RecoveryCaseRepository,
+    merchant_id: uuid.UUID,
+    canonical: CanonicalPaymentEvent,
+) -> uuid.UUID | None:
+    """The case a payment-success signal refers to, or ``None``.
+
+    Uses the *newest* case for the payment rather than the open one, deliberately. A capture that
+    arrives after the recovery window closed belongs to a case that is already ``EXPIRED``, and
+    R10.C14 requires that capture to reconcile it to ``RECOVERED`` — the open-case read cannot see
+    a terminal case, so routing through it would drop the late success silently. That is the
+    difference between recovering money and losing track of money the merchant already has.
+
+    The monitor is what decides whether the case is eligible; this only decides which case the
+    signal is about. Keeping those separate is why this returns an id and not a verdict.
+    """
+    if canonical.event_name not in RECOVERY_SIGNAL_EVENTS:
+        return None
+    payment_id = canonical.provider_payment_id
+    if payment_id is None:
+        return None
+    case = cases.newest_case_for_payment(merchant_id, payment_id)
+    return None if case is None else case.id
 
 
 def _already_captured(
@@ -178,7 +237,7 @@ def _open_or_attach(
     config: Configuration,
     result: DetectionResult,
     correlation_id: uuid.UUID | None,
-    moment,
+    moment: datetime,
 ) -> tuple[uuid.UUID, bool]:
     """Open a new case, or attach to the one already open. Returns ``(case_id, created)``."""
     payment_id = canonical.provider_payment_id

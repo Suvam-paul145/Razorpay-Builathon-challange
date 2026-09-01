@@ -45,7 +45,12 @@ from revora.audit.events import (
     SIGNATURE_REJECTED,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
-from revora.ingestion.canonical import CanonicalizationError, canonicalize
+from revora.domain.payment_event import CanonicalPaymentEvent
+from revora.ingestion.canonical import (
+    CanonicalizationError,
+    CanonicalResult,
+    canonicalize,
+)
 from revora.ingestion.ordering import assess_ordering
 from revora.ingestion.quarantine import quarantine_payload
 from revora.ingestion.signature import verify_for_merchant
@@ -281,7 +286,7 @@ def persist_and_enqueue(
     *,
     provider_event_id: str,
     body: bytes,
-    canonical_result,
+    canonical_result: CanonicalResult,
     config: Configuration,
     correlation_id: uuid.UUID,
     moment: datetime,
@@ -383,9 +388,9 @@ def _record_ordering(
     events: WebhookEventRepository,
     writer: AuditWriter,
     merchant_id: uuid.UUID,
-    canonical,
+    canonical: CanonicalPaymentEvent,
     new_id: uuid.UUID,
-    canonical_result,
+    canonical_result: CanonicalResult,
     correlation_id: uuid.UUID,
     moment: datetime,
 ) -> None:

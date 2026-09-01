@@ -178,7 +178,7 @@ def _to_canonical(envelope: _Envelope, *, disclosure_length: int) -> CanonicalRe
         error_step=payment.error_step if payment else None,
         customer_key=_derive_customer_key(contact_value),
         customer_contact_masked=(
-            mask_value(contact_value, FieldKind.CONTACT, disclosure_length=disclosure_length)
+            _masked_contact(contact_value, disclosure_length=disclosure_length)
             if contact_value
             else None
         ),
@@ -204,7 +204,31 @@ def _derive_customer_key(contact_value: str | None) -> str | None:
         return None
 
 
-def _first_error(exc: ValidationError) -> str:
+def _masked_contact(value: str, *, disclosure_length: int) -> str:
+    """:func:`mask_value` narrowed to the one field kind this module masks.
+
+    ``mask_value`` is declared as returning ``object`` because it is also the pass-through for
+    non-sensitive kinds, where it hands back whatever it was given. ``CONTACT`` is always
+    sensitive, so the result is always text. Narrowing here rather than widening
+    ``customer_contact_masked`` keeps the canonical model's field typed as the string it is.
+    """
+    masked = mask_value(value, FieldKind.CONTACT, disclosure_length=disclosure_length)
+    if not isinstance(masked, str):  # pragma: no cover - CONTACT always masks to text
+        raise CanonicalizationError(
+            "schema_invalid", "customer contact did not mask to text"
+        )
+    return masked
+
+
+def _first_error(exc: ValidationError | json.JSONDecodeError) -> str:
+    """A one-line description of why a payload would not parse.
+
+    Accepts both exception types because the round-trip check can fail either way: pydantic
+    rejects a field, or the serialized form is not valid JSON at all. A ``JSONDecodeError`` has no
+    ``errors()``, so it is handled separately rather than by hoping the attribute exists.
+    """
+    if isinstance(exc, json.JSONDecodeError):  # pragma: no cover - defensive
+        return f"line {exc.lineno} column {exc.colno}: {exc.msg}"
     errors = exc.errors()
     if not errors:  # pragma: no cover - pydantic always populates
         return "validation failed"
