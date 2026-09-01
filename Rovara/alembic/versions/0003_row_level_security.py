@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
+
 from alembic import op
 from revora.persistence.models import TENANT_SCOPED_TABLES
 from revora.platform.config import DEFAULTS_MERCHANT_ID
@@ -66,8 +68,30 @@ asks for: an assignment that can be moved from control to treatment destroys the
 comparison it was part of, and the move would be invisible in the result."""
 
 
+def _tables_present() -> tuple[str, ...]:
+    """The tenant-scoped tables that exist *at this point in the migration history*.
+
+    ``TENANT_SCOPED_TABLES`` is derived from live model metadata, which makes it correct
+    about the schema as it is today and wrong about the schema as it was when this migration
+    was written. Adding any new tenant-scoped model retroactively changes what this migration
+    tries to do, and on a fresh database it then fails: the table its own later migration
+    creates does not exist yet.
+
+    That was not hypothetical — adding ``experiment_result`` in 0005 broke every fresh
+    install until this filter was added. Intersecting with what the database actually holds
+    keeps the derivation (so a *new* table cannot be forgotten by a hand-maintained list)
+    while making the migration honest about when it ran. A table introduced later is
+    responsible for its own policy, and 0005 does exactly that.
+    """
+    inspector = sa.inspect(op.get_bind())
+    existing = set(inspector.get_table_names())
+    return tuple(name for name in TENANT_SCOPED_TABLES if name in existing)
+
+
 def upgrade() -> None:
-    for table in TENANT_SCOPED_TABLES:
+    tables = _tables_present()
+
+    for table in tables:
         read_expr = _APP_CONFIG_READ_EXPR if table == "app_config" else _TENANT_EXPR
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
         op.execute(
@@ -79,7 +103,7 @@ def upgrade() -> None:
     # blanket GRANT ALL so that the audit_record revocation from 0002 is not quietly
     # undone here — audit_record is granted SELECT and INSERT only.
     grants = [f"GRANT USAGE ON SCHEMA public TO {APP_ROLE};"]
-    for table in (*TENANT_SCOPED_TABLES, "merchant"):
+    for table in (*tables, "merchant"):
         if table == "audit_record":
             grants.append(f"GRANT SELECT, INSERT ON {table} TO {APP_ROLE};")
         elif table == "experiment_assignment":
@@ -111,6 +135,6 @@ $do$;
 
 
 def downgrade() -> None:
-    for table in TENANT_SCOPED_TABLES:
+    for table in _tables_present():
         op.execute(f"DROP POLICY IF EXISTS tenant_isolation ON {table}")
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")

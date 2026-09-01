@@ -31,7 +31,13 @@ from revora.persistence.models.base import (
     RowBase,
 )
 
-__all__ = ["CustomerConsent", "Merchant", "MerchantUser", "WebhookSecret"]
+__all__ = [
+    "CustomerConsent",
+    "Merchant",
+    "MerchantSession",
+    "MerchantUser",
+    "WebhookSecret",
+]
 
 
 class Merchant(Base, IdMixin, CreatedAtMixin):
@@ -80,6 +86,52 @@ class MerchantUser(RowBase):
         # Scoped to the merchant, not global: the same person may hold accounts
         # with two merchants and they are two users.
         UniqueConstraint("merchant_id", "email_key", name="uq_merchant_user_merchant_id_email_key"),
+    )
+
+
+class MerchantSession(RowBase):
+    """One authenticated dashboard session. The only thing an API request's tenant comes from.
+
+    **Stored server-side rather than carried in a signed token**, and the choice is not
+    incidental. A stateless token cannot be revoked, and R17 wants a session that stops being
+    valid — on expiry, on logout, and on an operator deciding it should. A row can be revoked;
+    a signature cannot be un-signed. It also means ``merchant_id`` is read from a row this
+    system wrote, which is the literal form of "the merchant is derived from the session and
+    from nothing in the request".
+
+    **The token is never stored.** ``token_digest`` is a keyed HMAC of the bearer token under
+    ``session_token_secret``. A database disclosure therefore does not hand over live sessions,
+    and the digest is keyed rather than plain so an offline attacker with the table cannot
+    confirm a guessed token without also holding the secret.
+
+    ``expires_at`` is persisted rather than derived from ``SESSION_LIFETIME`` at read time, for
+    the same reason ``recovery_case.window_end_at`` is: shortening a configured bound must not
+    retroactively invalidate sessions that were legitimately issued under the old one, and
+    lengthening it must not silently resurrect expired ones.
+    """
+
+    __tablename__ = "merchant_session"
+
+    merchant_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchant_user.id", ondelete="RESTRICT"), nullable=False
+    )
+    """Who the session acts as. Required even though the credential that minted it is a
+    per-merchant operator key rather than a user password — an audit trail that cannot name an
+    actor is not an audit trail, and "the operator key" is not an actor."""
+
+    token_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+
+    __table_args__ = (
+        # Global rather than per-merchant. The digest is keyed and 64 hex characters, so a
+        # collision is not a practical concern — but the lookup happens before the tenant is
+        # established beyond what the token claims, and a per-merchant constraint would leave
+        # the same digest usable against two merchants.
+        UniqueConstraint("token_digest", name="uq_merchant_session_token_digest"),
+        Index("ix_merchant_session_merchant_id_expires_at", "merchant_id", "expires_at"),
     )
 
 

@@ -22,14 +22,30 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import CursorResult, Result, Select, func, select
 from sqlalchemy.orm import Session
 
 from revora.persistence.models.base import RowBase
 
-__all__ = ["MerchantScopedRepository"]
+__all__ = ["MerchantScopedRepository", "rows_affected"]
+
+
+def rows_affected(result: Result[Any]) -> int:
+    """How many rows an ``UPDATE`` or ``DELETE`` touched.
+
+    A one-line helper because of a typing wrinkle worth stating once rather than suppressing in
+    five places: ``Session.execute`` is declared as returning ``Result``, which has no
+    ``rowcount``. The object it actually returns for a DML statement is a ``CursorResult``, which
+    does. The cast is narrowing to the real type rather than silencing the checker, and having it
+    here means a reader sees the reason instead of an inline ``type: ignore`` with no explanation.
+
+    Callers use the count to make an operation idempotent — "did this update change anything" is
+    what stops a second revoke, or a second retention pass, from writing an audit record claiming a
+    second action.
+    """
+    return int(cast("CursorResult[Any]", result).rowcount)
 
 
 class MerchantScopedRepository[ModelT: RowBase]:

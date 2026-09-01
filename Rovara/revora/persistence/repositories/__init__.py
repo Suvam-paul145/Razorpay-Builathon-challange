@@ -64,6 +64,10 @@ from revora.persistence.repositories.session import (
     transaction,
     try_advisory_xact_lock,
 )
+from revora.persistence.repositories.users import (
+    MerchantSessionRepository,
+    MerchantUserRepository,
+)
 
 __all__ = [
     "AUDIT_MUTATION_REJECTED",
@@ -76,6 +80,8 @@ __all__ = [
     "JobAttemptRepository",
     "JobRepository",
     "MerchantScopedRepository",
+    "MerchantSessionRepository",
+    "MerchantUserRepository",
     "PaymentStateReadRepository",
     "RecoveryCaseRepository",
     "RecoveryOutcomeRepository",

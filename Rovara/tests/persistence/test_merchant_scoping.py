@@ -16,8 +16,19 @@ import inspect
 import uuid
 from typing import Any
 
+import pytest
+
 from revora.persistence import repositories
 from revora.persistence.repositories.base import MerchantScopedRepository
+
+pytestmark = pytest.mark.pure
+"""Marked here rather than relying on the directory.
+
+The docstring above has always said this runs in the cheap tier, and it did not: CI's fast job
+selects ``pure or model``, this module carried no marker, and the ``pytestmark`` in the sibling
+conftest does not apply to other modules — so the primary tenant control was checked only when
+somebody ran the whole suite locally. Four tests, in the cheapest tier there is, guarding the
+mechanism the design calls primary."""
 
 DELIBERATE_EXCEPTIONS: frozenset[str] = frozenset(
     {

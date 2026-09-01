@@ -51,6 +51,7 @@ from revora.domain.actions import CandidateAction
 from revora.domain.enums import (
     NOT_ESTABLISHED,
     DecisionSource,
+    DiagnosisMethod,
     ExperimentGroup,
     ExperimentState,
     InterventionStatus,
@@ -63,6 +64,7 @@ from revora.persistence.models.base import (
     CONFIDENCE,
     MONEY,
     PROBABILITY,
+    SIGNED_INCREMENT,
     TIMESTAMPTZ,
     RowBase,
     enum_check,
@@ -71,6 +73,7 @@ from revora.persistence.models.base import (
 __all__ = [
     "Experiment",
     "ExperimentAssignment",
+    "ExperimentResult",
     "ExperimentVersionFreeze",
     "MemoryObservation",
     "ModelPromotion",
@@ -160,6 +163,115 @@ class ExperimentAssignment(RowBase):
         ),
         enum_check("experiment_assignment", "group", ExperimentGroup),
         Index("ix_experiment_assignment_experiment_id_group", "experiment_id", "group"),
+    )
+
+
+class ExperimentResult(RowBase):
+    """One analysis of one experiment: the lift, its interval, and the honest labels.
+
+    **The interval is the whole row.** A lift without one is a number that invites a causal
+    claim it cannot support, so ``lift_ci_low`` and ``lift_ci_high`` are constrained to be
+    present or absent together and ordered — a half-populated interval is uncommittable, and
+    an inverted one is caught before anything reads it.
+
+    **Rows accumulate; nothing is overwritten.** An experiment may be analysed more than once,
+    and re-analysis after more data arrives is legitimate. What is *not* legitimate is quietly
+    replacing an earlier result with a later, more flattering one — so every analysis is its
+    own row with its own ``computed_at``, and the history of what was concluded when is
+    reconstructable. Repeated interim looks are a real inferential hazard, and the mitigation
+    is that they are visible rather than that they are prevented.
+
+    **Counts are stored, not derived.** ``control_case_count`` and ``treatment_case_count`` are
+    compared against the experiment's ``required_sample_size_per_group`` to decide whether the
+    result may support attribution (R13.C8). Recomputing them at read time against a live
+    assignment table would let a result that was underpowered when concluded silently become
+    adequately powered later.
+    """
+
+    __tablename__ = "experiment_result"
+
+    experiment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("experiment.id", ondelete="RESTRICT"), nullable=False
+    )
+    primary_metric: Mapped[str] = mapped_column(Text, nullable=False)
+    """Copied from the experiment rather than joined, because the experiment's own
+    ``primary_metric`` could in principle be edited and a result must describe what was
+    actually analysed."""
+
+    analysis_method: Mapped[str] = mapped_column(Text, nullable=False)
+
+    control_case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    treatment_case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    control_recoveries: Mapped[int] = mapped_column(Integer, nullable=False)
+    treatment_recoveries: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    control_rate: Mapped[Decimal | None] = mapped_column(PROBABILITY)
+    treatment_rate: Mapped[Decimal | None] = mapped_column(PROBABILITY)
+    """``NULL`` on a zero denominator, never zero. An arm with no cases has no rate, and
+    reporting 0.0000 would make an empty arm look like a total failure to recover."""
+
+    lift: Mapped[Decimal | None] = mapped_column(SIGNED_INCREMENT)
+    lift_ci_low: Mapped[Decimal | None] = mapped_column(SIGNED_INCREMENT)
+    lift_ci_high: Mapped[Decimal | None] = mapped_column(SIGNED_INCREMENT)
+    """Signed, because a treatment can do worse than doing nothing and the design refuses to
+    hide that. ``SIGNED_INCREMENT`` rather than ``PROBABILITY`` for exactly that reason — a
+    difference of two probabilities lives in [-1, 1]."""
+
+    contaminated_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    excluded_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Reported alongside every result (R13.C15). A lift computed after discarding a third of
+    the control arm is a different claim from one that discarded none, and the reader is
+    entitled to see which happened."""
+
+    labels: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    """The result's own labels, distinct from the experiment's. An experiment can be sound
+    while a particular analysis of it is ``UNDERPOWERED`` or
+    ``CAUSALITY_NOT_ESTABLISHED`` — the interval containing zero is a property of the
+    analysis, not of the design."""
+
+    comparison: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    """The four-way per-arm comparison R13.C13 asks for: net recovered revenue, intervention
+    rate, customer messages per case and blocked case count, each with the direction and size
+    of treatment minus control.
+
+    JSONB rather than twelve typed columns because these four are *reported together and
+    reasoned about together* — the question is "what did the lift cost", and splitting the
+    answer across a dozen columns invites reading one without the others. Nothing gates a
+    claim on these, so none of them needs a ``CHECK``."""
+
+    computed_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "control_case_count >= 0 AND treatment_case_count >= 0 "
+            "AND control_recoveries >= 0 AND treatment_recoveries >= 0 "
+            "AND contaminated_count >= 0 AND excluded_count >= 0",
+            name="result_counts_nonnegative",
+        ),
+        # A recovery count above the case count is arithmetically impossible and would
+        # produce a rate above one, which every downstream reader would take at face value.
+        CheckConstraint(
+            "control_recoveries <= control_case_count "
+            "AND treatment_recoveries <= treatment_case_count",
+            name="recoveries_within_case_counts",
+        ),
+        # Both bounds or neither. A single bound is not an interval, and a reader shown one
+        # would reasonably assume the other end was zero.
+        CheckConstraint(
+            "(lift_ci_low IS NULL) = (lift_ci_high IS NULL)",
+            name="interval_bounds_present_together",
+        ),
+        CheckConstraint(
+            "lift_ci_low IS NULL OR lift_ci_low <= lift_ci_high",
+            name="interval_bounds_ordered",
+        ),
+        # Reason: the metrics engine asks for the newest analysis of an experiment, and the
+        # dashboard lists an experiment's analysis history.
+        Index(
+            "ix_experiment_result_experiment_id_computed_at",
+            "experiment_id",
+            "computed_at",
+        ),
     )
 
 
@@ -291,6 +403,15 @@ class MemoryObservation(RowBase):
     features: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     cause: Mapped[str | None] = mapped_column(Text)
     confidence: Mapped[Decimal | None] = mapped_column(CONFIDENCE)
+    diagnosis_method: Mapped[str | None] = mapped_column(Text)
+    """How the cause was arrived at. R15.C1 names it alongside cause and confidence.
+
+    Stored because it decides whether the label is trustworthy, not for completeness. A cause
+    reached by ``FALLBACK_UNKNOWN`` is a cause nobody established, and a model trained on
+    those rows as though they were diagnoses would learn the shape of our own ignorance. A
+    future trainer filters on this column; today nothing does, and recording it anyway is what
+    makes that filtering possible later rather than a reason to discard the history."""
+
     selected_action: Mapped[str | None] = mapped_column(Text)
     policy_verdict: Mapped[str | None] = mapped_column(Text)
     outcome_class: Mapped[str | None] = mapped_column(Text)
@@ -321,6 +442,7 @@ class MemoryObservation(RowBase):
         UniqueConstraint("case_id", name="uq_memory_observation_case_id"),
         CheckConstraint("realized_cost >= 0", name="realized_cost_nonnegative"),
         enum_check("memory_observation", "cause", RiskCause),
+        enum_check("memory_observation", "diagnosis_method", DiagnosisMethod),
         enum_check("memory_observation", "selected_action", CandidateAction),
         enum_check("memory_observation", "policy_verdict", PolicyVerdict),
         enum_check("memory_observation", "outcome_class", OutcomeClass, extra=(NOT_ESTABLISHED,)),

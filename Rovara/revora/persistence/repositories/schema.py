@@ -30,8 +30,14 @@ __all__ = [
     "verify_schema_revision",
 ]
 
-EXPECTED_REVISION: Final[str] = "0004"
-"""The head this build expects. Bump in the same commit as a new migration."""
+EXPECTED_REVISION: Final[str] = "0006"
+"""The head this build expects. Bump in the same commit as a new migration.
+
+``0005`` added ``experiment_result`` and ``memory_observation.diagnosis_method``; ``0006``
+adds ``merchant_session``. The bump was forgotten when 0005 was written and the pg tier
+caught it immediately, which is the whole reason this constant is hand-maintained rather
+than read from the migration directory: a value derived from the files present can never
+disagree with them, and so can never detect a database that has not been migrated."""
 
 
 class SchemaRevisionMismatchError(RuntimeError):

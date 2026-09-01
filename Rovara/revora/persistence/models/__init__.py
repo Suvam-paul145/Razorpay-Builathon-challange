@@ -52,6 +52,7 @@ from revora.persistence.models.jobs import Job, JobAttempt
 from revora.persistence.models.learning import (
     Experiment,
     ExperimentAssignment,
+    ExperimentResult,
     ExperimentVersionFreeze,
     MemoryObservation,
     ModelPromotion,
@@ -66,6 +67,7 @@ from revora.persistence.models.policy import (
 from revora.persistence.models.tenancy import (
     CustomerConsent,
     Merchant,
+    MerchantSession,
     MerchantUser,
     WebhookSecret,
 )
@@ -94,6 +96,7 @@ __all__ = [
     "ExecutionIntent",
     "Experiment",
     "ExperimentAssignment",
+    "ExperimentResult",
     "ExperimentVersionFreeze",
     "IdMixin",
     "Job",
@@ -101,6 +104,7 @@ __all__ = [
     "MemoryObservation",
     "Merchant",
     "MerchantScopedMixin",
+    "MerchantSession",
     "MerchantUser",
     "ModelPromotion",
     "ModelVersion",
@@ -120,7 +124,18 @@ __all__ = [
 ]
 
 ALL_TABLES: tuple[str, ...] = tuple(sorted(Base.metadata.tables))
-"""Every table name, sorted. Thirty-one of them."""
+"""Every table name, sorted. Thirty-three of them.
+
+``experiment_result`` was added in migration 0005 alongside
+``memory_observation.diagnosis_method``. Both exist because the evidence phase needs to
+persist a claim's *conditions* — the counts and interval an analysis was concluded from,
+and how a diagnosis was reached — and neither is reconstructable after the fact from live
+tables that keep moving.
+
+``merchant_session`` arrived with the API layer in migration 0006. It is a row rather than a
+signed token because R17 needs a session that can be revoked, and because a tenant read from a
+row this system wrote is the literal form of "the merchant comes from the session and from
+nothing in the request"."""
 
 TENANT_SCOPED_TABLES: tuple[str, ...] = tuple(
     sorted(
