@@ -90,7 +90,7 @@ from revora.domain.enums import (
 )
 from revora.domain.money import ZERO, Minor
 from revora.domain.probability import Probability
-from revora.estimation.segments import FEATURE_KEYS, FEATURE_RISK_CAUSE
+from revora.domain.segments import FEATURE_KEYS, FEATURE_RISK_CAUSE
 from revora.persistence.models.estimates import BaselineEstimate
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.estimates import (
@@ -448,6 +448,10 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
         ("risk_cost", raw.risk_cost, raw.risk_cost_method),
         ("customer_cost", raw.customer_cost, raw.customer_cost_method),
     )
+    # The methods are collected as they are checked rather than read off ``raw`` again below.
+    # Reading them again would mean the type checker had to trust that this loop returned on every
+    # ``None``, which it cannot see; carrying the checked value forward makes the narrowing real.
+    checked: dict[str, EstimationMethod] = {}
     for name, value, method in costs:
         if method is None:
             return RejectedFigure(
@@ -455,6 +459,7 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
             )
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return RejectedFigure(raw.action, name, str(value), REJECTION_OUT_OF_RANGE)
+        checked[name] = method
     return CandidateFigures(
         action=raw.action,
         intervention_probability=Probability(raw.intervention_probability),
@@ -462,9 +467,9 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
         risk_cost=Minor(raw.risk_cost),
         customer_cost=Minor(raw.customer_cost),
         probability_method=raw.probability_method,
-        action_cost_method=raw.action_cost_method,
-        risk_cost_method=raw.risk_cost_method,
-        customer_cost_method=raw.customer_cost_method,
+        action_cost_method=checked["action_cost"],
+        risk_cost_method=checked["risk_cost"],
+        customer_cost_method=checked["customer_cost"],
         availability=raw.availability,
         unavailable_reason=raw.unavailable_reason,
     )

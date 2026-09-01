@@ -57,6 +57,7 @@ __all__ = [
     "get_secret_store",
     "reset_secret_store",
     "set_secret_store",
+    "verify_dashboard_key",
     "verify_webhook_signature",
 ]
 
@@ -71,6 +72,30 @@ ENV_LLM_CREDENTIAL: Final[str] = "REVORA_LLM_CREDENTIAL"
 ENV_WEBHOOK_SECRETS_PREFIX: Final[str] = "REVORA_WEBHOOK_SECRETS_"
 """Suffixed with the merchant slug, upper-cased, non-alphanumerics as underscores.
 Value is a comma-separated list, newest secret first."""
+
+ENV_DASHBOARD_KEYS_PREFIX: Final[str] = "REVORA_DASHBOARD_KEYS_"
+"""Suffixed the same way as the webhook prefix. Comma-separated, newest first.
+
+The credential that mints a dashboard session. **[BUILD LATER]** and honest about it:
+``merchant_user`` has no password column and never had one, because the design assumes an
+external identity provider and states plainly that per-user roles and MFA are deferred for a
+single-operator persona. Inventing a password column now would mean inventing a hashing
+scheme, a reset flow and a lockout policy — four things to get wrong — for a persona that
+does not need them.
+
+So a session is minted by presenting a per-merchant operator key, verified in constant time
+against this list, exactly as a webhook signature is verified. It is a shared secret rather
+than a user credential, which is why the session it produces still names a specific
+``merchant_user``: the audit trail has to say who acted even when the credential does not."""
+
+ENV_SESSION_TOKEN_SECRET: Final[str] = "REVORA_SESSION_TOKEN_SECRET"
+"""HMAC secret the stored session token digest is keyed with.
+
+Separate from ``REVORA_CUSTOMER_KEY_SECRET`` on purpose. Rotating the customer key secret
+invalidates every stored ``customer_key`` and therefore every cross-case opt-out join;
+rotating this one invalidates live dashboard sessions and nothing else. Sharing one secret
+would couple "log everybody out" to "lose the opt-out index", which is the kind of coupling
+that stops a rotation from ever happening."""
 
 WEBHOOK_REDELIVERY_WINDOW: Final[timedelta] = timedelta(hours=24)
 """How long a retired webhook secret must stay active. Matches the provider's
@@ -250,6 +275,33 @@ def verify_webhook_signature(
     return matched
 
 
+def verify_dashboard_key(presented: str, keys: Sequence[SecretValue]) -> bool:
+    """True if ``presented`` equals any configured dashboard key for the merchant.
+
+    Every key is compared even after a match, and each comparison is ``compare_digest``, for
+    the same two reasons as the webhook check: a timing signal must not reveal *which* key
+    matched, and a byte-by-byte early exit must not reveal how much of a wrong key was right.
+
+    An empty ``presented`` is refused before any comparison. ``compare_digest("", "")`` is
+    ``True``, so a merchant whose key list somehow contained a blank entry would otherwise
+    authenticate an empty header — and the blank entry is exactly what a misconfigured
+    environment variable produces.
+
+    Raises:
+        CredentialUnavailableError: if no key was supplied, distinguished from a wrong key
+            because one is a configuration failure and the other is an authentication failure.
+    """
+    if not keys:
+        raise CredentialUnavailableError("dashboard_key", "no key configured for merchant")
+    if not presented:
+        return False
+    matched = False
+    for key in keys:
+        if hmac.compare_digest(key.reveal(), presented):
+            matched = True
+    return matched
+
+
 class SecretStore:
     """Named accessors for every credential Revora needs.
 
@@ -360,6 +412,38 @@ class SecretStore:
         if not values:
             raise CredentialUnavailableError("webhook_signing_secret", "no secret for merchant")
         return values
+
+    def dashboard_keys(self, merchant_slug: str) -> tuple[SecretValue, ...]:
+        """The operator keys that may mint a dashboard session for one merchant, newest first.
+
+        Same shape as :meth:`webhook_signing_secrets` and for the same reason: more than one
+        entry is normal, because a rotation adds the new key and keeps the old one until every
+        operator has moved. A tuple rather than a single value is what makes rotation possible
+        without a window where nobody can log in.
+
+        Raises:
+            CredentialUnavailableError: if the merchant has no configured key. Minting refuses,
+                which is the safe direction — a merchant with no dashboard credential should be
+                unreachable rather than open.
+        """
+        name = ENV_DASHBOARD_KEYS_PREFIX + _slug_to_env(merchant_slug)
+        raw = self._resolver.get(name)
+        if raw is None:
+            raise CredentialUnavailableError("dashboard_key", "no key for merchant")
+        values = tuple(SecretValue(part.strip()) for part in raw.split(",") if part.strip())
+        if not values:
+            raise CredentialUnavailableError("dashboard_key", "no key for merchant")
+        return values
+
+    def session_token_secret(self) -> bytes:
+        """HMAC secret behind the stored session-token digest.
+
+        Base64, at least 32 bytes decoded, like the customer-key secret. The token itself is
+        never stored — only its keyed digest — so a database disclosure does not hand over live
+        sessions.
+        """
+        value = self._require(ENV_SESSION_TOKEN_SECRET, "session_token_secret")
+        return _decode_key(value.reveal(), "session_token_secret", minimum_length=32)
 
     def __repr__(self) -> str:
         return f"SecretStore(resolver={self._resolver!r})"

@@ -58,6 +58,19 @@ from revora.domain.enums import RiskCause
 from revora.domain.failure_taxonomy import ErrorSource
 from revora.domain.money import Minor
 
+# NOTE ON LOCATION. This module lived in ``revora.estimation`` until recovery memory needed
+# it. The feature document is the interface between the component that *writes* observations
+# (``revora.memory``) and the component that *reads* them into a posterior
+# (``revora.estimation``) — they agree by JSONB containment on these exact five keys, and a
+# key that drifts on one side does not raise, it silently stops matching and collapses every
+# segment to the global prior.
+#
+# Those two packages sit in the same layer, so neither may import the other. The choices were
+# to duplicate the banding rules in both (the drift bug, guaranteed) or to move the shared
+# vocabulary down to where both can see it. It belongs here on its own merits: it is pure
+# enums and integer arithmetic over domain types, with no I/O and no configuration, and it
+# defines what a segment *is* rather than how one is estimated.
+
 __all__ = [
     "AMOUNT_BAND_BOUNDARIES",
     "BACKOFF_ORDER",

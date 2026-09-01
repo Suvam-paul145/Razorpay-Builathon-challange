@@ -84,6 +84,14 @@ def candidate_inputs(
     baseline, all costs zero — because that is the only form the estimation layer ever
     produces for it, and a generator that produced any other would be testing the
     optimizer against an input that cannot occur while failing P19 for the wrong reason.
+
+    ``WAIT`` is constrained too, and that was a gap: it was being generated ``UNAVAILABLE``
+    and with arbitrary action and customer costs, neither of which the estimation layer can
+    produce. ``WAIT`` is in ``EXECUTABLE_ACTIONS`` — waiting cannot fail at a provider — and
+    R6.C10 fixes its action cost and customer cost at zero, since it spends the recovery
+    window rather than money. Its ``risk_cost`` is still drawn, because that figure is a
+    real estimate. The unconstrained version was not harmless: it made P15 fail for an input
+    the system cannot reach, which hides whether the real bug it also found was fixed.
     """
     chosen = action if action is not None else draw(st.sampled_from(ACTION_PRECEDENCE))
     base = baseline if baseline is not None else Probability(draw(_probability_values()))
@@ -94,6 +102,15 @@ def candidate_inputs(
             intervention_probability=base,
             action_cost=Minor(0),
             risk_cost=Minor(0),
+            customer_cost=Minor(0),
+        )
+
+    if chosen is CandidateAction.WAIT:
+        return CandidateInput(
+            action=chosen,
+            intervention_probability=Probability(draw(_probability_values())),
+            action_cost=Minor(0),
+            risk_cost=Minor(draw(_costs())),
             customer_cost=Minor(0),
         )
 

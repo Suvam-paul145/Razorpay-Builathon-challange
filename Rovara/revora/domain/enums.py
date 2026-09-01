@@ -369,6 +369,34 @@ NOT_ESTABLISHED = "NOT_ESTABLISHED"
 supports a number. Deliberately not zero — "we have not measured this" and "we
 measured this and it was nothing" are different statements."""
 
+UNDEFINED = "UNDEFINED"
+"""Reported for any rate whose denominator is zero (R12.C5). Never the number zero.
+
+A reporting period with no cases has no recovery rate. Reporting ``0`` would say the
+period recovered nothing, which is a measurement — and a false one, because nothing
+was measured. The distinction matters most in exactly the situation it arises: a new
+merchant's first week, where a dashboard full of zeroes reads as total failure and a
+dashboard full of ``UNDEFINED`` reads as "no data yet".
+
+A string rather than ``None`` deliberately. ``None`` renders as an empty cell in most
+template engines and as ``0`` in a few, and both lose the distinction. A caller holding
+``Decimal | str`` has to look at what it got."""
+
 RECOVERY_GROSS_OF_REFUNDS = "RECOVERY_GROSS_OF_REFUNDS"
 """Label on MVP recovery figures. Refunds are captured on every authoritative
 read but not yet netted out of reported recovery."""
+
+SUPPRESSED_BY_CONTROL_ARM = "SUPPRESSED_BY_CONTROL_ARM"
+"""Reason recorded when an action is withheld because the case is in a control arm.
+
+Lives in the domain because two packages need the same spelling and neither is
+permitted to reach the other: ``revora.experiment`` puts the case in the arm,
+``revora.execution`` honours it, and they are siblings in the layering contract. A token
+each side defined for itself would give two spellings of one reason and make the audit
+trail unqueryable by exactly the question an operator asks — "which cases did the
+experiment hold back".
+
+A named token rather than a sentence for a second reason: an operator seeing a case
+with a recommendation and no action needs to know instantly whether that was the
+experiment working or policy blocking. From the outside those look identical and mean
+completely different things."""

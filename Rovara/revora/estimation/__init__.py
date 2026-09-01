@@ -34,6 +34,17 @@ approximation.
 
 from __future__ import annotations
 
+from revora.domain.segments import (
+    BACKOFF_ORDER,
+    FEATURE_KEYS,
+    AmountBand,
+    AttemptOrdinalBand,
+    ErrorSourceBand,
+    PaymentMethodBand,
+    SegmentFeatures,
+    SegmentLevel,
+    segment_id_for,
+)
 from revora.estimation.baseline import (
     BASELINE_MODEL_VERSION,
     UNCERTAINTY_UNAVAILABLE,
@@ -65,17 +76,6 @@ from revora.estimation.candidates import (
     candidate_figures,
     run_candidate_estimation,
     wait_probability,
-)
-from revora.estimation.segments import (
-    BACKOFF_ORDER,
-    FEATURE_KEYS,
-    AmountBand,
-    AttemptOrdinalBand,
-    ErrorSourceBand,
-    PaymentMethodBand,
-    SegmentFeatures,
-    SegmentLevel,
-    segment_id_for,
 )
 
 __all__ = [

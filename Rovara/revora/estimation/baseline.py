@@ -74,12 +74,12 @@ from revora.domain.enums import EstimationMethod, Provenance, RiskCause, Validat
 from revora.domain.money import Minor
 from revora.domain.payment_event import CanonicalPaymentEvent
 from revora.domain.probability import Probability
-from revora.estimation.beta import UNIFORM_PRIOR, BetaPosterior, BetaPrior
-from revora.estimation.segments import (
+from revora.domain.segments import (
     SegmentFeatures,
     SegmentLevel,
     backoff_candidates,
 )
+from revora.estimation.beta import UNIFORM_PRIOR, BetaPosterior, BetaPrior
 from revora.persistence.models.estimates import BaselineEstimate
 from revora.persistence.repositories.cases import (
     RecoveryCaseRepository,

@@ -11,6 +11,14 @@ non-positive check comes *first* and returns, and the ratio is computed only for
 candidates that got past it. ``cost_ratio`` stays ``None`` on the excluded ones, which is
 the recorded evidence that the division was skipped rather than performed and discarded.
 
+**The pool that competes is not the same as the pool that survived exclusion (R7.C4, R7.C5).**
+The two null actions are deliberately never excluded, so "everything unexcluded" is never empty —
+and while the pool was defined that way, ``NO_POSITIVE_VALUE`` was unreachable code and a world
+where acting made things worse selected ``DO_NOTHING`` while recording ``HIGHEST_NET_VALUE``. The
+action was right and the sentence was wrong: a merchant was told doing nothing won a comparison
+when the truth was that there was nothing to compare. :func:`_qualifies` is the requirement's own
+four conditions, asked in one place, and it is what makes the two "did nothing" reasons distinct.
+
 **High baseline short-circuits the ranking (R7.C6).** Where the baseline is at or above
 ``HIGH_BASELINE_THRESHOLD``, a null action is selected with
 ``HIGH_BASELINE_NO_INTERVENTION`` regardless of what the candidates say. This is checked
@@ -91,12 +99,32 @@ class SelectionResult:
     selection_reason: SelectionReason
     candidates: tuple[EvaluatedCandidate, ...]
     divergence_reason: str | None = None
+    qualifying_actions: tuple[CandidateAction, ...] = ()
+    """The actions that actually competed: unexcluded *and* clearing both configured floors.
+
+    Recorded rather than left for a caller to re-derive, because re-deriving it needs the
+    thresholds as they were at the time and a second copy of the rule. It is also the field
+    that makes the difference between the two "did nothing" reasons legible: empty means
+    nothing qualified, which is ``NO_POSITIVE_VALUE``.
+    """
 
     @property
     def survivors(self) -> tuple[EvaluatedCandidate, ...]:
-        """Candidates that cleared every exclusion, in rank order."""
+        """Candidates that cleared every exclusion, in rank order.
+
+        Not the same set as :attr:`qualifying_actions`. A null action is never *excluded* — it
+        has no exclusion reason and it carries a rank — but ``DO_NOTHING`` has exactly zero net
+        value by definition, so it does not clear ``MIN_NET_VALUE_THRESHOLD`` and it is not
+        competing. Conflating the two is what made ``NO_POSITIVE_VALUE`` unreachable.
+        """
         ranked = [c for c in self.candidates if c.rank is not None]
         return tuple(sorted(ranked, key=lambda c: c.rank or 0))
+
+    @property
+    def qualifying(self) -> tuple[EvaluatedCandidate, ...]:
+        """The competing candidates themselves, in input order."""
+        pool = set(self.qualifying_actions)
+        return tuple(item for item in self.candidates if item.action in pool)
 
 
 def select(
@@ -124,29 +152,30 @@ def select(
         for candidate in candidates
     ]
     screened = tuple(_apply_exclusions(item, thresholds) for item in evaluated)
+    ranked = _with_ranks(screened)
+    qualifying = [item for item in screened if _qualifies(item, thresholds)]
+    pool = tuple(item.action for item in qualifying)
 
     # R7.C6: a high baseline is decided before the ranking, not by it.
     if baseline.value >= thresholds.high_baseline:
-        null_choice = _best_null_action(screened)
         return SelectionResult(
-            selected=null_choice,
+            selected=_best_null_action(screened),
             selection_reason=SelectionReason.HIGH_BASELINE_NO_INTERVENTION,
-            candidates=_with_ranks(screened),
+            candidates=ranked,
             divergence_reason=None,
+            qualifying_actions=pool,
         )
 
-    survivors = [item for item in screened if not item.excluded]
-    ranked = _with_ranks(screened)
-
-    if not survivors:
+    if not qualifying:
         return SelectionResult(
             selected=_best_null_action(screened),
             selection_reason=SelectionReason.NO_POSITIVE_VALUE,
             candidates=ranked,
             divergence_reason=None,
+            qualifying_actions=pool,
         )
 
-    winner = min(survivors, key=_ranking_key)
+    winner = min(qualifying, key=_ranking_key)
     selected = next(
         item for item in ranked if item.action is winner.action
     )
@@ -154,8 +183,38 @@ def select(
         selected=selected,
         selection_reason=SelectionReason.HIGHEST_NET_VALUE,
         candidates=ranked,
-        divergence_reason=_divergence(selected, survivors),
+        divergence_reason=_divergence(selected, qualifying),
+        qualifying_actions=pool,
     )
+
+
+def _qualifies(item: EvaluatedCandidate, thresholds: Thresholds) -> bool:
+    """Whether a candidate is actually competing for selection. R7.C4's pool, exactly.
+
+    The requirement names four conditions: no exclusion reason, not ``UNAVAILABLE``, net value at
+    or above ``MIN_NET_VALUE_THRESHOLD``, and incremental probability at or above
+    ``MIN_INCREMENTAL_PROBABILITY``. The first two are already settled by
+    :func:`_apply_exclusions`; the last two have to be re-asked here, and that is the whole point
+    of this function.
+
+    **This is the fix for a real bug.** The pool used to be "everything not excluded", and the two
+    null actions are deliberately never excluded — so the pool was never empty, and
+    ``NO_POSITIVE_VALUE`` was unreachable code. A world where acting reduces recovery therefore
+    selected ``DO_NOTHING`` (correctly) and recorded ``HIGHEST_NET_VALUE`` (misleadingly): a
+    merchant reading that would be told doing nothing *won* a comparison, when the truth is there
+    was nothing to compare. R7.C5 asks for the other sentence, and the two are not interchangeable.
+    Found by the negative synthetic scenario, which is exactly what it exists for.
+
+    Note that this is not "drop the null actions". ``WAIT`` genuinely can clear both floors — its
+    probability comes from the no-intervention hazard over the time left in the window — and when
+    it does it competes and can win on merit, with ``HIGHEST_NET_VALUE`` recorded honestly.
+    ``DO_NOTHING`` never qualifies, because its net value is definitionally zero.
+    """
+    if item.excluded:
+        return False
+    if int(item.net_recovery_value) < int(thresholds.min_net_value):
+        return False
+    return item.incremental_probability.value >= thresholds.min_incremental_probability
 
 
 # ---------------------------------------------------------------------------
@@ -274,9 +333,20 @@ def _best_null_action(items: tuple[EvaluatedCandidate, ...]) -> EvaluatedCandida
     until its window closes has spent the whole opportunity on a decision to do nothing
     slowly. On an exact tie, doing nothing at least leaves the window intact.
 
-    Falls back to the first candidate if neither null action is present, which the
-    estimation layer guarantees cannot happen — but a ``StopIteration`` escaping from
-    here would be a crash in the one path that exists to always have an answer.
+    **An excluded null action is never chosen while an unexcluded one exists.** ``WAIT``
+    can arrive marked ``UNAVAILABLE``, and it can still hold the greater net value — so
+    ranking the nulls on net value alone would select an action that cannot be performed
+    and record it as the decision. That is worse than choosing the weaker option: it is a
+    decision to do something that will not happen. Found by P15 once
+    ``NO_POSITIVE_VALUE`` became reachable and this function started being reached with a
+    real candidate set; before that it was latent under the high-baseline branch, where no
+    property asserted the selected candidate was performable.
+
+    Falls back to the whole null set if both are excluded, preferring ``DO_NOTHING``,
+    because doing nothing cannot fail at a provider and an input claiming otherwise is
+    malformed rather than informative. The estimation layer never produces that input; the
+    fallback exists because a ``StopIteration`` escaping the one path that must always have
+    an answer would be an outage.
     """
     null_actions = [
         item
@@ -285,8 +355,9 @@ def _best_null_action(items: tuple[EvaluatedCandidate, ...]) -> EvaluatedCandida
     ]
     if not null_actions:  # pragma: no cover - the candidate set always holds both
         return items[0]
+    performable = [item for item in null_actions if not item.excluded]
     return min(
-        null_actions,
+        performable or null_actions,
         key=lambda item: (
             -int(item.net_recovery_value),
             _PRECEDENCE_INDEX[item.action],
@@ -295,19 +366,24 @@ def _best_null_action(items: tuple[EvaluatedCandidate, ...]) -> EvaluatedCandida
 
 
 def _divergence(
-    selected: EvaluatedCandidate, survivors: list[EvaluatedCandidate]
+    selected: EvaluatedCandidate, qualifying: list[EvaluatedCandidate]
 ) -> str | None:
-    """Record when the highest-probability survivor is not the selected one.
+    """Record when the highest-probability *competing* candidate is not the selected one.
 
     This is Property 18 and the product's central argument: "most likely to work" and
     "worth doing" are different questions, and where they disagree a merchant is owed
     both numbers rather than the one that happened to win. Recorded at decision time
     rather than reconstructed later, because reconstructing it would need the full
     candidate set *and* the ranking rule as they were at the time.
+
+    Computed over the qualifying pool rather than over everything unexcluded, because a
+    divergence between two candidates that were never in contention is not a finding. The
+    previous version could report one between ``WAIT`` and ``DO_NOTHING`` in a case where nothing
+    qualified at all, which reads as "we chose the less likely option" when nothing was chosen.
     """
-    if not survivors:
+    if not qualifying:
         return None
-    highest = max(survivors, key=lambda item: item.intervention_probability.value)
+    highest = max(qualifying, key=lambda item: item.intervention_probability.value)
     if highest.action is selected.action:
         return None
     return DIVERGENCE_HIGHER_PROBABILITY_LOWER_NET_VALUE

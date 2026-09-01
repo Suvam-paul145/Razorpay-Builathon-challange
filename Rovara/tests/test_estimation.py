@@ -66,6 +66,21 @@ from revora.domain.enums import (
 )
 from revora.domain.money import Minor
 from revora.domain.probability import Probability
+from revora.domain.segments import (
+    BACKOFF_ORDER,
+    FEATURE_KEYS,
+    GLOBAL_SEGMENT_ID,
+    AmountBand,
+    AttemptOrdinalBand,
+    ErrorSourceBand,
+    PaymentMethodBand,
+    SegmentFeatures,
+    SegmentLevel,
+    amount_band_for,
+    error_source_band_for,
+    payment_method_band_for,
+    segment_id_for,
+)
 from revora.estimation.baseline import (
     BASELINE_MODEL_VERSION,
     FAILURE_MEMORY_UNAVAILABLE,
@@ -85,21 +100,6 @@ from revora.estimation.candidates import (
     RejectedFigure,
     build_candidate_set,
     validate_figures,
-)
-from revora.estimation.segments import (
-    BACKOFF_ORDER,
-    FEATURE_KEYS,
-    GLOBAL_SEGMENT_ID,
-    AmountBand,
-    AttemptOrdinalBand,
-    ErrorSourceBand,
-    PaymentMethodBand,
-    SegmentFeatures,
-    SegmentLevel,
-    amount_band_for,
-    error_source_band_for,
-    payment_method_band_for,
-    segment_id_for,
 )
 from revora.persistence.repositories.estimates import SegmentCounts
 

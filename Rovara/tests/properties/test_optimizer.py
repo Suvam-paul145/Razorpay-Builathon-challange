@@ -156,21 +156,29 @@ def test_p14_no_cost_ratio_is_computed_on_non_positive_revenue(
 def test_p15_selection_is_argmax_of_net_value_among_survivors(
     data: tuple[Probability, tuple[CandidateInput, ...]], amount: Minor
 ) -> None:
-    """Feature: Value_Optimizer. Property 15 — the selected action is the survivor with
-    the greatest net recovery value; no excluded candidate is ever selected.
+    """Feature: Value_Optimizer. Property 15 — the selected action is the candidate with
+    the greatest net recovery value *among those competing*; no excluded candidate is ever
+    selected.
+
+    "Competing" is ``result.qualifying``, not "everything unexcluded". The two differ by the null
+    actions, which are never excluded but do not clear the value floors — and comparing against
+    the wider set would assert that the optimizer must pick a candidate the requirement says is
+    not in the running.
     """
     baseline, candidates = data
     result = select(candidates, baseline=baseline, amount=amount,
                     thresholds=_DEFAULT_THRESHOLDS)
 
-    survivors = [c for c in result.candidates if not c.excluded]
     selected = result.selected
-
     assert not selected.excluded, "an excluded candidate must never be selected"
-    if survivors:
-        best = max(c.net_recovery_value for c in survivors)
-        if result.selection_reason is SelectionReason.HIGHEST_NET_VALUE:
-            assert selected.net_recovery_value == best
+
+    if result.selection_reason is SelectionReason.HIGHEST_NET_VALUE:
+        qualifying = result.qualifying
+        assert qualifying, "HIGHEST_NET_VALUE with nothing competing is a contradiction"
+        assert selected.net_recovery_value == max(c.net_recovery_value for c in qualifying)
+    else:
+        # The other two reasons both mean a null action was chosen by default.
+        assert selected.action in (CandidateAction.DO_NOTHING, CandidateAction.WAIT)
 
 
 @given(data=tied_candidate_set(), amount=positive_money())
@@ -213,19 +221,66 @@ def test_p15_ties_resolve_by_cost_then_declared_precedence(
 
 
 @given(data=candidate_estimate_set(), amount=positive_money())
-def test_p16_no_positive_value_selects_a_null_action(
+def test_p16_nothing_qualifying_means_no_positive_value(
     data: tuple[Probability, tuple[CandidateInput, ...]], amount: Minor
 ) -> None:
-    """Feature: Value_Optimizer. Property 16 — when no candidate clears both
-    thresholds, the selection is a null action with reason ``NO_POSITIVE_VALUE``,
-    ``DO_NOTHING`` winning on equality.
+    """Feature: Value_Optimizer. Property 16 — when no candidate clears both thresholds, the
+    selection is a null action with reason ``NO_POSITIVE_VALUE``, ``DO_NOTHING`` on equality.
+
+    Stated as a biconditional, and that matters. The earlier version was written as "if the reason
+    happened to be ``NO_POSITIVE_VALUE`` then a null action was selected", which passed for years
+    without ever entering the branch: the pool was defined as "unexcluded", the null actions are
+    never excluded, so the pool was never empty and the reason was unreachable. A conditional
+    property is satisfied by a system that never meets the condition.
     """
     baseline, candidates = data
     result = select(candidates, baseline=baseline, amount=amount,
                     thresholds=_DEFAULT_THRESHOLDS)
+    if baseline.value >= _DEFAULT_THRESHOLDS.high_baseline:
+        return  # R7.C6 owns this case, and P17 asserts it.
 
-    if result.selection_reason is SelectionReason.NO_POSITIVE_VALUE:
+    nothing_qualified = not result.qualifying
+    assert (result.selection_reason is SelectionReason.NO_POSITIVE_VALUE) == nothing_qualified
+
+    if nothing_qualified:
         assert result.selected.action in (CandidateAction.DO_NOTHING, CandidateAction.WAIT)
+        nulls = [
+            c
+            for c in result.candidates
+            if c.action in (CandidateAction.DO_NOTHING, CandidateAction.WAIT)
+        ]
+        best_null = max(c.net_recovery_value for c in nulls)
+        assert result.selected.net_recovery_value == best_null
+        if result.selected.action is CandidateAction.WAIT:
+            # WAIT only wins on a strict advantage; R7.C5 fixes equality to DO_NOTHING.
+            do_nothing = next(
+                c for c in nulls if c.action is CandidateAction.DO_NOTHING
+            )
+            assert result.selected.net_recovery_value > do_nothing.net_recovery_value
+
+
+@given(data=candidate_estimate_set(), amount=positive_money())
+def test_no_positive_value_is_reachable(
+    data: tuple[Probability, tuple[CandidateInput, ...]], amount: Minor
+) -> None:
+    """The branch exists and runs. Thresholds nothing can clear, so the pool must be empty.
+
+    A guard against the regression, not a property of the arithmetic. ``NO_POSITIVE_VALUE`` was
+    dead code and every test around it passed; this one fails if it dies again.
+    """
+    baseline, candidates = data
+    impossible = Thresholds(
+        min_net_value=Minor(10**15),
+        min_incremental_probability=Decimal("1.0"),
+        max_cost_to_value_ratio=Decimal("0.30"),
+        high_baseline=Decimal("1.1"),
+    )
+    result = select(candidates, baseline=baseline, amount=amount, thresholds=impossible)
+
+    assert result.qualifying_actions == ()
+    assert result.selection_reason is SelectionReason.NO_POSITIVE_VALUE
+    assert result.selected.action in (CandidateAction.DO_NOTHING, CandidateAction.WAIT)
+    assert result.divergence_reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +309,12 @@ def test_p17_high_baseline_prefers_no_intervention(
 
     assert result.selection_reason is SelectionReason.HIGH_BASELINE_NO_INTERVENTION
     assert result.selected.action in (CandidateAction.DO_NOTHING, CandidateAction.WAIT)
+    # And it must be performable. This assertion is here because it was missing: the
+    # high-baseline branch has always chosen through `_best_null_action`, which ranked the two
+    # null actions on net value without checking whether they were excluded — so an UNAVAILABLE
+    # `WAIT` with the greater net value was selectable, recording a decision to do something
+    # that cannot happen. R7 forbids selecting an unavailable action anywhere.
+    assert not result.selected.excluded
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +340,14 @@ def test_p18_divergence_is_disclosed_when_probability_and_value_disagree(
     result = select(candidates, baseline=baseline, amount=amount,
                     thresholds=_DEFAULT_THRESHOLDS)
 
-    considered = [c for c in result.candidates if not c.excluded]
-    if not considered:
+    if result.selection_reason is not SelectionReason.HIGHEST_NET_VALUE:
+        # No ranking happened, so there is no disagreement to disclose. Reporting one would read
+        # as "we chose the less likely option" in a case where nothing was chosen on merit.
+        assert result.divergence_reason is None
         return
+
+    considered = result.qualifying
+    assert considered
     highest_probability = max(considered, key=lambda c: c.intervention_probability.value)
     if highest_probability.action is not result.selected.action:
         assert result.divergence_reason == "HIGHER_PROBABILITY_LOWER_NET_VALUE"
