@@ -62,6 +62,7 @@ from revora.audit.writer import AuditEntry, AuditWriter
 from revora.cases.manager import apply_locked_transition
 from revora.domain.enums import CaseState, IntentState, OutcomeClass, TerminalReason
 from revora.domain.transitions import TERMINAL_STATES
+from revora.memory.store import observation_writer
 from revora.outcome.reads import ReadRecord, payment_timestamp, persist_read
 from revora.persistence.models import RecoveryOutcome
 from revora.persistence.repositories.audit import AuditRecordRepository
@@ -485,6 +486,7 @@ def _handle_unreadable(
             actor=_ACTOR,
             terminal_reason=TerminalReason.PAYMENT_STATE_UNVERIFIABLE,
             correlation_id=correlation_id,
+            on_success=observation_writer(config, correlation_id=correlation_id),
             disclosure_length=config.MASK_DISCLOSURE_LENGTH,
             max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
         )
@@ -550,6 +552,7 @@ def _handle_conflict(
                 actor=_ACTOR,
                 terminal_reason=TerminalReason.PAYMENT_STATE_UNVERIFIABLE,
                 correlation_id=correlation_id,
+                on_success=observation_writer(config, correlation_id=correlation_id),
                 disclosure_length=config.MASK_DISCLOSURE_LENGTH,
                 max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
             )
@@ -676,6 +679,10 @@ def _declare_recovery(
         actor=_ACTOR,
         verified_capture=True,
         correlation_id=correlation_id,
+        # R15.C1: the observation shares this transaction. A recovered case with no
+        # observation is a permanent hole in the training set, because nothing revisits a
+        # terminal case to fill it in.
+        on_success=observation_writer(config, correlation_id=correlation_id),
         disclosure_length=config.MASK_DISCLOSURE_LENGTH,
         max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
     )
