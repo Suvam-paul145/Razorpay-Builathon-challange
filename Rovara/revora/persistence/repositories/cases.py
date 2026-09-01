@@ -190,6 +190,30 @@ class RecoveryCaseRepository(MerchantScopedRepository[RecoveryCase]):
         )
         return self.session.execute(statement).scalar_one_or_none()
 
+    def newest_case_for_payment(
+        self, merchant_id: uuid.UUID, provider_payment_id: str
+    ) -> RecoveryCase | None:
+        """The most recently detected case for a payment, **terminal ones included**.
+
+        Distinct from :meth:`open_case_for_payment`, and the difference is the delayed-recovery
+        path. A capture that arrives after the window closed belongs to a case that is already
+        ``EXPIRED``, so the open-case read cannot see it — and R10.C14 requires exactly that
+        capture to reconcile the case to ``RECOVERED``. Routing a late success signal through the
+        open-case read would drop it silently, which is the difference between recovering money and
+        losing track of money the merchant already has.
+
+        Newest by ``detected_at``: one payment can legitimately have several cases over time
+        because a terminal case does not block a new one, and a capture refers to the most recent
+        attempt at that payment.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(RecoveryCase.provider_payment_id == provider_payment_id)
+            .order_by(RecoveryCase.detected_at.desc(), RecoveryCase.created_at.desc())
+            .limit(1)
+        )
+        return self.session.execute(statement).scalars().first()
+
     def insert_if_absent(
         self, merchant_id: uuid.UUID, *, values: dict[str, object]
     ) -> uuid.UUID | None:

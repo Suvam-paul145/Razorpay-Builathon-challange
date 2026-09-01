@@ -27,7 +27,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from revora.cases.manager import apply_transition
+from revora.cases.manager import OnSuccess, apply_transition
 from revora.domain.enums import CaseState, TerminalReason
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.session import tenant_transaction
@@ -56,6 +56,7 @@ def sweep_expired_cases(
     *,
     limit: int = DEFAULT_SWEEP_LIMIT,
     factory: sessionmaker[Session] | None = None,
+    on_terminal: OnSuccess | None = None,
 ) -> int:
     """Expire every non-terminal case whose recovery window has closed.
 
@@ -63,6 +64,19 @@ def sweep_expired_cases(
     each in its own transaction through ``apply_transition`` — the read is not held
     across the writes, so a long backlog does not hold a lock while the whole batch
     is processed.
+
+    Args:
+        on_terminal: runs inside each expiry's transaction, after the state is written.
+            This is how the recovery-memory observation gets recorded atomically with the
+            expiry (R15.C1) without this module importing ``revora.memory`` — which the
+            layering contract forbids, and rightly: the component that owns state
+            transitions has no business knowing what a training label is. The worker
+            supplies the writer.
+
+            Expiry is the *most* important terminal transition to observe, because a case
+            that ran its whole window without a confirmed action is the closest thing
+            Revora has to a clean no-intervention outcome. Dropping these would leave the
+            baseline learning only from cases it acted on.
     """
     moment = now()
     with tenant_transaction(merchant_id, factory) as session:
@@ -84,6 +98,7 @@ def sweep_expired_cases(
             actor=_SWEEPER_ACTOR,
             terminal_reason=TerminalReason.RECOVERY_WINDOW_ELAPSED,
             factory=factory,
+            on_success=on_terminal,
         )
         if result.applied:
             expired += 1
