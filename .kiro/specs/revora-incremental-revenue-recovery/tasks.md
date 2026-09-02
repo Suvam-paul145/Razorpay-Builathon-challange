@@ -772,16 +772,16 @@ Two departures from the suggested order, both justified in place:
     - _Requirements: R13.C7, R13.C12_
     - _Properties: P21_
 
-- [ ] 28. Stateful property model
+- [x] 28. Stateful property model
   - One `RuleBasedStateMachine` carrying the eleven history-level invariants, because they are all statements about the same object's history and eleven separate harnesses would explore a narrower space.
 
-  - [ ] 28.1 `RecoveryLifecycleMachine` rules and clock plan
+  - [x] 28.1 `RecoveryLifecycleMachine` rules and clock plan
     - `tests/properties/test_lifecycle_machine.py`: rules for deliver event (any kind, order, duplication), advance clock, run lifecycle sweeper, run diagnosis, run estimation and optimization, request policy evaluation, attempt execution with an injected provider behaviour and crash point, run execution reconciliation, run outcome reconciliation, record opt-out, assign human owner, and restart the process
     - `tests/strategies/clocks.py`: `clock_plan()` crossing cooldown, window end, outcome-wait timeout and retention boundaries
     - _Requirements: R2.C13, R16.C6_
     - _Properties: P5, P6_
 
-  - [ ] 28.2 The eleven invariants and the teardown termination check
+  - [x] 28.2 The eleven invariants and the teardown termination check
     - After every step: state in the 14-value enum with only legal pairs (P5); no state after terminal except one verified reconciliation (P6); caps and monotonic counters (P9); cooldown between consecutive confirmed outbound actions (P10); confirmed timestamps inside the window (P11); external calls per key at most one (P3); zero confirmed customer-visible actions after opt-out (P8); zero confirmed actions after a verified captured read except pre-existing intents marked `POST_PAYMENT_ACTION` (P7); audit sequence 1..n gap-free with no duplicates (P12); one correlation id per delivery (P13); every confirmed intent has a preceding matching approval (P1)
     - Teardown advances the clock past the worst-case bound and asserts every case terminal
     - _Requirements: R2.C2, R2.C12, R8.C4, R9.C5, R10.C5, R11.C4, R11.C7_
@@ -820,36 +820,36 @@ Two departures from the suggested order, both justified in place:
     - _Requirements: R17.C1, R17.C2, R17.C3, R17.C13, R14.C12_
     - _Properties: P30_
 
-- [ ] 30. Frontend
+- [x] 30. Frontend
   - React 18 + TypeScript + Vite + TanStack Query. Static SPA, no SSR, no server-side secrets, no arithmetic in the browser.
 
-  - [ ] 30.1 App shell, typed API client, and money rendering rules
+  - [x] 30.1 App shell, typed API client, and money rendering rules
     - `web/` with Vite, TypeScript strict, TanStack Query; generated or hand-written types matching the task 29 DTOs; a `Money` component that renders **only** the server-formatted string, and a lint rule forbidding arithmetic on any figure typed as a money field
     - _Requirements: R14.C12_
 
-  - [ ] 30.2 Case list and case detail
+  - [x] 30.2 Case list and case detail
     - List: amount, risk cause, current state, selected action, executed action, policy decision, confirmed recovered amount, outcome classification, paged and ordered by descending detection timestamp
     - Detail: diagnosis with cause, confidence, evidence, method and timestamp; **every candidate considered** with baseline, intervention and incremental probability, expected incremental revenue, the three costs, their sum and net value; the twelve policy check identifiers with pass/fail and the failed check that determined the verdict; every executed action with timestamp and result; the audit trail
     - Where the selection is `DO_NOTHING` or `WAIT`, show the recorded reason together with baseline probability, incremental probability, net value and the three compared thresholds — a refusal must be as legible as an action, never a red indicator and never suppressed
     - _Requirements: R14.C2, R14.C3, R14.C4, R14.C5, R14.C6, R14.C14, R11.C5_
 
-  - [ ] 30.3 Metrics summary with provenance and causality labels
+  - [x] 30.3 Metrics summary with provenance and causality labels
     - Revenue at risk, observed, natural, net, unresolved, recovery rate, intervention rate, each with period start, period end and computation timestamp
     - Every recovered amount carries its outcome classification label and no amount renders without one; `incremental_recovered_revenue` renders `NOT_ESTABLISHED` rather than zero where no adequate experiment exists, with `CAUSALITY_NOT_ESTABLISHED` beside observed recovery, `SYNTHETIC` beside any synthetic-derived figure, and the gross-of-refunds label on recovery figures
     - _Requirements: R14.C1, R14.C7, R14.C8, R14.C9, R12.C13_
     - _Properties: P21, P23_
 
-  - [ ] 30.4 Unresolved grouping, experiment result, and webhook health
+  - [x] 30.4 Unresolved grouping, experiment result, and webhook health
     - Unresolved cases grouped by `STOPPED`, `BLOCKED`, `EXPIRED`, `ESCALATED`, `FAILED` with count and summed amount per group, showing zero rows for empty groups
     - Experiment result with per-arm figures, per-group counts, interval bounds and every label
     - A webhook health surface showing time since the last received event, since a disabled webhook means silent total detection loss
     - _Requirements: R14.C10, R14.C8, R13.C7_
 
-  - [ ] 30.5 Absent-value and unavailable-figure rendering
+  - [x] 30.5 Absent-value and unavailable-figure rendering
     - A not-yet-recorded indication naming the current case state for any absent diagnosis, recommendation, policy decision, executed action or experiment result, and a data-unavailable indication naming the affected figure on a metrics timeout — never zero, never a dash presented as a value, because substituting zero for an absent value is a false financial statement rather than a display bug
     - _Requirements: R14.C15, R14.C16_
 
-  - [ ] 30.6 Human ownership control
+  - [x] 30.6 Human ownership control
     - Assign and release ownership from the case detail view, reflecting the suppression of automated action in the UI state
     - _Requirements: R14.C11_
 
@@ -880,20 +880,20 @@ Two departures from the suggested order, both justified in place:
     - Schema revision matches at startup; TLS verification enabled on every outbound client; secrets resolve; the webhook signature canary passes; latency-bound smoke assertions with generous margins tagged so they can be excluded from gating without being deleted
     - _Requirements: R16.C9, R17.C5, R1.C1_
 
-- [ ] 32. End-to-end integration
-  - [ ] 32.1 Full-pipeline integration test on a real Postgres
+- [x] 32. End-to-end integration
+  - [x] 32.1 Full-pipeline integration test on a real Postgres
     - Signed `payment.failed` → persisted event → detection → case → assignment → deterministic diagnosis → baseline → candidates → recommendation → policy decision → payment link created once → `payment.captured` → authoritative read → `RECOVERED` → memory observation → metrics, asserting the audit trail answers every question R11.C5 lists in one query
     - Plus the refusal path: an opted-out customer produces a `BLOCKED` decision, zero external calls, and a legible reason on the detail endpoint
     - _Requirements: R11.C5, R8.C4, R10.C1, R15.C1_
     - _Properties: P1, P20_
 
-  - [ ] 32.2 The whole suite with the Reasoning_Layer hard-failing
+  - [x] 32.2 The whole suite with the Reasoning_Layer hard-failing
     - A second full run with the LLM adapter raising on every call: every case must reach a terminal state, no case may wait pending a response, and **the terminal-state distribution must be identical** to the run with the adapter available, modulo diagnosis cause and method values
     - This is the executable form of the claim that the system runs fully with the model unavailable
     - _Requirements: R4.C4, R3.C9_
     - _Properties: P31_
 
-  - [ ] 32.3 Degradation and restart integration tests
+  - [x] 32.3 Degradation and restart integration tests
     - Postgres unavailable at ingest returns 503 and persists nothing; a worker killed mid-execution reconciles without a duplicate; a window that elapsed during downtime expires on restart; withheld actions whose bounds no longer permit execution are discarded and audited
     - _Requirements: R16.C2, R16.C3, R16.C5, R16.C6, R16.C15_
     - _Properties: P3, P6_

@@ -13,6 +13,19 @@ __pycache__/
 tests/
 scripts/
 docs/
-node_modules/
-web/
 *.md
+
+# `web/` itself is NOT excluded — the image builds the dashboard from source in its own
+# stage. Only the two directories that must never enter the context are:
+#
+#   node_modules  hundreds of megabytes, platform-specific, and rebuilt by `npm ci`
+#                 anyway. Copying a host's tree in would also risk native modules built
+#                 for the wrong platform silently overriding the container's.
+#   web/dist      a stale local build. If this were copied in, the image would serve
+#                 whatever was last built on a developer's machine rather than what the
+#                 `web` stage produces from the committed source — which is exactly the
+#                 drift that building in the image is meant to eliminate.
+node_modules/
+web/node_modules/
+web/dist/
+web/coverage/

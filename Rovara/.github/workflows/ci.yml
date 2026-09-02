@@ -12,6 +12,12 @@
 # available reading of that, and it costs about a minute. The full harness tier —
 # every scenario plus the interval-coverage check — is the nightly job, because the
 # coverage check alone is a minute of Postgres round-trips.
+#
+# The `dashboard` job is the frontend's equivalent of the `static` job: types, the
+# honesty lint rules, the component tests and a production build. It is separate from
+# the Python jobs rather than folded into one because the two need different toolchains
+# and there is no ordering between them — the SPA talks to the API over HTTP and shares
+# no code with it, only a set of DTO shapes that `web/src/api/types.ts` restates by hand.
 
 name: ci
 
@@ -85,7 +91,46 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,ml]"
       - name: Pure and model tiers
-        run: pytest -m "pure or model" -q
+        # `not smoke` excludes the latency and startup-cost assertions. On a shared runner those
+        # measure the hardware as much as the code, and a gate that can fail for reasons nobody can
+        # act on teaches everyone to re-run the build. They are tagged rather than deleted so the
+        # budgets stay written down — see the `smoke` marker in pyproject.toml.
+        run: pytest -m "(pure or model) and not smoke" -q
+
+  dashboard:
+    name: dashboard (lint, tests, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Rovara/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: Rovara/web/package-lock.json
+      - name: Install
+        # `npm ci` rather than `npm install`: it installs exactly the lockfile and fails
+        # if the two have drifted. `install` would silently resolve a newer version and
+        # the build would then differ from the one a developer tested.
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        # The dashboard is plain JavaScript, so lint is the ONLY automated check on the
+        # honesty rules: no arithmetic on a money field, no client-side currency
+        # formatting or rounding, and no `?? 0` on a figure. Types could never have
+        # expressed the first of those anyway — arithmetic operators accept every number
+        # subtype, including a branded one — but the absent-value arms used to be checked
+        # by the compiler and are not any more. This step carries more weight than it did.
+        run: npm run lint
+      - name: Tests
+        # Includes a test that runs ESLint in-process against the shipped config and
+        # asserts the money rule actually fires. A typo in an ESLint selector does not
+        # error, it matches nothing — so without this the rule could enforce precisely
+        # nothing while the lint step stayed green.
+        run: npm run test
+      - name: Build
+        run: npm run build
 
   test-postgres:
     name: postgres test tier
@@ -122,7 +167,7 @@ jobs:
         # own two jobs below.
         env:
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
-        run: pytest -m "pg and not harness" -q
+        run: pytest -m "pg and not harness and not smoke" -q
 
   evidence-null-gate:
     # THE BUILD GATE. A measurement system that reports a lift in a world with no

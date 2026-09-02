@@ -85,5 +85,10 @@ markers = [
     "pg: needs a real PostgreSQL via testcontainers, runs on every push",
     "harness: full synthetic pipeline, runs nightly and pre-demo",
     "spike: manual provider verification against test-mode credentials",
+    # Timing assertions with order-of-magnitude margins. Excluded from the gating selection with
+    # `-m "not smoke"` because on shared runners a latency bound measures the hardware as much as
+    # the code, and a gate that fails for reasons nobody can act on teaches everyone to re-run the
+    # build. Tagged rather than deleted so the budgets stay written down somewhere a person checks.
+    "smoke: latency and startup-cost assertions, excluded from gating",
 ]
 addopts = "--strict-markers -q"
