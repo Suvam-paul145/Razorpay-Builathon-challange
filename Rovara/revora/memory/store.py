@@ -68,6 +68,7 @@ from revora.persistence.repositories.execution import (
 )
 from revora.persistence.repositories.memory import MemoryObservationRepository
 from revora.persistence.repositories.policy import PolicyDecisionRepository
+from revora.persistence.repositories.recommendations import RecommendationRepository
 from revora.platform.logging import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -176,7 +177,14 @@ def record_observation(
         return ObservationOutcome(existing.id, already_recorded=True)
 
     case_id = case.id
-    cycle = int(case.decision_cycle_count)
+    # Not ``case.decision_cycle_count`` — see ``active_decision_cycle``. The counter is one
+    # ahead of the cycle the diagnosis and the policy decision are filed under, and reading it
+    # here produced an observation whose cause, confidence, method and verdict were all NULL:
+    # a training label that cannot say why the action was taken, on a case where the reason was
+    # recorded in full.
+    cycle = RecommendationRepository(session).active_decision_cycle(
+        merchant_id, case_id, fallback=int(case.decision_cycle_count)
+    )
 
     diagnosis = DiagnosisRepository(session).active_for_cycle(merchant_id, case_id, cycle)
     decisions = PolicyDecisionRepository(session).for_cycle(merchant_id, case_id, cycle)

@@ -54,12 +54,13 @@ from revora.audit.writer import AuditEntry, AuditWriter
 from revora.cases.manager import apply_transition
 from revora.detection.service import DetectionServiceResult
 from revora.diagnosis.service import run_diagnosis
-from revora.domain.actions import CandidateAction
-from revora.domain.enums import CaseState, PolicyVerdict, RiskCause
+from revora.domain.actions import CandidateAction, needs_provider_call
+from revora.domain.enums import CaseState, PolicyVerdict, RiskCause, TerminalReason
 from revora.estimation.baseline import run_baseline_estimation
 from revora.estimation.candidates import run_candidate_estimation
 from revora.execution.engine import ExecutionOutcome, execute_approved_action
 from revora.experiment.control import assign_case
+from revora.memory.store import observation_writer
 from revora.optimizer.service import run_optimizer
 from revora.outcome.monitor import observe_payment_outcome
 from revora.persistence.repositories.cases import RecoveryCaseRepository
@@ -351,21 +352,67 @@ def handle_policy(
     if not outcome.authorized or not recorded.applied:
         return
 
-    # The scheduling edge, and the execution enqueue rides inside its transaction. If the enqueue
-    # were a separate commit, a crash between the two would leave a case in ``ACTION_SCHEDULED``
-    # with nothing to execute it — recoverable only by a sweep, and invisible until then.
-    apply_transition(
-        merchant_id,
-        case_id,
-        expected_version=recorded.version if recorded.version is not None else version + 1,
-        target_state=CaseState.ACTION_SCHEDULED,
-        reason="approved action scheduled",
-        actor=_POLICY_ACTOR,
-        action=outcome.selected_action,
-        correlation_id=correlation_id,
-        on_success=lambda session, case: _after(
-            session, merchant_id, case_id, EXECUTION_JOB_KIND, correlation_id
-        ),
+    action = outcome.selected_action
+    next_version = recorded.version if recorded.version is not None else version + 1
+
+    if action is not None and needs_provider_call(action):
+        # The scheduling edge, and the execution enqueue rides inside its transaction. If the
+        # enqueue were a separate commit, a crash between the two would leave a case in
+        # ``ACTION_SCHEDULED`` with nothing to execute it — recoverable only by a sweep, and
+        # invisible until then.
+        apply_transition(
+            merchant_id,
+            case_id,
+            expected_version=next_version,
+            target_state=CaseState.ACTION_SCHEDULED,
+            reason="approved action scheduled",
+            actor=_POLICY_ACTOR,
+            action=action,
+            correlation_id=correlation_id,
+            on_success=lambda session, case: _after(
+                session, merchant_id, case_id, EXECUTION_JOB_KIND, correlation_id
+            ),
+        )
+        return
+
+    if action is CandidateAction.HUMAN_ESCALATION:
+        # A human has been asked, so the case leaves automation. Terminal, and terminal is right:
+        # ``ESCALATED -> RECOVERED`` stays legal, so a case a person resolves still reconciles when
+        # the money arrives. What must not happen is what happened before this branch existed —
+        # scheduling an escalation as though it were a provider call, which left the case
+        # authorized, unexecuted and waiting for its window to close with no explanation on the
+        # record.
+        #
+        # ``observation_writer`` is attached because this is a *terminal* edge, and every terminal
+        # edge owes the training set a row. Nothing revisits a terminal case, so an edge without
+        # this callback is a permanent hole — and the hole would be systematically the large-amount
+        # cases, teaching the memory layer that expensive failures are ones Revora chose not to act
+        # on. It is exactly the wrong thing to be missing.
+        apply_transition(
+            merchant_id,
+            case_id,
+            expected_version=next_version,
+            target_state=CaseState.ESCALATED,
+            reason="approved action requires a human",
+            actor=_POLICY_ACTOR,
+            action=action,
+            terminal_reason=TerminalReason.HUMAN_OWNERSHIP,
+            correlation_id=correlation_id,
+            on_success=observation_writer(config, correlation_id=correlation_id),
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        return
+
+    # A null action. Nothing to schedule and nothing to execute — Revora decided not to act this
+    # cycle, which is a complete and defensible answer. The case stays at ``POLICY_CHECK`` and the
+    # lifecycle sweeper owns its ending, so "we chose not to act" does not become "we failed".
+    _logger.info(
+        "no action to execute this cycle",
+        merchant_id=str(merchant_id),
+        case_id=str(case_id),
+        selected_action=None if action is None else action.value,
+        selection_reason=outcome.primary_reason,
     )
 
 
@@ -516,16 +563,12 @@ def run_policy_evaluation(
 
     moment = now()
 
-    # The newest recommendation, not the one filed under the case's *current* cycle
-    # counter. The counter advances on the edge into ``DECISION_PENDING``, which happens
-    # *after* the optimizer writes its recommendation — so by the time policy runs, the
-    # counter is one ahead of the cycle the recommendation belongs to. Reading by the
-    # current counter finds nothing and the pipeline stalls in ``DECISION_PENDING``.
-    #
-    # Every subsequent lookup uses the recommendation's own cycle, so the decision, the
-    # recommendation and the diagnosis it was built from all agree about which cycle they
-    # describe. Deriving it by arithmetic on the counter would work today and break the
-    # moment another transition gained a cycle effect.
+    # The newest recommendation, not the one filed under the case's *current* cycle counter.
+    # ``RecommendationRepository.active_decision_cycle`` documents why those differ; the
+    # consequence here is that a lookup by the counter finds nothing and the pipeline stalls in
+    # ``DECISION_PENDING``. Every subsequent lookup uses the recommendation's own cycle, so the
+    # decision, the recommendation and the diagnosis it was built from all agree about which
+    # cycle they describe.
     recommendation = RecommendationRepository(session).latest_for_case(merchant_id, case_id)
 
     action = selected_action
