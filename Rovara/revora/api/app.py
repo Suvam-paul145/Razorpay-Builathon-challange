@@ -35,6 +35,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from revora.api import webhooks
 from revora.api.routers import cases, consent, experiments, health, metrics, sessions
+from revora.api.spa import mount_spa
 from revora.persistence.repositories.engine import get_engine
 from revora.persistence.repositories.schema import EXPECTED_REVISION, verify_schema_revision
 from revora.platform.logging import correlation_context, get_logger
@@ -76,7 +77,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     _logger.info("api stopping")
 
 
-def create_app(*, cors_origins: Sequence[str] | None = None, verify_schema: bool = True) -> FastAPI:
+def create_app(
+    *,
+    cors_origins: Sequence[str] | None = None,
+    verify_schema: bool = True,
+    serve_dashboard: bool = True,
+) -> FastAPI:
     """Build the application.
 
     Args:
@@ -88,6 +94,11 @@ def create_app(*, cors_origins: Sequence[str] | None = None, verify_schema: bool
             installing one with an empty list.
         verify_schema: set ``False`` only in tests that construct the app without a database.
             Production must not, and the parameter is named so a grep for it finds every caller.
+        serve_dashboard: mount the built SPA when ``web/dist`` exists. Defaults on, because the
+            same-origin deployment is the intended one. A test asserting on the API's 404 behaviour
+            sets it ``False`` so a catch-all cannot answer in place of the real response — the
+            fallback deliberately refuses the API prefixes, and this is how that guarantee gets
+            tested from the other side.
     """
     app = FastAPI(
         title=TITLE,
@@ -119,6 +130,16 @@ def create_app(*, cors_origins: Sequence[str] | None = None, verify_schema: bool
     app.include_router(metrics.router)
     app.include_router(experiments.router)
     app.include_router(consent.router)
+
+    # The built dashboard, same-origin with the API it calls — which is what lets this
+    # deployment run with no CORS middleware at all. Mounted *after* every router above,
+    # because it registers a catch-all for client-side routing, and a catch-all placed before
+    # a real route is how an endpoint starts returning HTML. See `revora.api.spa` for the
+    # second guard against exactly that.
+    #
+    # Nothing is mounted when `web/dist` does not exist, so an API-only deployment is unaffected.
+    if serve_dashboard:
+        mount_spa(app)
 
     @app.middleware("http")
     async def _correlate(request: Request, call_next):  # type: ignore[no-untyped-def]

@@ -19,6 +19,10 @@ because an unauthenticated endpoint must not be an oracle for which slugs exist.
 insert and one enqueue, then returns inside the acknowledgement budget; everything
 after that is a job.
 
+**A store that cannot be reached answers 503, not 500** (R16.C3). The distinction matters
+because the whole recovery path for an ingest failure is the provider redelivering, and a
+retry is only useful against a transient fault. See the handler for why the catch is narrow.
+
 **The blocking work runs in a worker thread.** The handler has to be ``async def`` — it awaits
 ``request.body()`` to get the exact bytes — but everything after that is synchronous SQLAlchemy, and
 doing it inline holds the event loop for the whole of three round trips. Under any concurrency that
@@ -31,6 +35,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Request, Response
+from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.concurrency import run_in_threadpool
 
 from revora.ingestion import (
@@ -61,9 +66,28 @@ async def razorpay_webhook(merchant_slug: str, request: Request) -> Response:
 
     with correlation_context() as correlation:
         correlation_id = uuid.UUID(correlation)
-        result = await run_in_threadpool(
-            _ingest, merchant_slug, body, signature, event_id, correlation_id
-        )
+        try:
+            result = await run_in_threadpool(
+                _ingest, merchant_slug, body, signature, event_id, correlation_id
+            )
+        except (OperationalError, InterfaceError):
+            # R16.C3: the store is unreachable, so answer 503 and persist nothing. Nothing was
+            # persisted by construction — every write on this path is inside a transaction that
+            # could not commit — so the only thing to get right is the status code.
+            #
+            # 503 rather than 500, and the two are not interchangeable here even though both are
+            # 5xx. Revora depends on the provider redelivering (R16.C3 marks that dependency an
+            # [ASSUMPTION]), and a retry only helps against a transient condition. 503 says "come
+            # back"; 500 says "this request is broken", and an operator seeing 500 goes looking for
+            # a bug in a payload that was fine.
+            #
+            # Narrow on purpose. ``OperationalError`` and ``InterfaceError`` are the
+            # connection-level failures — server unreachable, connection dropped mid-statement.
+            # A bad-SQL defect is deliberately *not* caught: it will fail identically on every
+            # redelivery, and dressing it as 503 would have the provider retry a deterministic
+            # failure until it gave up and then drop the event silently.
+            _logger.error("webhook ingest failed: persistence unavailable")
+            return Response(status_code=503)
 
     if result is None:
         return Response(status_code=401)

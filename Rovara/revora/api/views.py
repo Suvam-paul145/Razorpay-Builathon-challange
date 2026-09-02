@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from revora.api.rendering import data_unavailable, money, not_yet_recorded, rate
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import POLICY_CHECK_ORDER, SelectionReason
 from revora.metrics.engine import CohortMetrics
+from revora.metrics.unresolved import unresolved_groups
 from revora.persistence.repositories.consent import CustomerConsentRepository
 from revora.persistence.repositories.diagnosis import DiagnosisRepository
 from revora.persistence.repositories.estimates import BaselineEstimateRepository
@@ -54,6 +56,7 @@ from revora.persistence.repositories.experiments import (
 )
 from revora.persistence.repositories.policy import PolicyDecisionRepository
 from revora.persistence.repositories.recommendations import RecommendationRepository
+from revora.platform.clock import now
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.orm import Session
@@ -77,6 +80,7 @@ __all__ = [
     "case_summary",
     "experiment_document",
     "metrics_document",
+    "unresolved_view",
 ]
 
 NULL_SELECTION_REASONS: frozenset[str] = frozenset(
@@ -738,6 +742,52 @@ def _contains_zero(result: ExperimentResult) -> bool | None:
     if result.lift_ci_low is None or result.lift_ci_high is None:
         return None
     return result.lift_ci_low <= 0 <= result.lift_ci_high
+
+
+def unresolved_view(
+    session: Session,
+    merchant_id: uuid.UUID,
+    *,
+    start: datetime,
+    end: datetime,
+    currency: str,
+) -> dict[str, object]:
+    """The unresolved grouping with every amount formatted (R14.C10, R14.C12).
+
+    This wrapper exists because of where formatting is allowed to live.
+    :func:`revora.metrics.unresolved.unresolved_groups` returns integer minor units, which is
+    correct for a computation layer — and it cannot format them, because ``grouping_for`` and the
+    currency symbols live in :mod:`revora.api.rendering` and the ``feature modules depend downward
+    only`` contract forbids ``revora.metrics`` from importing ``revora.api``. Rather than duplicate
+    the symbol table one layer down, the amounts are formatted here.
+
+    The alternative shipped briefly and was wrong: the endpoint returned ``amount_minor`` as a bare
+    integer alongside a single ``currency`` field, which left the browser to divide by a hundred and
+    pick a symbol. That is precisely the client-side currency arithmetic R14.C12 exists to prevent,
+    and it would have been the one screen in the dashboard doing its own formatting — so the first
+    rounding disagreement would have appeared between this page and the summary beside it.
+
+    All five groups are always present, zero rows included, because that guarantee belongs to
+    ``unresolved_groups`` and is preserved verbatim here.
+    """
+    groups = unresolved_groups(session, merchant_id, start=start, end=end)
+    return {
+        "reporting_period": {"start": start.isoformat(), "end": end.isoformat()},
+        "computed_at": now().isoformat(),
+        "currency": currency,
+        "groups": [
+            {
+                "state": group.state.value,
+                "case_count": group.case_count,
+                "amount": money(group.amount, currency=currency),
+            }
+            for group in groups
+        ],
+        "total_case_count": sum(group.case_count for group in groups),
+        # Summed from the same integers the groups carry, so the total is exactly the sum of the
+        # rows above it and not a separately-rounded figure that can disagree with them.
+        "total_amount": money(sum(group.amount for group in groups), currency=currency),
+    }
 
 
 def audit_document(records: Sequence[AuditRecord]) -> list[dict[str, object]]:

@@ -33,7 +33,6 @@ from sqlalchemy.orm import Session
 
 from revora.domain.enums import CaseState
 from revora.persistence.models import RecoveryCase
-from revora.platform.clock import now
 
 __all__ = ["UNRESOLVED_STATES", "UnresolvedGroup", "unresolved_groups"]
 
@@ -116,26 +115,10 @@ def unresolved_groups(
     )
 
 
-def unresolved_document(
-    session: Session,
-    merchant_id: uuid.UUID,
-    *,
-    start: datetime,
-    end: datetime,
-    moment: datetime | None = None,
-) -> dict[str, object]:
-    """The grouping plus its period and computation instant.
-
-    The timestamps travel with the figures for the same reason they do on a cohort report: an
-    unresolved total without its window cannot be reconciled against a later recomputation, and
-    these figures *do* move — a delayed capture reconciles an ``EXPIRED`` case to ``RECOVERED``
-    weeks after the period closed, which removes it from this grouping retroactively.
-    """
-    groups = unresolved_groups(session, merchant_id, start=start, end=end)
-    return {
-        "reporting_period": {"start": start.isoformat(), "end": end.isoformat()},
-        "computed_at": (moment or now()).isoformat(),
-        "groups": [group.as_document() for group in groups],
-        "total_case_count": sum(group.case_count for group in groups),
-        "total_amount_minor": sum(group.amount for group in groups),
-    }
+# NOTE. The wire document for this grouping is built by
+# :func:`revora.api.views.unresolved_view`, not here, and the timestamps and formatting live with
+# it. This module used to assemble one itself and emitted ``amount_minor`` as a bare integer, which
+# left the browser to divide by a hundred and choose a currency symbol — the one client-side
+# currency arithmetic in the dashboard, and exactly what R14.C12 forbids. Formatting needs the
+# symbol table and the grouping selector in ``revora.api.rendering``, which this layer may not
+# import, so the document is assembled one layer up rather than duplicating them down here.

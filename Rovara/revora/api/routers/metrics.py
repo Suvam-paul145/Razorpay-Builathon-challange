@@ -32,7 +32,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 
 from revora.api.auth import AuthenticatedSession
 from revora.api.deps import TenantSession
-from revora.api.views import metrics_document
+from revora.api.views import metrics_document, unresolved_view
 from revora.domain.enums import RiskCause
 from revora.domain.segments import AmountBand
 from revora.metrics.engine import (
@@ -42,7 +42,6 @@ from revora.metrics.engine import (
     compute_metrics,
     incremental_finding,
 )
-from revora.metrics.unresolved import unresolved_document
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.clock import now
 from revora.platform.logging import get_logger
@@ -161,8 +160,10 @@ def metrics_unresolved(
     """
     period = _period(start, end)
     with tenant_transaction(current.merchant_id) as session:
-        document = unresolved_document(
-            session, current.merchant_id, start=period.start, end=period.end
+        return unresolved_view(
+            session,
+            current.merchant_id,
+            start=period.start,
+            end=period.end,
+            currency=current.default_currency,
         )
-    document["currency"] = current.default_currency
-    return document
