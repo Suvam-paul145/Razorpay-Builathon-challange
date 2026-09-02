@@ -15,3 +15,7 @@ dist/
 build/
 node_modules/
 docs/provider-findings.local.md
+*.local.txt
+local_credentials.txt
+credentials.txt
+credentials.local.txt
