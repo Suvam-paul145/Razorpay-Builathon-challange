@@ -96,6 +96,18 @@ sent."""
 
 _BY_ACTION: Final[dict[CandidateAction, MessageTemplate]] = {
     CandidateAction.PAYMENT_LINK: PAYMENT_LINK_NEUTRAL,
+    # The same approved sentence, and deliberately not a second one. `CUSTOMER_MESSAGE` *is* a
+    # payment link with the provider's notification enabled — there is no separate messaging
+    # vendor and no separate content — so the customer reads the identical words either way and
+    # the only difference is who does the sending. Two templates saying the same thing would be
+    # two strings to keep in step, and the day they diverged the difference would be invisible.
+    #
+    # This mapping was missing, and the consequence was not a cosmetic gap: the optimizer can
+    # select `CUSTOMER_MESSAGE`, policy can approve it, and execution then refused it for having no
+    # approved wording — leaving the case authorized, unexecuted and stuck in `ACTION_SCHEDULED`
+    # until its window closed. `EXECUTABLE_ACTIONS` claimed the action was executable while this
+    # table said it had nothing to say.
+    CandidateAction.CUSTOMER_MESSAGE: PAYMENT_LINK_NEUTRAL,
 }
 """Action to template. A mapping rather than a conditional so an action with no approved
 wording is a missing key — a loud failure at execution time — rather than an empty string

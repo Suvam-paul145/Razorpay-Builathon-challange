@@ -27,11 +27,13 @@ __all__ = [
     "ELIGIBILITY",
     "EXECUTABLE_ACTIONS",
     "NULL_ACTIONS",
+    "PROVIDER_ACTIONS",
     "UNAVAILABLE_IN_MVP",
     "CandidateAction",
     "candidate_set_for",
     "is_customer_visible",
     "is_executable",
+    "needs_provider_call",
 ]
 
 
@@ -82,6 +84,24 @@ terminal at the provider; a new attempt is a new payment the customer starts.
 Automatic retry exists in the provider's subscriptions product, which is a
 different object and out of scope. If the retry-capability spike comes back
 positive, this set shrinks and the eligibility rows below gain real actions."""
+
+PROVIDER_ACTIONS: frozenset[CandidateAction] = frozenset(
+    {CandidateAction.PAYMENT_LINK, CandidateAction.CUSTOMER_MESSAGE}
+)
+"""The actions the execution engine performs by calling the provider.
+
+A **narrower** set than :data:`EXECUTABLE_ACTIONS`, and the distinction is load-bearing rather
+than pedantic. ``DO_NOTHING`` and ``WAIT`` are executable in the sense that Revora can carry
+them out — by not acting — and ``HUMAN_ESCALATION`` is executable by handing the case to a
+person. Neither reaches the provider, so neither belongs in a state called
+``ACTION_SCHEDULED``, which means "an external effect is pending".
+
+Conflating the two produced a case that could never leave ``ACTION_SCHEDULED``: policy approved
+``HUMAN_ESCALATION``, the pipeline scheduled it, the execution engine tried to build a payment
+link for it, found no approved wording, refused — and left the case authorized, unexecuted and
+waiting for a window to close. The dead end was not in the engine's refusal, which was correct;
+it was in having scheduled an external effect that was never going to exist.
+"""
 
 CUSTOMER_VISIBLE_ACTIONS: frozenset[CandidateAction] = frozenset(
     {
@@ -185,6 +205,16 @@ def is_customer_visible(action: CandidateAction) -> bool:
 def is_executable(action: CandidateAction) -> bool:
     """True if the MVP can actually carry this action out."""
     return action in EXECUTABLE_ACTIONS
+
+
+def needs_provider_call(action: CandidateAction) -> bool:
+    """True if carrying this action out means calling the provider.
+
+    What the pipeline branches on to decide whether a case should be scheduled for execution at
+    all. An action that needs no call needs no ``ACTION_SCHEDULED``, no intent and no idempotency
+    key — and giving it those is how a case ends up authorized for an effect that cannot happen.
+    """
+    return action in PROVIDER_ACTIONS
 
 
 def candidate_set_for(cause: RiskCause) -> frozenset[CandidateAction]:

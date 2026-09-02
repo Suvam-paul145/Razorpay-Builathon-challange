@@ -105,7 +105,28 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from revora.providers.classification import PaymentLinkEntity, ProviderResult
     from revora.providers.razorpay import PaymentProviderClient
 
-__all__ = ["ExecutionAttempt", "ExecutionOutcome", "execute_approved_action"]
+__all__ = [
+    "CONSUMABLE_STATES",
+    "ExecutionAttempt",
+    "ExecutionOutcome",
+    "execute_approved_action",
+]
+
+CONSUMABLE_STATES: frozenset[CaseState] = frozenset(
+    {CaseState.POLICY_CHECK, CaseState.ACTION_SCHEDULED}
+)
+"""The states an approved decision may still be acted on from.
+
+Exactly the two states between "a decision was recorded" and "an effect was attempted".
+``POLICY_CHECK`` covers a caller that executes straight off the decision; ``ACTION_SCHEDULED``
+covers the pipeline, which advances the case as soon as it has an authorization to consume.
+
+Everything else is excluded for a reason worth naming individually. A **terminal** state means the
+case ended — possibly because the payment was already made — and acting would contact a customer
+about money they have already sent. **EXECUTING** or **WAITING_FOR_OUTCOME** means an effect
+already happened, and a second one is the duplicate this whole engine exists to prevent.
+**DECISION_PENDING** means a new decision cycle is under way, so this approval describes a
+comparison that has been superseded."""
 
 _logger = get_logger(__name__)
 
@@ -548,19 +569,34 @@ def _structural_refusal(
 ) -> str | None:
     """Checks on the approval as a record, independent of what policy would say now.
 
-    Separate from re-evaluation because these are not policy questions. An expired approval
-    or one recorded against a different case state is not a decision the engine disagrees
-    with — it is a decision that no longer describes the situation, and reporting it as a
-    policy block would hide a real defect behind a routine-looking reason.
+    Separate from re-evaluation because these are not policy questions. An expired approval or
+    one recorded against a case that has since moved somewhere it cannot be acted on is not a
+    decision the engine disagrees with — it is a decision that no longer describes the situation,
+    and reporting it as a policy block would hide a real defect behind a routine-looking reason.
+
+    **The state check asks whether the case is somewhere an approval may still be consumed, not
+    whether it is where it was when the approval was recorded.** It used to ask the second thing,
+    and that was a contradiction with the pipeline it is part of: policy evaluates while the case
+    is ``DECISION_PENDING``, then the case advances through ``POLICY_CHECK`` to
+    ``ACTION_SCHEDULED`` precisely *because* the approval exists. An equality check therefore
+    refused every approval the pipeline had actually authorized — the engine's own tests did not
+    catch it because they construct a case already sitting in the state the approval names, and the
+    integration path that exposed it is the only one that walks the states in order.
+
+    What the check must still catch is a case that moved somewhere the approval cannot describe: a
+    terminal state (the case ended, possibly because it was already paid), a state past execution
+    (an effect already happened), or back to ``DECISION_PENDING`` (a new cycle is deciding afresh).
+    :data:`CONSUMABLE_STATES` is that list, and it is short enough to read.
     """
     if decision.expires_at is not None and decision.expires_at <= moment:
         return "approval expired"
     if decision.consumed_by_intent_id is not None:
         return "approval already consumed"
-    if str(case.state) != str(decision.case_state_at_evaluation):
+    current = CaseState(str(case.state))
+    if current not in CONSUMABLE_STATES:
         return (
             f"case state moved from {decision.case_state_at_evaluation} to {case.state} "
-            "since the approval"
+            "since the approval, which is not a state an approval may be consumed from"
         )
     return None
 
