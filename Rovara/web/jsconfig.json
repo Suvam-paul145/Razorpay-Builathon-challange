@@ -1,0 +1,29 @@
+{
+  "//": [
+    "Editor support only. This project is plain JavaScript — there is no compile step and no",
+    "type checking in the build. `checkJs` is off deliberately: turning it on would report",
+    "thousands of implicit-any findings across a codebase written without annotations, which is",
+    "noise rather than signal. What this file buys is import resolution and JSDoc-driven",
+    "completion in the editor.",
+    "",
+    "Losing TypeScript costs one specific guarantee, and it is worth naming: every API figure in",
+    "this app is a union between a real value and an absent-value marker, and the compiler used to",
+    "refuse an unhandled arm. Nothing refuses it now. The compensating controls are the runtime",
+    "guards in src/api/types.js (isPresent, isAbsentMarker), the fact that every figure renders",
+    "through <Money>/<Rate>/<Enum> which handle all three arms, and the eslint rules that forbid",
+    "`?? 0` on a figure."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "checkJs": false,
+    "allowJs": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src", "vite.config.js", "eslint.config.js"]
+}
