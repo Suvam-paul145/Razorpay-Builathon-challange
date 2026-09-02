@@ -485,13 +485,22 @@ def test_the_unresolved_grouping_returns_all_five_groups_including_the_empty_one
     assert set(groups) == {"STOPPED", "BLOCKED", "EXPIRED", "ESCALATED", "FAILED"}
 
     assert groups["EXPIRED"]["case_count"] == 2
-    assert groups["EXPIRED"]["amount_minor"] == 150_000
+    # A formatted money field, like every other amount on the wire. This endpoint used to emit a
+    # bare ``amount_minor`` with one ``currency`` field beside it, which left the browser dividing
+    # by a hundred and picking a symbol — the only client-side currency arithmetic in the dashboard,
+    # and the first place a rounding disagreement with the summary page would have appeared.
+    assert groups["EXPIRED"]["amount"]["minor"] == 150_000
+    assert groups["EXPIRED"]["amount"]["formatted"] == "₹1,500.00"
     for state in ("STOPPED", "BLOCKED", "ESCALATED", "FAILED"):
         assert groups[state]["case_count"] == 0, state
-        assert groups[state]["amount_minor"] == 0, state
+        # An empty group is a real zero — "we looked and there were none" — so it renders as a
+        # formatted zero rather than as an absent-value marker. This is the one place a zero amount
+        # is the honest answer, and it is honest because the row is present at all.
+        assert groups[state]["amount"]["minor"] == 0, state
+        assert groups[state]["amount"]["status"] == "PRESENT", state
 
-    assert document["total_amount_minor"] == sum(
-        group["amount_minor"] for group in document["groups"]
+    assert document["total_amount"]["minor"] == sum(
+        group["amount"]["minor"] for group in document["groups"]
     )
 
 

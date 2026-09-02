@@ -212,6 +212,9 @@ def test_the_positive_scenario_recovers_the_planted_effect(
     Runs at ``_DETECTION_CASE_COUNT`` rather than the default, because this is one of only two tests
     that require the interval to *exclude* zero and that is the assertion a marginal sample size
     makes flaky. See the constant for the arithmetic.
+
+    Every assertion here is one a *single* randomization can be held to. Interval coverage is not,
+    and the note at the end of the body says why it lives elsewhere.
     """
     with tenant_transaction(merchant, factory) as session:
         result = run_scenario(
@@ -240,10 +243,22 @@ def test_the_positive_scenario_recovers_the_planted_effect(
         f"measured {report.measured_lift} against a true {report.true_lift}; the measurement is "
         f"off by {difference}"
     )
-    assert report.interval_contains_true_lift, (
-        f"the reported interval [{report.measured_ci_low}, {report.measured_ci_high}] does not "
-        f"contain the true lift {report.true_lift}"
-    )
+
+    # NOTE. There is deliberately no `interval_contains_true_lift` assertion here, and this is the
+    # one place in the file where sample size is not the answer.
+    #
+    # A 95 percent interval covers the true parameter 95 percent of the time **by construction**, so
+    # a single-run coverage assertion fails one build in twenty however many cases it is given.
+    # `_DETECTION_CASE_COUNT` fixes the *other* assertion above — "the interval excludes zero" is a
+    # power question, and more cases push the interval further from zero — but coverage is not a
+    # power question. Raising n narrows the interval and moves the true lift no closer to the middle
+    # of it. This assertion was here, and it failed exactly as predicted: passing in isolation and
+    # failing in a full-suite run, with the interval [0.1686, 0.2470] missing a true 0.1500 low.
+    #
+    # The claim is real and worth testing, so it is tested where it can be: over
+    # `_COVERAGE_SEEDS` randomizations in the coverage test at the end of this file, which is the
+    # same treatment the null gate gets and for the same reason. Asserting it twice, once correctly
+    # and once as a coin flip, buys nothing and costs a flaky build.
 
 
 def test_the_negative_scenario_reports_a_negative_lift_and_refuses_attribution(

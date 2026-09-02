@@ -36,7 +36,8 @@ from sqlalchemy import Engine, text
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import CaseState, PolicyVerdict, SelectionReason
 from revora.ingestion.service import IngestionOutcome, ingest_webhook
-from revora.jobs.worker import run_once
+from revora.jobs.pipeline import EXECUTION_JOB_KIND
+from revora.jobs.worker import Handler, build_registry, run_once
 from revora.persistence.repositories.engine import (
     build_engine,
     dispose_engine,
@@ -119,6 +120,11 @@ def _make_merchant(engine: Engine) -> tuple[uuid.UUID, str]:
     return merchant_id, slug
 
 
+_CONTACT = "+919876543210"
+"""The contact in the envelope below. Named so consent can be recorded against its derived key
+before any case exists, which is the only ordering that works — see :func:`_grant_consent`."""
+
+
 def _grant_consent(engine: Engine, merchant_id: uuid.UUID, customer_key: str) -> None:
     """Record consent so the customer-visible path is reachable.
 
@@ -126,6 +132,15 @@ def _grant_consent(engine: Engine, merchant_id: uuid.UUID, customer_key: str) ->
     outcome but not the one this checkpoint is exercising — the point here is that the
     pipeline reaches a decision, and a consent block would prove the engine works while
     saying nothing about the optimizer having run.
+
+    **Must be called before the webhook is delivered.** ``run_once`` drains a merchant's whole
+    queue in one pass and every pipeline step enqueues its successor inside its own transaction,
+    so the first pass runs detection *through policy*. Recording consent after "the case exists"
+    records it after the decision it was meant to govern. The key is therefore derived from the
+    contact the way the system derives it, rather than read back off the case row.
+
+    ``effective_at`` is backdated a minute because a consent record takes effect at its own
+    effective instant, and one written at ``now()`` races the evaluation reading it.
     """
     with engine.begin() as connection:
         connection.execute(
@@ -134,7 +149,8 @@ def _grant_consent(engine: Engine, merchant_id: uuid.UUID, customer_key: str) ->
                 INSERT INTO customer_consent (
                     merchant_id, customer_key, opted_out, source, effective_at, created_at
                 ) VALUES (
-                    :merchant_id, :customer_key, false, 'test', now(), now()
+                    :merchant_id, :customer_key, false, 'test',
+                    now() - interval '1 minute', now()
                 )
                 """
             ),
@@ -149,6 +165,15 @@ def _failed_payment_body(payment_id: str, event_id: str) -> bytes:
     table, it maps deterministically to ``INSUFFICIENT_FUNDS``, and that cause's
     eligibility row permits ``PAYMENT_LINK`` — so the pipeline has a real action to
     consider rather than falling through to the null actions for lack of one.
+
+    **The amount is load-bearing and it is below the escalation crossover.** The priors put
+    ``HUMAN_ESCALATION`` above ``PAYMENT_LINK`` on net value from about ₹12,000 up, and this
+    checkpoint's whole claim is that the decision pipeline runs to completion and then stops at
+    the first step that needs the outside world. An escalation is *terminal* — it never reaches
+    that step — so above the crossover the test would still pass its later assertions while no
+    longer demonstrating the thing it exists to demonstrate. It sat at ₹20,000 for exactly that
+    reason and asserted the wrong terminal state until the integration tier made the crossover
+    explicit.
     """
     payload = {
         "entity": "event",
@@ -159,12 +184,12 @@ def _failed_payment_body(payment_id: str, event_id: str) -> bytes:
             "payment": {
                 "entity": {
                     "id": payment_id,
-                    "amount": 2_000_000,
+                    "amount": 100_000,
                     "currency": "INR",
                     "status": "failed",
                     "order_id": f"order_{event_id}",
                     "method": "card",
-                    "contact": "+919876543210",
+                    "contact": _CONTACT,
                     "email": "buyer@example.com",
                     "error_code": "BAD_REQUEST_ERROR",
                     "error_description": "insufficient balance",
@@ -188,10 +213,34 @@ def _one(engine: Engine, sql: str, params: dict[str, object]) -> object:
         return connection.execute(text(sql), params).scalar_one()
 
 
+def _decision_only_registry() -> dict[str, Handler]:
+    """The real worker registry with the executor replaced by a no-op.
+
+    This is what makes "zero external calls" a *structural* claim here rather than a lucky one.
+    The registry is otherwise the production one — every decision step is the real handler, so
+    the chaining this checkpoint verifies is the real chaining — and the single kind that can
+    reach outside the process is stubbed out. A reader can see from this function alone that no
+    provider request is possible, which is a stronger statement than any assertion about counts.
+
+    It also stops the checkpoint from silently changing subject. When execution was wired into
+    the worker, this test began running the executor, which reserved an intent and then died on
+    an unresolvable credential — leaving the case in ``EXECUTING`` and breaking the very
+    "no external effect" assertion below. The decision pipeline is what this file is about;
+    execution has its own tests and its own integration coverage.
+
+    A no-op rather than a missing key: an unregistered kind is ``fail``-ed and rescheduled with
+    backoff, which is noise in a test that asserts on the audit trail.
+    """
+    registry = build_registry(provider=None)
+    registry[EXECUTION_JOB_KIND] = lambda claimed: None
+    return registry
+
+
 def _drain(worker_id: str) -> int:
     """Run the worker until the queue stops producing work. Returns passes used."""
+    registry = _decision_only_registry()
     for used in range(1, _MAX_WORKER_PASSES + 1):
-        if run_once(worker_id) == 0:
+        if run_once(worker_id, registry=registry) == 0:
             return used
     return _MAX_WORKER_PASSES
 
@@ -203,6 +252,10 @@ def test_webhook_to_policy_decision_end_to_end(
     engine = installed_engine
     merchant_id, slug = _make_merchant(engine)
     config = default_configuration()
+
+    # Consent first. See `_grant_consent` — the first worker pass runs the pipeline through
+    # policy, so consent recorded afterwards is recorded after the decision it governs.
+    _grant_consent(engine, merchant_id, crypto.customer_key(_CONTACT))
 
     payment_id = f"pay_{uuid.uuid4().hex[:16]}"
     event_id = f"evt_{uuid.uuid4().hex[:16]}"
@@ -219,26 +272,41 @@ def test_webhook_to_policy_decision_end_to_end(
     )
     assert accepted.outcome is IngestionOutcome.ACCEPTED
 
-    # Detection opens the case; consent has to exist before the policy step reaches it.
-    assert run_once("decision-worker") >= 1
-    customer_key = _one(
-        engine,
-        "SELECT customer_key FROM recovery_case WHERE merchant_id = :m",
-        {"m": str(merchant_id)},
-    )
-    _grant_consent(engine, merchant_id, str(customer_key))
-
+    assert run_once("decision-worker", registry=_decision_only_registry()) >= 1
     _drain("decision-worker")
 
-    # -- the case walked the whole pipeline ---------------------------------
+    # The consent recorded before the case existed is the consent this case's decision saw.
+    # Asserted rather than assumed: if the derivation ever diverged, every consent check would be
+    # answered about a different person and every one of them would answer "missing".
+    assert (
+        _one(
+            engine,
+            "SELECT customer_key FROM recovery_case WHERE merchant_id = :m",
+            {"m": str(merchant_id)},
+        )
+        == crypto.customer_key(_CONTACT)
+    )
+
+    # -- the case walked the whole decision pipeline -------------------------
     state = _one(
         engine,
         "SELECT state FROM recovery_case WHERE merchant_id = :m",
         {"m": str(merchant_id)},
     )
-    assert state == CaseState.POLICY_CHECK.value, (
-        "the pipeline must reach POLICY_CHECK; a case stuck earlier means a step did not "
-        "enqueue its successor"
+    # ``ACTION_SCHEDULED``, not ``POLICY_CHECK``. This expectation moved when execution was
+    # wired into the worker, and the move is the point rather than an accommodation: an
+    # ``APPROVED`` decision now schedules the action it authorized, where previously it was a
+    # durable authorization that nothing consumed. ``POLICY_CHECK`` means "a decision is
+    # recorded"; ``ACTION_SCHEDULED`` means "an authorization exists and is waiting to be
+    # consumed", and reaching the second proves the policy step enqueued its successor.
+    #
+    # It stops here because the executor is stubbed out — see `_decision_only_registry`. That is
+    # the property this checkpoint exists to assert: the whole decision pipeline runs to
+    # completion with zero external calls, and the boundary where the outside world begins is
+    # visible in the registry rather than inferred from a count.
+    assert state == CaseState.ACTION_SCHEDULED.value, (
+        "the decision pipeline must reach ACTION_SCHEDULED; a case stuck earlier means a step "
+        "did not enqueue its successor"
     )
 
     # -- diagnosis: deterministic, no AI ------------------------------------

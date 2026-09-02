@@ -14,17 +14,39 @@ the database-backed ones run with no deadline because a container round-trip is 
 a timing signal. Encoding that here keeps the numbers out of every individual test
 and makes the tiering a property of the suite rather than of whoever wrote the last
 test.
+
+**The failure database is committed.** By default Hypothesis writes counterexamples
+to ``.hypothesis/examples`` and drops a ``.gitignore`` containing ``*`` beside them,
+so a shrunk counterexample lives exactly as long as one developer's working copy.
+That makes every property test a lottery: the run that finds the bug reproduces it,
+and every run afterwards has to rediscover it from scratch. A property suite without
+a committed failure database cannot say "this stays fixed".
+
+So the database is pointed at :data:`FAILURE_DATABASE`, a directory that *is* checked
+in, and the default ``.hypothesis`` cache is left alone for what it is good at —
+caching. Only the counterexamples are version-controlled, which is the part with
+regression value.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from hypothesis import HealthCheck, Verbosity, settings
+from hypothesis.database import DirectoryBasedExampleDatabase
 
 from revora.platform import clock
+
+FAILURE_DATABASE = Path(__file__).resolve().parent / "failure_db"
+"""Committed counterexamples, so a fixed bug stays fixed.
+
+Under ``tests/`` rather than at the repository root because it belongs to the suite, and named
+``failure_db`` rather than ``.hypothesis`` so no tool's default ignore rule claims it. Hypothesis
+writes one small file per distinct failure; a green suite adds nothing, and a file appearing in a
+diff is a genuine signal that a property found something."""
 
 pytest_plugins = ("tests.pg_support",)
 """The migrated-PostgreSQL fixtures, registered suite-wide.
@@ -37,21 +59,26 @@ session-scoped and lazy, so a run that touches no ``pg`` test never contacts a d
 Plugin registration has to happen in the *root* conftest; pytest rejects ``pytest_plugins`` in a
 nested one."""
 
+_DATABASE = DirectoryBasedExampleDatabase(str(FAILURE_DATABASE))
+
 settings.register_profile(
     "default",
     max_examples=100,
     deadline=None,
+    database=_DATABASE,
     suppress_health_check=[HealthCheck.too_slow],
 )
 settings.register_profile(
     "pure",
     max_examples=500,
     deadline=None,
+    database=_DATABASE,
 )
 settings.register_profile(
     "ci",
     max_examples=200,
     deadline=None,
+    database=_DATABASE,
     suppress_health_check=[HealthCheck.too_slow],
 )
 settings.register_profile(
@@ -59,6 +86,7 @@ settings.register_profile(
     max_examples=20,
     verbosity=Verbosity.verbose,
     deadline=None,
+    database=_DATABASE,
 )
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
 
