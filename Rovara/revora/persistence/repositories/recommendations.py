@@ -59,6 +59,38 @@ class RecommendationRepository(MerchantScopedRepository[Recommendation]):
         )
         return self.session.execute(statement).scalars().first()
 
+    def active_decision_cycle(
+        self, merchant_id: uuid.UUID, case_id: uuid.UUID, *, fallback: int
+    ) -> int:
+        """Which cycle the case's live decision rows are actually filed under.
+
+        **``case.decision_cycle_count`` is not that number, and reading it as though it were
+        is a bug that has now been made three times.** The counter increments on the edge
+        into ``DECISION_PENDING``, and the optimizer writes its recommendation *before*
+        applying that transition — deliberately, so the recommendation belongs to the cycle
+        that produced it. Everything downstream then files itself under the recommendation's
+        cycle: the policy decision, its twelve check results, the audit record. So from
+        ``DECISION_PENDING`` onward the counter is one *ahead* of the cycle every one of those
+        rows carries, and a lookup by the counter finds nothing.
+
+        Finding nothing is the dangerous part, because none of these reads raise. The policy
+        step stalled the pipeline in ``DECISION_PENDING``; the case-detail view rendered a
+        fully evaluated case as having no policy decision; the memory writer wrote a training
+        observation with a NULL cause, confidence, method and verdict — a row that reads as
+        "we do not know why we acted" about a case where we did.
+
+        ``fallback`` is used only when no recommendation exists at all, which means the case
+        never reached the optimizer and the counter is the honest answer. Callers pass
+        ``case.decision_cycle_count``.
+
+        Deriving the cycle as ``counter - 1`` would work today and break the moment another
+        transition gains a cycle effect. This reads the number off the row that defines it.
+        """
+        recommendation = self.latest_for_case(merchant_id, case_id)
+        if recommendation is None:
+            return fallback
+        return int(recommendation.decision_cycle)
+
     def insert(
         self, merchant_id: uuid.UUID, *, values: Mapping[str, object]
     ) -> Recommendation:

@@ -26,10 +26,10 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
-    Integer,
     SmallInteger,
     Text,
     UniqueConstraint,
@@ -117,7 +117,7 @@ class JobAttempt(RowBase):
     outcome: Mapped[str | None] = mapped_column(Text)
     error_class: Mapped[str | None] = mapped_column(Text)
     error_detail: Mapped[str | None] = mapped_column(Text)
-    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger)
     worker_id: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (

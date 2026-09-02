@@ -36,6 +36,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -148,7 +149,7 @@ class AiInvocation(RowBase):
 
     model_id: Mapped[str | None] = mapped_column(Text)
     model_version: Mapped[str | None] = mapped_column(Text)
-    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(BigInteger)
     verdict: Mapped[str] = mapped_column(Text, nullable=False)
     """Which gate the invocation reached and what happened there. Free text rather
     than an enum because the gate vocabulary belongs to the reasoning layer, which

@@ -26,7 +26,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, Integer, LargeBinary, SmallInteger, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    ForeignKey,
+    Index,
+    Integer,
+    LargeBinary,
+    SmallInteger,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -157,7 +166,7 @@ class DetectionVerdictRecord(RowBase):
     """Set only for ``AT_RISK``. A verdict that opened no case still has a row."""
 
     decided_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
-    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(BigInteger)
     """Persistence to verdict, against ``DETECTION_LATENCY_BOUND``. Stored so the
     bound can be reported on rather than merely alarmed on."""
 
