@@ -30,7 +30,8 @@ import {
 } from '../api/queries'
 import { isAbsentMarker } from '../api/types'
 import { Empty, Fact, Failure, Loading, Panel, StateBadge, When } from '../components/Chrome'
-import { AbsentValue, Enum, Money, humanise } from '../components/Figure'
+import { AbsentValue, Enum, Label, Money, humanise } from '../components/Figure'
+import { Timeline } from '../components/Timeline'
 
 export function CaseDetail() {
   const { caseId = '' } = useParams()
@@ -42,6 +43,17 @@ export function CaseDetail() {
   const detail = query.data
   return (
     <div className="detail">
+      {/* R26.C12. The timeline is the *first* element of the detail view, and everything R14.C3–C6
+          and R14.C14 require is retained below it unchanged — the diagnosis, the full candidate
+          comparison, all twelve policy checks, every execution attempt, every authoritative read,
+          the recorded outcome and the refusal block.
+
+          First taken literally, above the case header, which costs something worth naming: a reader
+          landing here sees the history before they see which payment it belongs to. The header is
+          immediately below and the URL carries the case id, so the cost is one scroll-height of
+          ambiguity — against which the requirement's reason is that a reviewer with two minutes
+          should reach the answer before they reach the ten sections that also contain it. */}
+      <Timeline caseId={caseId} />
       <CaseHeader detail={detail} caseId={caseId} />
       <DiagnosisPanel detail={detail} />
       <DecisionPanel detail={detail} />
@@ -100,7 +112,10 @@ function CaseHeader({ detail, caseId }) {
     >
       <dl className="facts">
         <Fact label="State">
-          <StateBadge state={summary.state} />
+          {/* The server's label (R26.C14), the same one the case list renders. Deriving it here
+              with `humanise` gave this screen "Policy check" where the list said "Decision
+              recorded" — two words for one state, on two pages a reader moves between. */}
+          <StateBadge state={summary.state} label={summary.state_label} />
           {detail.terminal_reason !== null && (
             <span className="fact__note">{humanise(detail.terminal_reason)}</span>
           )}
@@ -126,6 +141,34 @@ function CaseHeader({ detail, caseId }) {
               {detail.consent.opted_out ? 'Opted out' : 'Consent on record'}
               {detail.consent.source !== null && (
                 <span className="fact__note">via {detail.consent.source}</span>
+              )}
+            </span>
+          )}
+        </Fact>
+        {/* R21.C11 and R21.C9. Its own Fact, immediately beside Consent, because the two are
+            different statements and this is the pair a reader is most likely to collapse: a
+            suppression is an objection to *this debt*, an opt-out is a withdrawal of consent to
+            be contacted at all. Rendering them adjacently is how the screen keeps them apart. A
+            case with no suppression shows "None", not nothing — an omitted row reads as "we did
+            not look", which on a contact control is the wrong thing for it to read as. */}
+        <Fact label="Contact suppression">
+          {detail.contact_suppression === null ? (
+            <span className="muted">None</span>
+          ) : (
+            <span
+              className={detail.contact_suppression.in_force ? 'flag flag--stop' : 'flag'}
+            >
+              {detail.contact_suppression.hard_stop_label}
+              <span className="fact__note">
+                {detail.contact_suppression.in_force ? 'in force since ' : 'suppressed '}
+                <When iso={detail.contact_suppression.suppressed_at} />
+                {detail.contact_suppression.inherited && ', from another case on this order'}
+              </span>
+              {detail.contact_suppression.released_at !== null && (
+                <span className="fact__note">
+                  released <When iso={detail.contact_suppression.released_at} /> by{' '}
+                  <code>{detail.contact_suppression.released_by_user_id}</code>
+                </span>
               )}
             </span>
           )}
@@ -261,8 +304,15 @@ function DecisionPanel({ detail }) {
               <th scope="col" className="num">
                 Expected revenue
               </th>
+              {/* Four cost figures, then their total (R31.C7). The blended "action cost" these
+                  replaced could not say whether an action was excluded because links are
+                  expensive or because messages are, which is the one question this column set
+                  exists to answer. */}
               <th scope="col" className="num">
-                Action cost
+                Financial cost
+              </th>
+              <th scope="col" className="num">
+                Communication cost
               </th>
               <th scope="col" className="num">
                 Risk cost
@@ -271,7 +321,7 @@ function DecisionPanel({ detail }) {
                 Customer cost
               </th>
               <th scope="col" className="num">
-                Total cost
+                Total action cost
               </th>
               <th scope="col" className="num">
                 Net value
@@ -294,6 +344,16 @@ function DecisionPanel({ detail }) {
         could not be used is different evidence from an action that was not worth using, and both are
         different from an action that never appears. Costs are summed by the server.
       </p>
+      {recommendation.candidates.some((candidate) => candidate.cost_split_not_measured) && (
+        <p className="notice">
+          {/* R31.C10. Stated once for the table as well as beside each figure, because a reader
+              scanning for the cheap row will see the columns before they see a label in one cell. */}
+          Some rows below were priced before financial and communication cost were estimated
+          separately. On those rows the whole recorded cost sits in <code>Financial cost</code> and
+          the communication figure is a zero nothing measured, marked{' '}
+          <code>COST_SPLIT_NOT_MEASURED</code> beside both.
+        </p>
+      )}
     </Panel>
   )
 }
@@ -318,8 +378,16 @@ function CandidateRow({ candidate, selected }) {
       <td className="num">
         <Money value={candidate.expected_incremental_revenue} />
       </td>
+      {/* R31.C10. The marking sits in both cost cells rather than once per row: a reader comparing
+          the communication column across rows must be able to tell a measured zero from a zero the
+          migration wrote, and a label three columns away does not tell them. */}
       <td className="num">
-        <Money value={candidate.action_cost} />
+        <Money value={candidate.financial_cost} />
+        {candidate.cost_split_not_measured && <Label text="COST_SPLIT_NOT_MEASURED" />}
+      </td>
+      <td className="num">
+        <Money value={candidate.communication_cost} />
+        {candidate.cost_split_not_measured && <Label text="COST_SPLIT_NOT_MEASURED" />}
       </td>
       <td className="num">
         <Money value={candidate.risk_cost} />
@@ -327,8 +395,10 @@ function CandidateRow({ candidate, selected }) {
       <td className="num">
         <Money value={candidate.customer_cost} />
       </td>
+      {/* Summed by the server (R14.C12). Adding `.minor` here would fail lint, by design — a
+          browser-side total is free to disagree with the net value in the next column. */}
       <td className="num">
-        <Money value={candidate.total_cost} />
+        <Money value={candidate.total_action_cost} />
       </td>
       <td className="num">
         <Money value={candidate.net_recovery_value} emphasis />

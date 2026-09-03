@@ -1,0 +1,302 @@
+/*
+ * The customer page's own stylesheet. Deliberately not the dashboard's.
+ *
+ * `src/styles.css` is around a thousand lines of table, panel, chip and timeline rules, none of which
+ * this page uses, and importing it would put all of them in a bundle whose entire justification is
+ * arriving quickly over a mobile connection from an SMS.
+ *
+ * Two consequences worth stating, because both are the kind of thing a reader would otherwise assume
+ * is an oversight.
+ *
+ * **The figure classes are redefined here, minimally.** `<Money>` is shared — one implementation of
+ * how an amount renders — and it emits `.money`. Its *styling* is not shared, so the rule below is a
+ * second declaration of what a figure looks like. That is a real duplication and it is the cheaper of
+ * the two options: the alternative is this page pulling a stylesheet twenty times its size to inherit
+ * three properties. The values that matter for correctness are in the component, not here.
+ *
+ * **No web font, no icon set, no background image.** Zero third-party requests is a requirement
+ * (R19.C11), not a preference, and a font from a CDN is a third party that receives a request from a
+ * page whose URL contains a bearer token. System stack only.
+ *
+ * One column, generous type, and large touch targets: this is read on a phone, once, by somebody who
+ * is being asked for money and is not enjoying it.
+ */
+
+:root {
+  --cp-ink: #17212b;
+  --cp-ink-soft: #4a5a68;
+  --cp-ink-faint: #6b7b88;
+  --cp-page: #f6f7f9;
+  --cp-card: #ffffff;
+  --cp-line: #d8dee4;
+  --cp-accent: #0f5fa8;
+  --cp-accent-ink: #ffffff;
+  --cp-caution: #8a4b00;
+  --cp-ok: #1a6b3c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--cp-page);
+  color: var(--cp-ink);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Focus is always visible. Keyboard operation is a target of the accessibility standard and a focus
+   ring removed for tidiness is the fastest way to make a form unusable without a mouse.
+   `:focus-visible` rather than `:focus`, so a pointer user does not get a ring they did not ask for
+   while a keyboard user always does. */
+:focus-visible {
+  outline: 3px solid var(--cp-accent);
+  outline-offset: 2px;
+}
+
+.cp {
+  margin: 0 auto;
+  max-width: 34rem;
+  padding: 24px 16px 48px;
+}
+
+.cp__loading {
+  color: var(--cp-ink-soft);
+}
+
+/* --- the case ------------------------------------------------------------- */
+
+.cp__case,
+.cp__refusal,
+.cp__form,
+.cp__forms--closed {
+  background: var(--cp-card);
+  border: 1px solid var(--cp-line);
+  border-radius: 10px;
+  margin-bottom: 16px;
+  padding: 20px;
+}
+
+.cp__to {
+  color: var(--cp-ink-soft);
+  margin: 0 0 4px;
+}
+
+.cp__heading {
+  font-size: 30px;
+  line-height: 1.2;
+  margin: 0 0 12px;
+}
+
+.cp__currency {
+  color: var(--cp-ink-faint);
+  font-size: 15px;
+  font-weight: 400;
+  /* The currency code beside the formatted amount, which already carries its symbol. Quieter,
+     because a reader wants the figure first and the code only when matching it against a statement. */
+  vertical-align: middle;
+}
+
+.cp__reason {
+  margin: 0 0 14px;
+}
+
+.cp__window,
+.cp__promise,
+.cp__remaining {
+  color: var(--cp-ink-soft);
+  font-size: 14.5px;
+  margin: 0 0 8px;
+}
+
+.cp__promise-absent,
+.cp__pay-absent {
+  color: var(--cp-ink-faint);
+}
+
+.cp__promise-status {
+  color: var(--cp-ink-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.cp__pay {
+  margin: 16px 0;
+}
+
+/* The one action on the page. A large target, because it is tapped with a thumb. */
+.cp__pay-link {
+  background: var(--cp-accent);
+  border-radius: 8px;
+  color: var(--cp-accent-ink);
+  display: block;
+  font-size: 17px;
+  font-weight: 600;
+  padding: 14px 20px;
+  text-align: center;
+  text-decoration: none;
+}
+
+.cp__pay-link:hover {
+  background: #0c4d88;
+}
+
+/* --- the figure ----------------------------------------------------------- */
+
+/* `<Money>` from `../components/Figure.jsx`. Tabular figures so the digits do not shift, and no
+   wrapping so an amount never breaks across two lines mid-number. */
+.money {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.money--emphasis {
+  font-weight: 700;
+}
+
+/* An absent figure, if one ever arrives here. The amount is always present on this projection, so
+   this is the styling for a state the wire does not currently produce — present because the shared
+   component can render it and an unstyled marker would look like a bug rather than a message. */
+.absent {
+  color: var(--cp-ink-faint);
+  display: inline-flex;
+  flex-direction: column;
+  font-size: 14px;
+}
+
+.absent__tag {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.absent__what {
+  font-size: 13px;
+}
+
+/* --- refusals ------------------------------------------------------------- */
+
+.cp__detail {
+  color: var(--cp-ink-soft);
+  margin: 0 0 8px;
+}
+
+.cp__detail--quiet {
+  color: var(--cp-ink-faint);
+  font-size: 14px;
+}
+
+/* --- the forms ------------------------------------------------------------ */
+
+.cp__fieldset {
+  border: 0;
+  margin: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+.cp__legend {
+  font-size: 19px;
+  font-weight: 600;
+  padding: 0;
+}
+
+.cp__help {
+  color: var(--cp-ink-faint);
+  font-size: 14px;
+  margin: 4px 0 12px;
+}
+
+.cp__help--caution {
+  color: var(--cp-caution);
+}
+
+.cp__field {
+  margin-bottom: 16px;
+}
+
+.cp__label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.cp__select,
+.cp__input,
+.cp__textarea {
+  background: var(--cp-card);
+  border: 1px solid var(--cp-line);
+  border-radius: 8px;
+  color: inherit;
+  /* 16px, so iOS Safari does not zoom the viewport when the control takes focus — a zoom that leaves
+     the rest of the page off-screen and looks like the page broke. */
+  font-family: inherit;
+  font-size: 16px;
+  padding: 12px;
+  width: 100%;
+}
+
+.cp__textarea {
+  resize: vertical;
+}
+
+.cp__select[aria-invalid='true'],
+.cp__input[aria-invalid='true'] {
+  border-color: var(--cp-caution);
+}
+
+.cp__button {
+  background: var(--cp-accent);
+  border: 0;
+  border-radius: 8px;
+  color: var(--cp-accent-ink);
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 13px 20px;
+  width: 100%;
+}
+
+.cp__fieldset:disabled .cp__button {
+  background: var(--cp-ink-faint);
+}
+
+/* The validation summary. Always in the DOM so the live region exists before it has anything to say —
+   a region inserted at the same moment as its first message is often not announced at all. Empty, it
+   occupies no space. */
+.cp__summary:empty {
+  display: none;
+}
+
+.cp__summary-head {
+  color: var(--cp-caution);
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.cp__summary-list {
+  color: var(--cp-caution);
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.cp__summary-ok {
+  color: var(--cp-ok);
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+/* --- footnote ------------------------------------------------------------- */
+
+.cp__footnote {
+  color: var(--cp-ink-faint);
+  font-size: 13px;
+}
+
+.cp__footnote p {
+  margin: 0;
+}

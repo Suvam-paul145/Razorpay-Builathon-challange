@@ -11,10 +11,19 @@
  * **All five rows always render, zeros included.** The server guarantees five groups; this renders
  * whatever it is given without filtering. A row omitted because its count was zero reads as "we did
  * not look", and a reader used to five rows who sees four will not notice which one went.
+ *
+ * **Suppressed cases are listed under the escalated grouping, not as a sixth row** (R21.C11). A
+ * customer who disputed a charge or cancelled an order ends the case `ESCALATED`, so its money is
+ * already in that row — a sixth group would split one grouping across two places and the total
+ * would stop being the sum of the rows above it. The list is a breakdown of a row that is already
+ * there, and it is the only place on this screen that names individual cases, because it is the
+ * only group whose next action is *per case* rather than about a threshold.
  */
 
+import { Link } from 'react-router-dom'
+
 import { useUnresolved, useWebhookHealth } from '../api/queries'
-import { Fact, Failure, Loading, Panel } from '../components/Chrome'
+import { Fact, Failure, Loading, Panel, When } from '../components/Chrome'
 import { Money, humanise } from '../components/Figure'
 
 /** What each ending means and what to do about it. The operational half of the grouping. */
@@ -63,7 +72,11 @@ export function Unresolved() {
                   {query.data.groups.map((group) => (
                     <tr key={group.state} className={group.case_count === 0 ? 'row--zero' : ''}>
                       <td>
-                        <strong>{humanise(group.state)}</strong>
+                        {/* R26.C14: the server's label, with the stored member beside it. This cell
+                            used to call `humanise(group.state)`, which made the one place a case's
+                            ending is named the one place nobody had chosen the words. */}
+                        <strong>{group.label ?? humanise(group.state)}</strong>{' '}
+                        <span className="enum__member">{group.state}</span>
                       </td>
                       <td className="num">{group.case_count}</td>
                       <td className="num">
@@ -85,14 +98,92 @@ export function Unresolved() {
                 </tfoot>
               </table>
             </div>
+            <SuppressedCases cases={query.data.suppressed} />
             <p className="footnote">
               {query.data.reporting_period.start} to {query.data.reporting_period.end} · computed{' '}
               {query.data.computed_at}. These figures move: a delayed capture reconciles an expired
               case to recovered weeks later, which removes it from this grouping retroactively.
             </p>
+            {/* R30.C13. Said out loud, because a reader looking for a case they know is unresolved
+                and not finding it here would otherwise conclude the grouping is incomplete. Every
+                row above is a Terminal_State; a case that chose restraint is still being worked and
+                is not one. */}
+            <p className="footnote">
+              Every row here is a case that <em>ended</em>. A case Revora decided to wait on is still
+              being worked — it holds a scheduled review, appears in no group above, and is on the
+              case list marked “Waiting and watching” with the instant it will next be looked at.
+            </p>
           </>
         )}
       </Panel>
+    </div>
+  )
+}
+
+/**
+ * R21.C11. Every case holding a live Contact_Suppression, under its escalated reason.
+ *
+ * Three columns because the requirement names three things: the Hard_Stop_Reason, the suppression
+ * instant, and the unresolved amount. The reason is the customer's own words rather than
+ * "contact suppressed", which would name the consequence and leave the merchant to guess the
+ * cause — and the cause is what decides who picks the case up. A dispute is a possible chargeback;
+ * a cancellation is a fulfilment and refund question.
+ *
+ * **The amount comes through `<Money>` from the server's formatted string.** Every figure on this
+ * screen does, and this one is no different: the browser performs no arithmetic on minor units and
+ * chooses no currency symbol, which is R14.C12 and which the ESLint rule in `web/eslint.config.js`
+ * enforces rather than merely requests.
+ *
+ * Renders nothing when the list is empty — deliberately unlike the five aggregate rows above,
+ * which always render. A zero row in an aggregate says "we looked and it is zero"; an empty table
+ * of individual cases says only that there are none, and the escalated row above already carries
+ * that number. A "no suppressed cases" panel on every dashboard in the ordinary case would be
+ * furniture.
+ *
+ * @param {{ cases: Array<Record<string, any>> | undefined }} props
+ */
+function SuppressedCases({ cases }) {
+  if (!cases || cases.length === 0) return null
+  return (
+    <div className="table-scroll">
+      <table className="grid">
+        <caption>
+          Escalated because the customer objected — {cases.length}{' '}
+          {cases.length === 1 ? 'case' : 'cases'}. Automated contact on these is permanently
+          stopped and only a named person can lift it.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Case</th>
+            <th scope="col">What the customer said</th>
+            <th scope="col">Since</th>
+            <th scope="col" className="num">
+              Unresolved
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {cases.map((entry) => (
+            <tr key={entry.case_id}>
+              <td>
+                <Link to={`/cases/${entry.case_id}`}>
+                  <code>{entry.case_id.slice(0, 8)}</code>
+                </Link>
+              </td>
+              <td>
+                <strong>{entry.hard_stop_label}</strong>{' '}
+                <span className="enum__member">{entry.hard_stop_reason}</span>
+              </td>
+              <td>
+                <When iso={entry.suppressed_at} />
+              </td>
+              <td className="num">
+                <Money value={entry.unresolved_amount} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }

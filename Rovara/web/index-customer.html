@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Your payment</title>
+    <!-- Deliberately no `description`. This document is reached from one SMS by one person and is
+         never a search result; a description would only be metadata about a page nobody indexes. -->
+
+    <!-- Zero third-party requests (R19.C11). No analytics, no tag manager, no font from a CDN, no
+         icon sprite, no error reporter. The token that authorizes this page is in the URL's path, so
+         every additional origin is another party that could read it out of a request. Typography is
+         the system stack. -->
+
+    <!-- `no-referrer`, not `same-origin` as the dashboard uses, and the difference is the token.
+         The dashboard's credential lives in `sessionStorage` and never appears in a URL; this page's
+         credential *is* part of the URL, so any header carrying this URL carries the credential. The
+         API sends the same policy as a response header (R19.C11, R29.C7); this is the document half,
+         so the policy holds for requests the document makes before any API response has arrived. -->
+    <meta name="referrer" content="no-referrer" />
+
+    <!-- The document half of the page's CSP. The API sends its own stricter policy as a header on
+         every `/customer` response and the header is the enforcing one; this exists because a static
+         host serving this file may not set headers at all, and a page with no policy is a worse
+         default than a duplicated one.
+
+         `base-uri 'none'` is here for the same reason the API sets it: an injected `<base>` would
+         re-root every relative URL on the page, and the fetch that carries the bearer token uses a
+         relative URL. `form-action 'none'` because both forms below are handled in JavaScript and
+         submit nowhere — a form that could POST somewhere would be a second way to send the path.
+         `connect-src` is left to the response header, which knows the API host; the document does
+         not, since it is configured at build time per deployment. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/customer/main.jsx"></script>
+  </body>
+</html>

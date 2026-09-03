@@ -79,6 +79,33 @@ export function Metrics() {
           <Metric label="Total recovery cost" hint="What the actions cost to take">
             <Money value={report.total_recovery_cost} />
           </Metric>
+          {/* R31.C12. The four terms of every confirmed executed action, and their sum beside them
+              rather than instead of them. Estimated, not realized — which is why they sit apart from
+              "Total recovery cost" and are not subtracted from net revenue. */}
+          <Metric
+            label="Financial cost"
+            hint="Provider fees attributable to the actions taken. Estimated, not invoiced."
+          >
+            <Money value={report.financial_cost} />
+          </Metric>
+          <Metric label="Communication cost" hint="Per-message delivery cost of those actions">
+            <Money value={report.communication_cost} />
+          </Metric>
+          <Metric label="Risk cost" hint="Expected cost of an action going wrong">
+            <Money value={report.risk_cost} />
+          </Metric>
+          <Metric
+            label="Customer cost"
+            hint="What the intrusion costs the customer. Nothing has measured this."
+          >
+            <Money value={report.customer_cost} />
+          </Metric>
+          <Metric
+            label="Total action cost"
+            hint="The four terms above, summed by the server. Shown alongside them, never instead of them."
+          >
+            <Money value={report.total_action_cost} />
+          </Metric>
           <Metric
             label="Net recovered revenue"
             hint="Observed recovery less cost. Still not a causal claim."

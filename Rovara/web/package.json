@@ -3,10 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Revora dashboard. A React SPA that renders server-formatted figures and computes nothing about money.",
+  "description": "Revora's two frontends. A dashboard SPA and a separate customer response page, both rendering server-formatted figures and computing nothing about money.",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && vite build --mode customer",
+    "build:dashboard": "vite build",
+    "build:customer": "vite build --mode customer",
     "preview": "vite preview",
     "lint": "eslint src",
     "test": "vitest run"

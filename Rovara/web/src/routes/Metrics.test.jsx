@@ -38,6 +38,11 @@ function report(overrides = {}) {
     total_recovery_cost: money(120_000, '₹1,200.00'),
     net_recovered_revenue: money(45_080_000, '₹4,50,800.00'),
     unresolved_revenue: money(74_000_000, '₹7,40,000.00'),
+    financial_cost: money(2_700, '₹27.00'),
+    communication_cost: money(225, '₹2.25'),
+    risk_cost: money(0, '₹0.00'),
+    customer_cost: money(9_000, '₹90.00'),
+    total_action_cost: money(11_925, '₹119.25'),
     incremental_recovered_revenue: {
       status: 'NOT_ESTABLISHED',
       value: 'NOT_ESTABLISHED',

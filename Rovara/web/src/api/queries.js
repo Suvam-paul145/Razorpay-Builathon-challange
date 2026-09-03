@@ -47,6 +47,27 @@ export function useCaseDetail(caseId) {
   })
 }
 
+/**
+ * The nine-stage timeline for one case (R26.C1).
+ *
+ * Its own query rather than a field of `useCaseDetail`, and the separation is deliberate. The
+ * timeline read is bounded by `TIMELINE_QUERY_TIMEOUT` on the server and degrades on its own: when it
+ * cannot be projected in time the response says so and names the case, while every other section of
+ * the detail view still renders from its own request. Folding it into the detail query would make a
+ * slow audit trail blank the whole page — which is the failure R26.C10 is written to prevent.
+ *
+ * No `select` and no transform, like every other hook here. The document arrives projected.
+ *
+ * @param {string} caseId
+ */
+export function useCaseTimeline(caseId) {
+  return useQuery({
+    queryKey: ['timeline', caseId],
+    queryFn: () => request(`/cases/${caseId}/timeline`),
+    ...READ_OPTIONS,
+  })
+}
+
 /** @param {string} caseId */
 export function useAuditTrail(caseId) {
   return useQuery({

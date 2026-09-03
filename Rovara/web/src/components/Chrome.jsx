@@ -10,16 +10,29 @@ import { humanise } from './Figure'
  * failures — one means policy correctly stopped an action, the other means a human was asked — and
  * showing them in the same red as `FAILED` teaches an operator that a working system is broken.
  *
- * @param {{ state: string }} props
+ * `label` is the server's wording when the response carries one (R26.C14); `humanise` is the
+ * fallback for the surfaces that have not been given one yet. The member name stays in `title`
+ * either way, so the stored value is always readable beside the label.
+ *
+ * @param {{ state: string, label?: string | null }} props
  */
-export function StateBadge({ state }) {
+export function StateBadge({ state, label = null }) {
   return (
     <span className={`state state--${STATE_KIND[state] ?? 'active'}`} title={state}>
-      {humanise(state)}
+      {label ?? humanise(state)}
     </span>
   )
 }
 
+/**
+ * Which states read as an ending.
+ *
+ * `POLICY_CHECK` is deliberately absent and that absence is R30.C13's client half: a case resting
+ * there has recorded a decision, not reached a conclusion, and it falls through to `'active'`. A
+ * case that chose restraint is *the* case this mapping must not group with the endings — it was the
+ * whole defect R30 exists to fix, and colouring it as ended would restate that defect on the screen
+ * after it was fixed in the pipeline.
+ */
 const STATE_KIND = {
   RECOVERED: 'recovered',
   BLOCKED: 'ended',
@@ -28,6 +41,8 @@ const STATE_KIND = {
   EXPIRED: 'ended',
   FAILED: 'failed',
 }
+
+export { STATE_KIND }
 
 /**
  * @param {{ title: string, subtitle?: string, aside?: import('react').ReactNode,

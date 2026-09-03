@@ -4,11 +4,19 @@
  * Nine columns and not one is derived here. `payment_amount` and `recovered_amount` arrive formatted;
  * `risk_cause`, `selected_action`, `executed_action`, `policy_decision` and `outcome_classification`
  * each arrive as either an enum value or an absent marker, and each cell renders whichever it got.
+ * Every human label — the state's and the selected action's — arrives too (R26.C14); nothing on this
+ * screen decides what a stored enumeration member is called.
  *
  * **A case with no recovered amount is not a case that recovered nothing.** It is usually a case that
  * has not finished, and on a `RECOVERED` case with no executed action it is the *best* outcome the
  * product produces — the customer paid without being contacted. Both render as markers naming the
  * state rather than as a zero or a blank, which is why this table has no empty cells anywhere.
+ *
+ * **And a case that chose restraint is not a case that ended (R30.C13).** `POLICY_CHECK` with a
+ * future review instant is the state R30 was written about: correctly non-terminal, and until the
+ * review loop existed, behaviourally identical to abandonment. The server sends a `waiting` block for
+ * exactly those cases and `<Waiting>` renders it, so the row says *when* the case will be looked at
+ * again rather than leaving a reader to infer that nothing will happen.
  */
 
 import { useState } from 'react'
@@ -17,6 +25,40 @@ import { Link } from 'react-router-dom'
 import { useCases } from '../api/queries'
 import { Empty, Failure, Loading, Panel, StateBadge, When } from '../components/Chrome'
 import { Enum, Money } from '../components/Figure'
+
+/**
+ * R30.C13. A case at `POLICY_CHECK` with a future review instant, presented as actively waiting.
+ *
+ * Every string here comes from the server: the shared "Waiting and watching" label, the stored
+ * enumeration member beside it, and the sentence in `title`. Nothing is composed from two enum
+ * values in JSX — that is the constraint R26.C14 puts on this, and it is why the label travels on
+ * the wire rather than being a lookup in this file.
+ *
+ * The counter reads `n of cap` and both numbers arrive as small integers rather than as money, so
+ * there is nothing here for the honesty lint to catch and nothing to divide.
+ *
+ * @param {{ waiting: { next_review_at: string, selected_action: string | null,
+ *                      selected_action_label: string | null, decision_cycle_count: number,
+ *                      max_recovery_attempts: number, detail: string } }} props
+ */
+function Waiting({ waiting }) {
+  return (
+    <span className="waiting" title={waiting.detail}>
+      <span className="waiting__label">
+        {waiting.selected_action_label ?? waiting.detail}
+        {waiting.selected_action != null && (
+          <span className="enum__member"> {waiting.selected_action}</span>
+        )}
+      </span>
+      <span className="waiting__when">
+        next review <When iso={waiting.next_review_at} />
+      </span>
+      <span className="waiting__cycles">
+        cycle {waiting.decision_cycle_count} of {waiting.max_recovery_attempts}
+      </span>
+    </span>
+  )
+}
 
 /** Offered as filters because these are the states an operator triages by. */
 const FILTER_STATES = [
@@ -112,7 +154,7 @@ export function CaseList() {
                       <When iso={row.detected_at} />
                     </td>
                     <td>
-                      <StateBadge state={row.state} />
+                      <StateBadge state={row.state} label={row.state_label} />
                       {row.human_owner_user_id !== null && (
                         <span
                           className="owned"
@@ -121,6 +163,7 @@ export function CaseList() {
                           owned
                         </span>
                       )}
+                      {row.waiting != null && <Waiting waiting={row.waiting} />}
                     </td>
                     <td className="num">
                       <Money value={row.payment_amount} />
@@ -129,7 +172,7 @@ export function CaseList() {
                       <Enum value={row.risk_cause} />
                     </td>
                     <td>
-                      <Enum value={row.selected_action} />
+                      <Enum value={row.selected_action} label={row.selected_action_label} />
                     </td>
                     <td>
                       <Enum value={row.executed_action} />

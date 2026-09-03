@@ -98,11 +98,26 @@ export function Rate({ value }) {
  * one is a string when recorded and a marker when not. Branching in every cell is what this replaces,
  * and it is why the case table has no empty cells anywhere.
  *
- * @param {{ value: string | import('../api/types').Absent }} props
+ * `label`, when supplied, is a **server-chosen** human label and is rendered in place of the
+ * derived one, with the stored enumeration member kept beside it (R26.C14). That pairing is the
+ * requirement: `DO_NOTHING` and `WAIT` both arrive labelled "Waiting and watching", and both still
+ * show which of the two was actually recorded. The label is never composed here — a client that
+ * mapped two enum values onto one string would be a second vocabulary, free to drift from the one
+ * the API and the timeline share, and the drift would be in the direction of rendering restraint as
+ * an ending.
+ *
+ * @param {{ value: string | import('../api/types').Absent, label?: string | null }} props
  */
-export function Enum({ value }) {
+export function Enum({ value, label = null }) {
   if (value == null) return null
   if (isAbsentMarker(value)) return <AbsentValue marker={value} />
+  if (label != null) {
+    return (
+      <span className="enum">
+        {label} <span className="enum__member">{String(value)}</span>
+      </span>
+    )
+  }
   return <span className="enum">{humanise(String(value))}</span>
 }
 
@@ -141,6 +156,7 @@ const LABEL_KINDS = {
   UNCALIBRATED: 'caution',
   UNVALIDATED_BASELINE: 'caution',
   CALIBRATION_UNVERIFIED: 'caution',
+  COST_SPLIT_NOT_MEASURED: 'caution',
   SYNTHETIC: 'synthetic',
   RECOVERY_GROSS_OF_REFUNDS: 'neutral',
 }
@@ -160,6 +176,10 @@ const LABEL_EXPLANATIONS = {
   RECOVERY_GROSS_OF_REFUNDS:
     'Refunds are recorded on every read and are not subtracted from these figures.',
   UNCALIBRATED: 'This estimate has not been checked against outcomes.',
+  COST_SPLIT_NOT_MEASURED:
+    'This row was priced before financial and communication cost were estimated separately. ' +
+    'The whole recorded cost is in the financial figure and the communication figure is a zero ' +
+    'nothing measured — not a measurement that it was free.',
   UNVALIDATED_BASELINE: 'Nothing has yet verified the do-nothing probability this was built on.',
   CALIBRATION_UNVERIFIED: 'A calibration check has not been run for this segment.',
 }

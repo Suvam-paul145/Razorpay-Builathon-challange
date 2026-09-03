@@ -332,6 +332,39 @@ pre {
   font-size: 13.5px;
 }
 
+/* The stored enumeration member, kept beside its human label (R26.C14). Quieter than the label
+   because a reader wants the words first and the value when they need to match it against a row. */
+.enum__member {
+  color: var(--ink-faint);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+
+/* R30.C13. A case that chose restraint, with the instant it will be looked at again.
+   Deliberately styled as ongoing work rather than as a warning: choosing not to act is the
+   product working, and an amber badge here would teach an operator otherwise. */
+.waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 4px;
+  line-height: 1.3;
+  cursor: help;
+}
+
+.waiting__label {
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.waiting__when,
+.waiting__cycles {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
 /* An absent value: grey, labelled, and never mistakable for a figure. */
 .absent {
   display: inline-flex;
@@ -1119,3 +1152,165 @@ pre {
     animation: none !important;
   }
 }
+/* ---------------------------------------------------------------------------
+ * Case_Timeline (R26.C12, R26.C13)
+ *
+ * Status is carried by text in every case — the visible chip and the `<li>`'s accessible name both
+ * say the word — so the colours below are redundant reinforcement rather than the signal. That is
+ * R26.C13's "conveyed by a programmatic label rather than by colour alone", and it is why removing
+ * this whole block would leave the component still readable and still correct.
+ *
+ * Focus is styled rather than left to the browser default, and `:focus-visible` rather than `:focus`
+ * so a pointer user does not get a ring they did not ask for while a keyboard user always does. The
+ * outline is offset so it is visible against the row's own background.
+ *
+ * Contrast: the four status colours are dark text on a light tint of the same hue rather than light
+ * text on saturated colour. WCAG 2.1 AA is the target standard; full conformance validation requires
+ * manual testing with assistive technologies and expert review, which has not been done.
+ * --------------------------------------------------------------------------- */
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.timeline__item {
+  border-left: 3px solid var(--line, #d8dee9);
+  padding: 0 0 0.5rem 0;
+}
+
+.timeline__item--done { border-left-color: #2e7d32; }
+.timeline__item--in_progress { border-left-color: #1565c0; }
+.timeline__item--skipped { border-left-color: #8d6e63; }
+.timeline__item--upcoming { border-left-color: #b0bec5; }
+
+.timeline__control {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: none;
+  border: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.timeline__control:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.timeline__control:focus-visible {
+  outline: 3px solid #1565c0;
+  outline-offset: 2px;
+}
+
+.timeline__ordinal {
+  flex: 0 0 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #eceff1;
+  color: #263238;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.timeline__name {
+  font-weight: 600;
+  flex: 1 1 auto;
+}
+
+.timeline__status {
+  flex: 0 0 auto;
+  font-size: 0.8125rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid currentColor;
+}
+
+.timeline__status--done { color: #1b5e20; background: #e8f5e9; }
+.timeline__status--in_progress { color: #0d47a1; background: #e3f2fd; }
+.timeline__status--skipped { color: #4e342e; background: #efebe9; }
+.timeline__status--upcoming { color: #37474f; background: #eceff1; }
+
+.timeline__body {
+  padding: 0 0.75rem 0 3.25rem;
+}
+
+.timeline__instant time {
+  font-size: 0.8125rem;
+  color: #546e7a;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline__decision {
+  margin: 0.125rem 0;
+  font-size: 0.9375rem;
+}
+
+.timeline__evidence,
+.timeline__skip {
+  margin: 0.125rem 0;
+  font-size: 0.875rem;
+  color: #455a64;
+}
+
+.timeline__fields {
+  margin-top: 0.5rem;
+}
+
+.timeline__sublist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.timeline__subrecord {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.timeline__subkey {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #607d8b;
+}
+
+.timeline-banner {
+  border: 1px solid #e65100;
+  border-left-width: 4px;
+  background: #fff3e0;
+  color: #3e2723;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.timeline-banner__head { margin: 0 0 0.25rem; }
+.timeline-banner__detail { margin: 0.25rem 0 0; font-size: 0.875rem; }
+
+.timeline-unavailable {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.timeline-ai {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed #7e57c2;
+  background: #f6f3fb;
+}
+
+.timeline-ai__label { margin: 0 0 0.375rem; }
+.timeline-ai__text { margin: 0; font-style: italic; }
