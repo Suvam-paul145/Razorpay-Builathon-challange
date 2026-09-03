@@ -257,7 +257,7 @@ rather than a search.
 
 ## Layout
 
-A modular monolith. One image, two process roles, selected by `REVORA_ROLE`.
+A modular monolith. One image, three process roles, selected by `REVORA_ROLE`: `api`, `worker`, and `ticker` — the schedule, which produces every periodic sweep job and reclaims the leases of jobs a dead worker left `RUNNING`. Without the ticker running, nothing expires a case, reconciles an intent, re-reads payment state, backfills a detection gap, redacts customer data, or reviews a case that chose restraint, and nothing looks broken.
 
 ```
 revora/
@@ -274,7 +274,7 @@ revora/
   memory/        training observations and model versions
   metrics/       the reported figures, with their provenance labels
   cases/         the state machine, the lifecycle sweeper, retention
-  jobs/          the queue, the worker loop, the pipeline steps
+  jobs/          the queue, the worker loop, the ticker, the pipeline steps
   providers/     the Razorpay client and result classification
   persistence/   models and repositories
   audit/         the append-only writer
@@ -346,11 +346,14 @@ point of use rather than silently degrading.
 | `REVORA_DATABASE_URL` | Postgres DSN (`postgresql+psycopg://…`) |
 | `REVORA_PAYLOAD_ENCRYPTION_KEYS` | `<version>:<base64 32 bytes>`, comma-separated for rotation |
 | `REVORA_CUSTOMER_KEY_SECRET` | base64 32 bytes; derives `customer_key` from a contact |
+| `REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS` | `<version>:<base64 32 bytes>`, comma-separated for rotation; keys the customer access token hash. Highest version mints, every version verifies |
 | `REVORA_SESSION_TOKEN_SECRET` | base64 32 bytes; HMAC key for stored session digests |
 | `REVORA_DASHBOARD_KEYS_<SLUG>` | per-merchant operator key that mints a session |
 | `REVORA_WEBHOOK_SECRETS_<SLUG>` | per-merchant Razorpay webhook signing secret |
 | `REVORA_RAZORPAY_KEY_ID` / `_KEY_SECRET` | Razorpay API credentials |
-| `REVORA_ROLE` | `api` or `worker` |
+| `REVORA_ROLE` | `api`, `worker` or `ticker`. An unknown value is refused at startup |
+| `REVORA_TICKER_INTERVAL_SECONDS` | ticker role only. Seconds between ticks, default 30. Deliberately shorter than the shortest sweep interval; over-ticking is free because every enqueue is dedupe-keyed by interval bucket |
+| `REVORA_JOB_LEASE_SECONDS` | ticker role only. How long a `RUNNING` job may hold its lease before the tick presumes its worker died, default 900 |
 | `REVORA_API_CORS_ORIGINS` | exact origins, comma-separated. A `*` is refused at startup. Omit entirely when the SPA is same-origin, which is the intended deployment |
 | `REVORA_WEB_ROOT` | where the built dashboard lives. Defaults to `web/dist` beside the package, which the image produces. Absent build → nothing mounted, API-only |
 

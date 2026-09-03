@@ -1,6 +1,6 @@
 # 🚀 Revora — Local Development & Execution Runbook
 
-This guide contains everything you need to run, test, and develop the **Revora Autonomous Revenue Recovery System** (Backend API, Background Worker, Dashboard SPA, and Webhook Simulation).
+This guide contains everything you need to run, test, and develop the **Revora Autonomous Revenue Recovery System** (Backend API, Background Worker, Ticker, Dashboard SPA, and Webhook Simulation).
 
 ---
 
@@ -12,7 +12,7 @@ This guide contains everything you need to run, test, and develop the **Revora A
 
 ---
 
-## ⚡ Quick Start: 3-Terminal Execution
+## ⚡ Quick Start: 4-Terminal Execution
 
 Open **PowerShell** terminals in your workspace directory (`.../Razorpay Builathon challange/Rovara`).
 
@@ -28,7 +28,18 @@ Pulls queued jobs (ingestion, diagnosis, optimization, policy checks, execution,
 cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='worker'; .\.venv\Scripts\python.exe -m revora.jobs.main
 ```
 
-### 📡 **Terminal 3 — Send Test Events (Webhook Simulator)**
+### ⏰ **Terminal 3 — Ticker (the schedule)**
+Produces the seven periodic sweep jobs and returns a dead worker's `RUNNING` job to `PENDING`. Nothing else creates those jobs, so without this the worker has nothing periodic to claim: cases never expire, intents never reconcile, payment state is never re-read, detection gaps are never backfilled, customer data is never redacted, and a case that chose restraint is never reviewed. None of that logs an error.
+```powershell
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='ticker'; .\.venv\Scripts\python.exe -m revora.jobs.ticker_main
+```
+
+`enqueued=0` in its log is the expected steady state — it means every interval bucket already has a pending sweep, which is the dedupe key doing its job. To drive the same loop by hand instead, one tick at a time:
+```powershell
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_tick.py --due
+```
+
+### 📡 **Terminal 4 — Send Test Events (Webhook Simulator)**
 Send mock Razorpay failed payment events to trigger recovery flows:
 
 - **Standard failure event:**
@@ -42,7 +53,7 @@ Send mock Razorpay failed payment events to trigger recovery flows:
 
 ---
 
-## 🎨 Terminal 4 (Optional) — Frontend UI Hot-Reload
+## 🎨 Terminal 5 (Optional) — Frontend UI Hot-Reload
 
 By default, the backend API serves the pre-built frontend SPA at `http://127.0.0.1:8000/app`. 
 

@@ -1,0 +1,875 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "34.1 The four new tables with their constraints and RLS policies": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354839994
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354862452
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788356357726
+      }
+    ],
+    "34.2 `next_review_at`, `effect_kind`, and `call_kind`": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840086
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788356364371
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788357419827
+      }
+    ],
+    "34.3 The cost split columns and the R31.C9 data migration": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840142
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788356365303
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788358612817
+      }
+    ],
+    "34.4 Downgrade with three refusal pre-assertions": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840195
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788358619433
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788361073741
+      }
+    ],
+    "34.5 SQLAlchemy models, repositories, and the revision bump": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840246
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788358620604
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788361084056
+      }
+    ],
+    "35.1 `CostPrior` gains a fourth term; `EstimationMethod` gains its weakest member": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840318
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788361093765
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416441163
+      }
+    ],
+    "35.2 Four-term arithmetic in the optimizer": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840412
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416445742
+      }
+    ],
+    "35.3 Property test: the split changes presentation, not selection": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840471
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416450431
+      }
+    ],
+    "35.5 `PAYMENT_LINK_FINANCIAL_COST` and `MESSAGE_COMMUNICATION_COST` as versioned config rows": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840522
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416455304
+      }
+    ],
+    "35.6 Present four figures plus the total, never the total instead": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840597
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416459918
+      }
+    ],
+    "36. Checkpoint — schema and valuation": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840668
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416464471
+      }
+    ],
+    "37.1 Declare the edge and rewrite the termination proof": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840731
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416469010
+      }
+    ],
+    "37.2 `apply_locked_transition` clears `next_review_at` on every edge out of `POLICY_CHECK`": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840787
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416474799
+      }
+    ],
+    "37.3 `handle_policy`'s null-action branch persists a review instant": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840844
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416479707
+      }
+    ],
+    "37.4 Strengthen the existing lifecycle property test's graph assertion": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840896
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416484423
+      }
+    ],
+    "38.1 `revora/cases/review.py` and its scheduler registration": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354840965
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416489382
+      }
+    ],
+    "38.2 `handle_review` assembled from the existing pipeline steps": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841030
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416493893
+      }
+    ],
+    "38.3 `EVENT_ATTACHED` trigger in the detection service": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841096
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416498784
+      }
+    ],
+    "38.4 Property tests: review never buys time and never escapes the cap": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841148
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416503483
+      }
+    ],
+    "38.5 `pg`-tier proof that one review is one cycle": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841202
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416508143
+      }
+    ],
+    "38.6 Present a waiting case as waiting, not as ended": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841254
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416512905
+      }
+    ],
+    "39.1 `CUSTOMER_ACCESS_TOKEN` as a sensitive field kind": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841320
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416517686
+      }
+    ],
+    "39.2 `revora/customer/tokens.py` — mint, verify, rotate": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841415
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416522451
+      }
+    ],
+    "39.3 Revocation on terminal state and on suppression": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841541
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416527063
+      }
+    ],
+    "39.4 Mint inside `execute_approved_action`'s first transaction": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841601
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416533105
+      }
+    ],
+    "39.5 Property tests: one token reaches one case and nothing else": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841655
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416537982
+      }
+    ],
+    "40.1 Promote the rate limiter to `revora/platform/ratelimit.py`": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841723
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416544997
+      }
+    ],
+    "40.2 `revora/customer/projection.py` — nine fields and no tenth": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841776
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416549708
+      }
+    ],
+    "40.3 `revora/customer/signals.py` — three write shapes, one transaction each": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841841
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416554238
+      }
+    ],
+    "40.4 `revora/api/routers/customer.py` — the status-code table, CORS, and response headers": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841896
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416558782
+      }
+    ],
+    "40.5 Property tests: the projection discloses nine fields and the audit trail is exact": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354841947
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416563362
+      }
+    ],
+    "40.6 Extend the structural checks to the new packages": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842005
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416567913
+      }
+    ],
+    "41.1 The mapping table and the second deterministic diagnosis source": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842073
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416602116
+      }
+    ],
+    "41.2 Note handling and the confidence floor guard": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842134
+      }
+    ],
+    "41.3 Property tests: customer input is evidence, never authority": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842193
+      }
+    ],
+    "41.4 Present the note as customer-supplied unverified text": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842252
+      }
+    ],
+    "41.5 Extend the retention sweep to notes": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842299
+      }
+    ],
+    "42.1 `revora/customer/suppression.py` — the record and the policy input": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842356
+      }
+    ],
+    "42.2 Escalation, cancellation, and the in-flight intent": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842440
+      }
+    ],
+    "42.3 Release requires a person": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842523
+      }
+    ],
+    "42.4 Property tests: a hard stop is permanent": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842579
+      }
+    ],
+    "42.5 Present suppression in the unresolved grouping": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842632
+      }
+    ],
+    "43.1 Escalate, record, change no money field": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842681
+      }
+    ],
+    "43.2 Property tests: partial money is never recovery": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842745
+      }
+    ],
+    "43.3 Present the arrangement request in the ESCALATED grouping": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842801
+      }
+    ],
+    "44.1 `revora/customer/promises.py` — accept, clamp, reject": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842863
+      }
+    ],
+    "44.2 Status transitions driven by authoritative reads": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842917
+      }
+    ],
+    "44.3 The promise sweep": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354842970
+      }
+    ],
+    "44.4 Property tests: a promise never buys time": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843028
+      }
+    ],
+    "44.5 Present the clamp as a clamp": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843109
+      }
+    ],
+    "45. Checkpoint — customer surface": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843169
+      }
+    ],
+    "46.1 The client method and the composed response identifier": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843223
+      }
+    ],
+    "46.2 The resend classification table": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843280
+      }
+    ],
+    "46.3 `UNCERTAIN` is terminal-unresolvable, and the sweep must not touch it": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843336
+      }
+    ],
+    "46.4 Example test: a 429 spends a customer-message increment": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843433
+      }
+    ],
+    "47.1 Move the action into the executable and provider-call sets": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843490
+      }
+    ],
+    "47.2 Price it in the four-term shape": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843550
+      }
+    ],
+    "47.3 Execute it exactly once": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843602
+      }
+    ],
+    "47.4 Property tests for the new action's exactly-once and cooldown bounds": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843659
+      }
+    ],
+    "47.5 The capability-withdrawal degradation path": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843711
+      }
+    ],
+    "48.1 Observation fields written in the terminal transaction": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843767
+      }
+    ],
+    "48.2 A responded customer is not a no-intervention observation": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843841
+      }
+    ],
+    "48.3 Composition and cohort reporting": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843899
+      }
+    ],
+    "49.1 Contracts, schemas, and the import contracts in the same task": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354843953
+      },
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788361094548
+      },
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416572612
+      }
+    ],
+    "49.2 Hand-written `httpx` client and the four gates": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844006
+      }
+    ],
+    "49.3 Three invocation sites, all in the job pipeline": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844058
+      }
+    ],
+    "49.4 One `ai_invocation` row per invocation, and the per-case bound": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844146
+      }
+    ],
+    "49.5 Property tests: reasoning has no authority": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844209
+      }
+    ],
+    "50.1 `revora/timeline/stages.py` — the pure projection": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844261
+      }
+    ],
+    "50.2 `revora/timeline/templates.py` — deterministic sentences and the label table": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844319
+      }
+    ],
+    "50.3 Router, timeout, and the sequence-gap banner": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844412
+      }
+    ],
+    "50.4 Property tests: the timeline is a projection": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844471
+      }
+    ],
+    "50.5 The timeline as the first element of the case detail view": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844531
+      }
+    ],
+    "51.1 The entry, the token read, and the two API calls": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844583
+      }
+    ],
+    "51.2 `Page.jsx` — amount, reason, pay button, two forms": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844635
+      }
+    ],
+    "51.3 Frontend test extensions": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844693
+      }
+    ],
+    "52. Checkpoint — decision loop, reasoning, and surfaces": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844752
+      }
+    ],
+    "53.1 Seed `DEMO_BATCH_CASE_COUNT` cases through the signed webhook endpoint": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844828
+      }
+    ],
+    "53.2 Drive the customer-side outcomes through the public HTTP surface": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844886
+      }
+    ],
+    "53.3 Assert the required outcome coverage rather than assuming it": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844941
+      }
+    ],
+    "53.4 Compute the sample size before activation and refuse to fudge it": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354844997
+      }
+    ],
+    "53.5 The two-figure split, kept apart in the API response and on the page": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845050
+      }
+    ],
+    "53.6 `harness`-tier run and the two demonstration properties": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845101
+      }
+    ],
+    "53.7 Verified test-mode recoveries and the runbook entry": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845170
+      }
+    ],
+    "54.1 Marker assignment and CI tier extension": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845237
+      }
+    ],
+    "54.2 Example-based tests for what properties should not cover": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845309
+      }
+    ],
+    "54.3 Full-loop integration test on a real Postgres": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845389
+      }
+    ],
+    "54.4 Degradation integration tests, one per new ladder row": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845441
+      }
+    ],
+    "55. Final checkpoint": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788354845507
+      }
+    ],
+    "34. Migration `0008` — the schema the whole loop stands on": [
+      {
+        "executionId": "db252dde-829a-420d-98f1-f492fc16a3d3",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788361084204
+      }
+    ],
+    "35. Four-term cost decomposition — before anything prices a new action": [
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416459991
+      }
+    ],
+    "37. The REVIEW transition edge and `next_review_at` writer discipline": [
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416484534
+      }
+    ],
+    "38. Review_Sweeper, `handle_review`, and the three triggers": [
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416512979
+      }
+    ],
+    "39. Customer_Access_Token mint, verify, revoke, and the execution-engine integration": [
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416538047
+      }
+    ],
+    "40. The public customer surface — projection, three writes, and the compensations for the absent session": [
+      {
+        "executionId": "b97e7333-57db-4b23-816e-7e38c4051073",
+        "chatSessionId": "sess_8006587a-33c0-410b-accf-9041e24856da",
+        "timestamp": 1788416568029
+      }
+    ]
+  }
+}
