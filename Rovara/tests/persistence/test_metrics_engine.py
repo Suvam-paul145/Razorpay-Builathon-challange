@@ -203,19 +203,35 @@ def _confirmed_action(
     case_id: uuid.UUID,
     *,
     is_post_payment: bool = False,
+    priced: tuple[int, int, int, int] | None = None,
+    state: IntentState = IntentState.CONFIRMED,
 ) -> None:
+    """One policy decision and the intent it authorized.
+
+    ``priced`` attaches the decision to a real priced candidate set — baseline, estimate,
+    recommendation, ranked candidate — with those four cost terms on the
+    ``PAYMENT_LINK`` row. Left ``None`` the decision names no recommendation, which is
+    what most of these tests want: they are about counts, and the chain is scaffolding.
+    R31.C12's cost terms need it, because the terms are only reachable *through* the
+    recommendation the decision was evaluated against.
+    """
     decision_id = uuid.uuid4()
     moment = now()
+    recommendation_id = (
+        None
+        if priced is None
+        else _priced_recommendation(engine, merchant_id, case_id, costs=priced)
+    )
     with engine.begin() as connection:
         connection.execute(
             text(
                 """
                 INSERT INTO policy_decision (
-                    id, merchant_id, case_id, verdict, primary_reason, rule_set_version,
-                    evaluated_at, expires_at, selected_action, case_state_at_evaluation,
-                    decision_cycle, created_at
+                    id, merchant_id, case_id, recommendation_id, verdict, primary_reason,
+                    rule_set_version, evaluated_at, expires_at, selected_action,
+                    case_state_at_evaluation, decision_cycle, created_at
                 ) VALUES (
-                    :id, :m, :c, 'APPROVED', 'ALL_CHECKS_PASSED', 'v1', :ev, :exp,
+                    :id, :m, :c, :r, 'APPROVED', 'ALL_CHECKS_PASSED', 'v1', :ev, :exp,
                     'PAYMENT_LINK', 'ACTION_SCHEDULED', 1, now()
                 )
                 """
@@ -224,6 +240,7 @@ def _confirmed_action(
                 "id": str(decision_id),
                 "m": str(merchant_id),
                 "c": str(case_id),
+                "r": None if recommendation_id is None else str(recommendation_id),
                 "ev": moment,
                 "exp": moment + timedelta(minutes=15),
             },
@@ -238,7 +255,7 @@ def _confirmed_action(
                     counter_applied, created_at
                 ) VALUES (
                     gen_random_uuid(), :m, :c, :d, :key, 'PAYMENT_LINK', 1, :st,
-                    :started, :started, 'plink_x', :pp, 0, true, now()
+                    :started, :resolved, 'plink_x', :pp, 0, true, now()
                 )
                 """
             ),
@@ -247,11 +264,118 @@ def _confirmed_action(
                 "c": str(case_id),
                 "d": str(decision_id),
                 "key": f"rv_{uuid.uuid4().hex[:16]}",
-                "st": IntentState.CONFIRMED.value,
+                "st": state.value,
                 "started": moment,
+                # ``resolved_at_iff_resolved``: an UNCERTAIN intent is by definition not
+                # resolved, and the schema refuses a timestamp that claims it is.
+                "resolved": None if state is IntentState.UNCERTAIN else moment,
                 "pp": is_post_payment,
             },
         )
+
+
+def _priced_recommendation(
+    engine: Engine,
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    costs: tuple[int, int, int, int],
+) -> uuid.UUID:
+    """A baseline, one candidate estimate, and a recommendation ranking it first.
+
+    Written by hand rather than by running the optimizer because this file's subject is
+    the aggregation SQL, and driving the pipeline would make a wrong join pass on the
+    strength of a right pipeline.
+    """
+    financial, communication, risk, customer = costs
+    baseline_id = uuid.uuid4()
+    estimate_id = uuid.uuid4()
+    recommendation_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO baseline_estimate (
+                    id, merchant_id, case_id, decision_cycle, probability,
+                    uncertainty_available, method, provenance, validation_status, created_at
+                ) VALUES (
+                    :id, :m, :c, 1, 0.3000, false, 'PRIOR_FALLBACK', 'REAL',
+                    'UNVALIDATED_BASELINE', now()
+                )
+                """
+            ),
+            {"id": str(baseline_id), "m": str(merchant_id), "c": str(case_id)},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO candidate_estimate (
+                    id, merchant_id, case_id, baseline_estimate_id, action,
+                    intervention_probability, financial_cost, communication_cost,
+                    risk_cost, customer_cost, financial_cost_method,
+                    communication_cost_method, method, provenance, availability, created_at
+                ) VALUES (
+                    :id, :m, :c, :b, 'PAYMENT_LINK', 0.3800, :f, :cm, :r, :cu,
+                    'PRIOR_FALLBACK', 'PRIOR_FALLBACK', 'UNCALIBRATED', 'REAL',
+                    'AVAILABLE', now()
+                )
+                """
+            ),
+            {
+                "id": str(estimate_id),
+                "m": str(merchant_id),
+                "c": str(case_id),
+                "b": str(baseline_id),
+                "f": financial,
+                "cm": communication,
+                "r": risk,
+                "cu": customer,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO recommendation (
+                    id, merchant_id, case_id, baseline_estimate_id, decision_cycle,
+                    selected_action, selection_reason, created_at
+                ) VALUES (
+                    :id, :m, :c, :b, 1, 'PAYMENT_LINK', 'HIGHEST_NET_VALUE', now()
+                )
+                """
+            ),
+            {
+                "id": str(recommendation_id),
+                "m": str(merchant_id),
+                "c": str(case_id),
+                "b": str(baseline_id),
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO recommendation_candidate (
+                    id, merchant_id, recommendation_id, candidate_estimate_id, action,
+                    incremental_probability, expected_incremental_revenue, financial_cost,
+                    communication_cost, risk_cost, customer_cost, financial_cost_method,
+                    communication_cost_method, net_recovery_value, excluded, rank, created_at
+                ) VALUES (
+                    gen_random_uuid(), :m, :r, :e, 'PAYMENT_LINK', 0.0800, 20000, :f, :cm,
+                    :ri, :cu, 'PRIOR_FALLBACK', 'PRIOR_FALLBACK', :net, false, 1, now()
+                )
+                """
+            ),
+            {
+                "m": str(merchant_id),
+                "r": str(recommendation_id),
+                "e": str(estimate_id),
+                "f": financial,
+                "cm": communication,
+                "ri": risk,
+                "cu": customer,
+                "net": 20_000 - financial - communication - risk - customer,
+            },
+        )
+    return recommendation_id
 
 
 def _completed_experiment(
@@ -789,6 +913,90 @@ def test_the_counters_and_money_figures_add_up(
         metrics.unresolved_revenue,
         metrics.net_recovered_revenue,
     ))
+
+
+def test_the_four_cost_terms_are_reported_separately_and_summed(
+    owner_engine: Engine, factory: sessionmaker[Session], period: ReportingPeriod
+) -> None:
+    """R31.C12. Four terms, their sum beside them, every figure an integer minor-unit count.
+
+    Two confirmed actions on two cases, priced differently, so a query that summed one row
+    and stopped, or that double-counted through the join, would produce a wrong number
+    rather than a plausible one. The sum is asserted against the four terms rather than
+    against a literal, because the claim is that the total *is* the four terms — a literal
+    would still pass if a term were dropped from both sides.
+    """
+    merchant_id = _merchant(owner_engine)
+    first = _case(owner_engine, merchant_id)
+    second = _case(owner_engine, merchant_id)
+    _confirmed_action(owner_engine, merchant_id, first, priced=(300, 25, 0, 1_000))
+    _confirmed_action(owner_engine, merchant_id, second, priced=(450, 25, 10, 2_000))
+
+    with tenant_transaction(merchant_id, factory) as session:
+        metrics = compute_metrics(session, merchant_id, period)
+
+    assert metrics.financial_cost == 750
+    assert metrics.communication_cost == 50
+    assert metrics.risk_cost == 10
+    assert metrics.customer_cost == 3_000
+    assert metrics.total_action_cost == (
+        metrics.financial_cost
+        + metrics.communication_cost
+        + metrics.risk_cost
+        + metrics.customer_cost
+    )
+    assert all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (
+            metrics.financial_cost,
+            metrics.communication_cost,
+            metrics.risk_cost,
+            metrics.customer_cost,
+            metrics.total_action_cost,
+        )
+    )
+
+    document = metrics.as_document()
+    for key in (
+        "financial_cost",
+        "communication_cost",
+        "risk_cost",
+        "customer_cost",
+        "total_action_cost",
+    ):
+        assert key in document, key
+
+    # The realized figure and the estimated one are separate claims, and net revenue still
+    # subtracts the realized one. Folding an estimate into net revenue is what
+    # ``_realized_cost`` exists to refuse.
+    assert metrics.total_recovery_cost == 0
+    assert metrics.net_recovered_revenue == metrics.observed_recovered_revenue
+
+
+def test_an_unconfirmed_action_contributes_no_cost(
+    owner_engine: Engine, factory: sessionmaker[Session], period: ReportingPeriod
+) -> None:
+    """R31.C12 says *confirmed* executed, and an unresolved attempt has no established effect.
+
+    An intent left ``UNCERTAIN`` by a provider timeout may or may not have created a link.
+    Charging a merchant for it would report a cost for something that might not exist, in a
+    figure whose whole purpose is to say what recovery cost.
+    """
+    merchant_id = _merchant(owner_engine)
+    case_id = _case(owner_engine, merchant_id)
+    _confirmed_action(
+        owner_engine,
+        merchant_id,
+        case_id,
+        priced=(300, 25, 0, 1_000),
+        state=IntentState.UNCERTAIN,
+    )
+
+    with tenant_transaction(merchant_id, factory) as session:
+        metrics = compute_metrics(session, merchant_id, period)
+
+    assert metrics.confirmed_action_count == 0
+    assert metrics.total_action_cost == 0
 
 
 def test_unnecessary_actions_are_counted_and_visible(

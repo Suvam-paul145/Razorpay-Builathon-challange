@@ -60,6 +60,7 @@ def passing_input(**overrides: object) -> PolicyInput:
         verified_payment_captured=False,
         verified_payment_status="failed",
         customer_opted_out=False,
+        contact_suppressed=False,
         consent_expires_at=_NOW + timedelta(days=30),
         consent_recorded=True,
         risk_flagged=False,
@@ -161,6 +162,64 @@ def test_5_opted_out_blocks_and_is_checked_before_every_bound() -> None:
     )
     assert evaluation.verdict is PolicyVerdict.BLOCKED
     assert evaluation.primary_reason == PolicyCheck.CUSTOMER_OPTED_OUT.value
+
+
+def test_5b_contact_suppression_blocks_through_the_same_check() -> None:
+    """Feature: Policy_Engine. R21.C3, R21.C8 — a hard stop blocks, and adds no new check.
+
+    Three assertions, and each is a separate claim R21 makes.
+
+    The verdict is ``BLOCKED`` with ``CUSTOMER_OPTED_OUT`` as the primary reason even though
+    the customer-wide opt-out flag is ``False`` and consent is recorded and live. That is the
+    "no thirteenth check" claim made checkable: the suppression is refused at check 5's
+    position, not at a thirteenth position that would have had to sit after a bound.
+
+    The bounds are all broken and the reason is still the suppression, which is the ordering
+    argument that put the opt-out fifth applied to its second input.
+
+    Exactly twelve check outcomes are recorded, before and after. A count of thirteen would
+    mean a check was added, which is the thing this requirement says it does not do.
+    """
+    evaluation = evaluate(
+        passing_input(
+            contact_suppressed=True,
+            customer_opted_out=False,
+            executed_action_count=99,
+            customer_message_count=99,
+            window_end_at=_NOW - timedelta(hours=1),
+        ),
+        RULES,
+    )
+    assert evaluation.verdict is PolicyVerdict.BLOCKED
+    assert evaluation.primary_reason == PolicyCheck.CUSTOMER_OPTED_OUT.value
+    assert len(evaluation.checks) == 12
+    suppressed = next(
+        check for check in evaluation.checks if check.check is PolicyCheck.CUSTOMER_OPTED_OUT
+    )
+    assert suppressed.detail == "contact_suppressed"
+    assert suppressed.order == 5
+
+
+def test_5c_a_suppressed_case_still_reaches_a_person() -> None:
+    """Feature: Policy_Engine. R21 ends contact, not help.
+
+    ``HUMAN_ESCALATION`` is not customer-visible, so check 5 passes it whether the case is
+    suppressed or not. A hard stop that also blocked escalation would leave the case nobody
+    may message unreachable by the person who has to deal with the dispute — which is the
+    opposite of what R21's user story asks for.
+    """
+    evaluation = evaluate(
+        passing_input(
+            contact_suppressed=True,
+            selected_action=CandidateAction.HUMAN_ESCALATION,
+        ),
+        RULES,
+    )
+    opted_out = next(
+        check for check in evaluation.checks if check.check is PolicyCheck.CUSTOMER_OPTED_OUT
+    )
+    assert opted_out.passed
+    assert opted_out.detail == "not_customer_visible"
 
 
 def test_6_missing_consent_blocks() -> None:

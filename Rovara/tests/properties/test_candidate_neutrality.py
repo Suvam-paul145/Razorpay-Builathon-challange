@@ -47,6 +47,7 @@ from revora.estimation.candidates import (
     wait_probability,
     weakest_method,
 )
+from revora.platform.config import default_configuration
 from tests.strategies.primitives import probabilities, risk_causes
 
 pytestmark = pytest.mark.pure
@@ -55,6 +56,15 @@ WINDOW = timedelta(days=7)
 """``RECOVERY_WINDOW_DURATION``'s seeded default. A literal rather than a configuration
 read, for the reason ``tests/strategies/primitives`` gives: a property test that explores
 different values on different machines is not a property test."""
+
+CONFIG = default_configuration()
+"""The catalogue defaults, with nothing read from a database.
+
+``build_candidate_set`` resolves the two R31.C11 cost rows off a ``Configuration``. Held
+fixed here for the same reason ``WINDOW`` is: these properties are about definitional
+neutrality and about which methods a degraded read produces, and neither depends on what a
+merchant set a payment link's fee to. The cost rows are varied where that matters —
+``tests/test_estimation.py``."""
 
 
 def remaining_windows() -> st.SearchStrategy[timedelta]:
@@ -90,6 +100,7 @@ def candidate_sets() -> st.SearchStrategy[CandidateSet]:
         baseline=probabilities(),
         remaining=remaining_windows(),
         window=st.just(WINDOW),
+        config=st.just(CONFIG),
         memory_available=st.booleans(),
     )
 
@@ -122,6 +133,7 @@ def test_do_nothing_probability_equals_the_baseline_exactly(
         baseline=baseline,
         remaining=remaining,
         window=WINDOW,
+        config=CONFIG,
         memory_available=memory_available,
     )
     figure = candidates.figure_for(CandidateAction.DO_NOTHING)
@@ -143,7 +155,7 @@ def test_do_nothing_costs_are_all_exactly_zero_and_definitional(
     remaining: timedelta,
     memory_available: bool,
 ) -> None:
-    """All three costs zero, all four methods ``DEFINITIONAL``, whatever else is true.
+    """All four costs zero, all five methods ``DEFINITIONAL``, whatever else is true.
 
     Including when memory is unavailable. R6.C11 degrades every *estimated* figure to
     ``UNCALIBRATED``, and ``DO_NOTHING``'s figures are not estimated — a definitional
@@ -155,16 +167,19 @@ def test_do_nothing_costs_are_all_exactly_zero_and_definitional(
         baseline=baseline,
         remaining=remaining,
         window=WINDOW,
+        config=CONFIG,
         memory_available=memory_available,
     )
     figure = candidates.figure_for(CandidateAction.DO_NOTHING)
     assert figure is not None
-    assert figure.action_cost == ZERO
+    assert figure.financial_cost == ZERO
+    assert figure.communication_cost == ZERO
     assert figure.risk_cost == ZERO
     assert figure.customer_cost == ZERO
     assert figure.total_cost == ZERO
     assert figure.probability_method is EstimationMethod.DEFINITIONAL
-    assert figure.action_cost_method is EstimationMethod.DEFINITIONAL
+    assert figure.financial_cost_method is EstimationMethod.DEFINITIONAL
+    assert figure.communication_cost_method is EstimationMethod.DEFINITIONAL
     assert figure.risk_cost_method is EstimationMethod.DEFINITIONAL
     assert figure.customer_cost_method is EstimationMethod.DEFINITIONAL
     assert figure.recorded_method is EstimationMethod.DEFINITIONAL
@@ -174,16 +189,18 @@ def test_do_nothing_costs_are_all_exactly_zero_and_definitional(
 @given(candidates=candidate_sets())
 @settings(max_examples=500)
 def test_wait_has_zero_action_and_customer_cost(candidates: CandidateSet) -> None:
-    """R6.C10 fixes two of ``WAIT``'s three costs at zero, and they are definitional.
+    """R6.C10 and R31.C2 fix three of ``WAIT``'s four costs at zero, definitionally.
 
-    Waiting issues no request and reaches no customer, so both figures are zero by what
-    the action *is* rather than by a configured value that could be retuned upward.
+    Waiting issues no request and reaches no customer, so all three figures are zero by
+    what the action *is* rather than by a configured value that could be retuned upward.
     """
     figure = candidates.figure_for(CandidateAction.WAIT)
     assert figure is not None
-    assert figure.action_cost == ZERO
+    assert figure.financial_cost == ZERO
+    assert figure.communication_cost == ZERO
     assert figure.customer_cost == ZERO
-    assert figure.action_cost_method is EstimationMethod.DEFINITIONAL
+    assert figure.financial_cost_method is EstimationMethod.DEFINITIONAL
+    assert figure.communication_cost_method is EstimationMethod.DEFINITIONAL
     assert figure.customer_cost_method is EstimationMethod.DEFINITIONAL
 
 
@@ -213,7 +230,7 @@ def test_the_set_always_holds_both_null_actions_and_between_two_and_nine_members
 @given(candidates=candidate_sets())
 @settings(max_examples=500)
 def test_every_member_has_all_four_figures_in_range(candidates: CandidateSet) -> None:
-    """R6.C3 and R6.C7: four figures set, probability in [0, 1], costs non-negative ints.
+    """R6.C3, R6.C7 and R31.C1: five figures set, probability in [0, 1], costs non-negative.
 
     These are also the database's ``CHECK`` constraints, so a violation is an
     uncommittable row rather than a wrong number — which means a job that retries
@@ -221,7 +238,12 @@ def test_every_member_has_all_four_figures_in_range(candidates: CandidateSet) ->
     """
     for figure in candidates.figures:
         assert Decimal(0) <= figure.intervention_probability.value <= Decimal(1)
-        for cost in (figure.action_cost, figure.risk_cost, figure.customer_cost):
+        for cost in (
+            figure.financial_cost,
+            figure.communication_cost,
+            figure.risk_cost,
+            figure.customer_cost,
+        ):
             assert isinstance(cost, int)
             assert cost >= 0
 
@@ -259,7 +281,11 @@ def test_mvp_unavailable_actions_that_the_cause_permits_are_present_and_marked(
     dashboard is supposed to be able to say both of those things at once.
     """
     candidates = build_candidate_set(
-        cause, baseline=baseline, remaining=timedelta(days=1), window=WINDOW
+        cause,
+        baseline=baseline,
+        remaining=timedelta(days=1),
+        window=WINDOW,
+        config=CONFIG,
     )
     eligible = candidate_set_for(cause)
     for action in eligible & UNAVAILABLE_IN_MVP:
@@ -309,6 +335,7 @@ def test_memory_error_marks_every_estimated_figure_uncalibrated(
         baseline=baseline,
         remaining=remaining,
         window=WINDOW,
+        config=CONFIG,
         memory_available=False,
     )
     for figure in candidates.figures:

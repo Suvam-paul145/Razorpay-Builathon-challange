@@ -314,18 +314,32 @@ def test_the_case_detail_returns_every_candidate_with_all_of_its_figures(
         for field in (
             "incremental_probability",
             "expected_incremental_revenue",
-            "action_cost",
+            "financial_cost",
+            "communication_cost",
             "risk_cost",
             "customer_cost",
-            "total_cost",
+            "total_action_cost",
             "net_recovery_value",
         ):
             assert field in candidate, candidate["action"]
-        assert candidate["total_cost"]["minor"] == (
-            candidate["action_cost"]["minor"]
+        # R31.C7. Four separate figures *and* the total, never the total in place of them —
+        # so the presence check above is the assertion, and this is the arithmetic that
+        # proves the server summed them rather than the client having to.
+        assert candidate["total_action_cost"]["minor"] == (
+            candidate["financial_cost"]["minor"]
+            + candidate["communication_cost"]["minor"]
             + candidate["risk_cost"]["minor"]
             + candidate["customer_cost"]["minor"]
         ), candidate["action"]
+        assert "action_cost" not in candidate, (
+            "the blended action_cost is gone from the wire (R31.C1); a client still reading "
+            "it would silently drop the communication term"
+        )
+        # R31.C10's marking travels with the two figures it qualifies. A live estimate is
+        # never marked — only a row migration 0008 rewrote is.
+        assert candidate["cost_split_not_measured"] is False, candidate["action"]
+        assert candidate["financial_cost_method"] is not None, candidate["action"]
+        assert candidate["communication_cost_method"] is not None, candidate["action"]
         if candidate["excluded"]:
             assert candidate["exclusion_reason"], (
                 f"{candidate['action']} is excluded with no stated reason"

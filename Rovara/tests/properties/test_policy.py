@@ -161,8 +161,22 @@ def test_primary_reason_is_the_lowest_ordered_failure(candidate: PolicyInput) ->
     Which is what guarantees an expensive or case-specific check can never be the recorded
     reason a paid or opted-out customer was contacted: those checks are ordered first, so
     if they fail they are the reason.
+
+    **With one substitution the requirements mandate, and it is not a loophole.** R8.C8 and
+    R24.C8 require a ``COOLDOWN_ACTIVE`` failure whose earliest permitted execution instant
+    falls at or after the Recovery_Window end to be reported as ``WINDOW_EXPIRED`` and
+    ``BLOCKED`` rather than as ``DEFERRED``, because deferring would schedule an action that
+    can never legally run and the case would expire with "waiting for cooldown" as its last
+    recorded word. So the lowest-ordered failure still *decides*; what it is *called*
+    changes in exactly one predictable case.
+
+    The expected reason is derived from the candidate and the rule set here rather than read
+    off the evaluation, which is what keeps the property sharp: it still fails if the engine
+    reports a higher-ordered check, and it fails if the engine substitutes ``WINDOW_EXPIRED``
+    when the cooldown *would* have elapsed inside the window — the two ways a verdict can be
+    mis-ordered. Weakening this to "the reason is one of the failures" would catch neither.
     """
-    from revora.domain.enums import CheckOutcome, PolicyVerdict
+    from revora.domain.enums import CheckOutcome, PolicyCheck, PolicyVerdict
 
     evaluation = evaluate(candidate, _RULES)
     if any(c.outcome is CheckOutcome.UNAVAILABLE for c in evaluation.checks):
@@ -171,7 +185,23 @@ def test_primary_reason_is_the_lowest_ordered_failure(candidate: PolicyInput) ->
     if not failures:
         assert evaluation.verdict is PolicyVerdict.APPROVED
         return
-    assert evaluation.primary_reason == failures[0].check.value
+
+    deciding = failures[0].check
+    expected = deciding.value
+    if deciding is PolicyCheck.COOLDOWN_ACTIVE and candidate.last_outbound_at is not None:
+        earliest = candidate.last_outbound_at + _RULES.cooldown_interval
+        if earliest >= candidate.window_end_at:
+            expected = PolicyCheck.WINDOW_EXPIRED.value
+
+    assert evaluation.primary_reason == expected, (
+        f"lowest-ordered failure {deciding.value} produced {evaluation.primary_reason}"
+    )
+    if expected != deciding.value:
+        # The substitution is a refusal, not a deferral, and it carries no schedule. A
+        # WINDOW_EXPIRED that still parked an earliest-permitted instant would be the same
+        # silent expiry under a different name.
+        assert evaluation.verdict is PolicyVerdict.BLOCKED
+        assert evaluation.earliest_permitted_at is None
 
 
 @given(candidate=policy_input())

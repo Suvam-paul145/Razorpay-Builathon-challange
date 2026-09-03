@@ -69,7 +69,7 @@ def test_p14_arithmetic_chain_is_exact_integer_minor_units(
     The three-step chain is checked against independently recomputed values rather
     than against itself: the incremental probability is a plain Decimal subtraction,
     the expected revenue is one call to the single sanctioned rounding function, and
-    the net value is integer subtraction of three costs.
+    the net value is integer subtraction of four costs (R31.C3).
     """
     evaluated = evaluate_candidate(candidate, baseline=Probability(baseline), amount=amount)
 
@@ -82,7 +82,8 @@ def test_p14_arithmetic_chain_is_exact_integer_minor_units(
 
     assert evaluated.net_recovery_value == (
         int(expected_revenue)
-        - int(candidate.action_cost)
+        - int(candidate.financial_cost)
+        - int(candidate.communication_cost)
         - int(candidate.risk_cost)
         - int(candidate.customer_cost)
     )
@@ -368,7 +369,7 @@ def test_p19_do_nothing_is_exactly_zero_on_every_figure(
     amount: Minor, baseline: Decimal
 ) -> None:
     """Feature: Value_Optimizer. Property 19 — ``DO_NOTHING`` has incremental
-    probability, expected incremental revenue, all three costs and net value all
+    probability, expected incremental revenue, all four costs and net value all
     exactly zero, for any case.
 
     Exactly zero, not approximately. If ``DO_NOTHING`` were estimated like any other
@@ -380,7 +381,8 @@ def test_p19_do_nothing_is_exactly_zero_on_every_figure(
     do_nothing = CandidateInput(
         action=CandidateAction.DO_NOTHING,
         intervention_probability=base,
-        action_cost=Minor(0),
+        financial_cost=Minor(0),
+        communication_cost=Minor(0),
         risk_cost=Minor(0),
         customer_cost=Minor(0),
     )

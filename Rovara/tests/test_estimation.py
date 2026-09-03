@@ -36,6 +36,7 @@ only prove the fake agrees with itself.
 from __future__ import annotations
 
 import ast
+import dataclasses
 from collections.abc import Mapping
 from datetime import timedelta
 from decimal import Decimal
@@ -95,19 +96,23 @@ from revora.estimation.baseline import (
 from revora.estimation.candidates import (
     COST_PRIORS,
     UPLIFT_PRIORS,
-    CostPrior,
     RawFigures,
     RejectedFigure,
     build_candidate_set,
+    cost_prior_for,
     validate_figures,
 )
 from revora.persistence.repositories.estimates import SegmentCounts
+from revora.platform.config import default_configuration
 
 pytestmark = pytest.mark.pure
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIN_SAMPLE = 30
 WINDOW = timedelta(days=7)
+CONFIG = default_configuration()
+"""The catalogue defaults. ``build_candidate_set`` resolves the two R31.C11 cost rows off
+one of these, so a test that prices an action has to supply it."""
 
 FORBIDDEN_PACKAGES = ("revora.providers", "revora.reasoning")
 """The two packages estimation must not be able to reach. ``providers`` is the payment
@@ -577,11 +582,13 @@ def raw(**overrides: object) -> RawFigures:
     base: dict[str, object] = {
         "action": CandidateAction.PAYMENT_LINK,
         "intervention_probability": Decimal("0.4000"),
-        "action_cost": 0,
+        "financial_cost": 300,
+        "communication_cost": 25,
         "risk_cost": 0,
         "customer_cost": 1_000,
         "probability_method": EstimationMethod.UNCALIBRATED,
-        "action_cost_method": EstimationMethod.PRIOR_FALLBACK,
+        "financial_cost_method": EstimationMethod.PRIOR_FALLBACK,
+        "communication_cost_method": EstimationMethod.PRIOR_FALLBACK,
         "risk_cost_method": EstimationMethod.UNCALIBRATED,
         "customer_cost_method": EstimationMethod.UNCALIBRATED,
     }
@@ -594,7 +601,8 @@ def raw(**overrides: object) -> RawFigures:
     [
         ({"intervention_probability": Decimal("1.5")}, "intervention_probability"),
         ({"intervention_probability": Decimal("-0.1")}, "intervention_probability"),
-        ({"action_cost": -1}, "action_cost"),
+        ({"financial_cost": -1}, "financial_cost"),
+        ({"communication_cost": -1}, "communication_cost"),
         ({"risk_cost": -500}, "risk_cost"),
         ({"customer_cost": True}, "customer_cost"),
     ],
@@ -617,7 +625,8 @@ def test_out_of_range_figures_are_rejected_and_named(
     "missing",
     [
         "probability_method",
-        "action_cost_method",
+        "financial_cost_method",
+        "communication_cost_method",
         "risk_cost_method",
         "customer_cost_method",
     ],
@@ -632,28 +641,29 @@ def test_a_figure_with_no_recorded_method_is_rejected(missing: str) -> None:
     assert isinstance(rejection, RejectedFigure)
 
 
-def test_a_rejected_candidate_is_retained_as_a_neutral_unavailable_member(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_rejected_candidate_is_retained_as_a_neutral_unavailable_member() -> None:
     """A broken figure excludes the action from selection but not from the record.
 
-    Forced by corrupting a configured cost prior, which is the realistic source of an
-    invalid figure — the priors are placeholder constants that will become editable
-    configuration. The substitute claims nothing: probability equal to the baseline and
-    zero costs, so it cannot be selected on its merits either, and the rejection is
-    reported so an ``INVALID_ESTIMATE`` record names the figure.
+    Forced by corrupting the configured payment link fee, which under R31.C11 is now a
+    versioned configuration row and so is the realistic source of an invalid figure: a
+    merchant can change it, and nothing between the row and the estimator would otherwise
+    notice a negative one. The substitute claims nothing — probability equal to the
+    baseline and zero costs — so it cannot be selected on its merits either, and the
+    rejection is reported so an ``INVALID_ESTIMATE`` record names the figure.
+
+    Previously this corrupted ``COST_PRIORS`` in place. That idiom stopped being able to
+    express the failure once the two R31.C11 terms came from the row rather than the
+    table: a patched entry would have had its financial term overwritten by the
+    configured one and the candidate would have priced correctly.
     """
-    monkeypatch.setitem(
-        COST_PRIORS,
-        CandidateAction.PAYMENT_LINK,
-        CostPrior(Minor(-1), Minor(0), Minor(0)),
-    )
+    config = dataclasses.replace(CONFIG, PAYMENT_LINK_FINANCIAL_COST=Minor(-1))
     baseline = Probability(Decimal("0.400"))
     candidates = build_candidate_set(
         RiskCause.INSUFFICIENT_FUNDS,
         baseline=baseline,
         remaining=timedelta(days=2),
         window=WINDOW,
+        config=config,
     )
     figure = candidates.figure_for(CandidateAction.PAYMENT_LINK)
     assert figure is not None
@@ -661,10 +671,15 @@ def test_a_rejected_candidate_is_retained_as_a_neutral_unavailable_member(
     assert figure.unavailable_reason == ExclusionReason.INVALID_ESTIMATE_INPUT.value
     assert figure.intervention_probability == baseline
     assert figure.total_cost == 0
+    # Both actions that read ``PAYMENT_LINK_FINANCIAL_COST`` are rejected, and that is the
+    # point rather than collateral damage: one bad row invalidates every estimate priced
+    # from it, and an implementation that rejected only the first would leave the second
+    # priced from a negative fee.
     assert [rejection.action for rejection in candidates.rejected] == [
-        CandidateAction.PAYMENT_LINK
+        CandidateAction.PAYMENT_LINK,
+        CandidateAction.CUSTOMER_MESSAGE,
     ]
-    assert candidates.rejected[0].figure == "action_cost"
+    assert {rejection.figure for rejection in candidates.rejected} == {"financial_cost"}
 
 
 def test_every_uplift_prior_belongs_to_an_executable_action() -> None:
@@ -682,10 +697,80 @@ def test_every_uplift_prior_belongs_to_an_executable_action() -> None:
 def test_every_action_has_a_cost_prior() -> None:
     """No action in the vocabulary is priced by omission.
 
-    A missing entry would silently fall back to zero across all three costs, which for a
+    A missing entry would silently fall back to zero across all four costs, which for a
     customer-visible action would make it look free.
     """
     assert set(COST_PRIORS) == set(CandidateAction)
+
+
+def test_the_two_configured_cost_rows_default_to_the_prior_table() -> None:
+    """R31.C11, first half: the row and the table cannot disagree at the default.
+
+    ``COST_PRIORS`` binds the two figures from the catalogue's declared defaults and
+    migration ``0009`` seeds the rows from the same declaration, so an unchanged
+    deployment prices exactly as the table says. If this ever failed it would mean the
+    number had been written down twice.
+    """
+    for action in (CandidateAction.PAYMENT_LINK, CandidateAction.CUSTOMER_MESSAGE):
+        assert cost_prior_for(action, CONFIG) == COST_PRIORS[action]
+
+
+@pytest.mark.parametrize(
+    "action", [CandidateAction.PAYMENT_LINK, CandidateAction.CUSTOMER_MESSAGE]
+)
+def test_a_changed_cost_row_changes_what_the_estimator_prices(
+    action: CandidateAction,
+) -> None:
+    """R31.C11, second half: changing the row has a consequence.
+
+    This is the half that seeding the rows did not close. An estimator reading the module
+    constant would price identically whatever the row said, which would make "changeable
+    only through a recorded configuration change naming an approving Merchant_User" a
+    statement about a value nothing consumes.
+
+    Asserted through :func:`build_candidate_set` rather than through the accessor alone,
+    because the accessor being right is not the claim — the claim is that the figure the
+    optimizer eventually subtracts came from the row.
+    """
+    config = dataclasses.replace(
+        CONFIG,
+        PAYMENT_LINK_FINANCIAL_COST=Minor(777),
+        MESSAGE_COMMUNICATION_COST=Minor(13),
+    )
+    candidates = build_candidate_set(
+        RiskCause.INSUFFICIENT_FUNDS,
+        baseline=Probability(Decimal("0.400")),
+        remaining=timedelta(days=2),
+        window=WINDOW,
+        config=config,
+    )
+    figure = candidates.figure_for(action)
+    assert figure is not None
+    assert int(figure.financial_cost) == 777
+    assert int(figure.communication_cost) == 13
+    # The two terms the requirement does not name are untouched by the change.
+    assert figure.risk_cost == COST_PRIORS[action].risk_cost
+    assert figure.customer_cost == COST_PRIORS[action].customer_cost
+
+
+def test_the_other_seven_actions_are_priced_from_the_table_alone() -> None:
+    """R31.C11 names two figures, and only those two are configuration.
+
+    ``PROMISE_TO_PAY_FOLLOW_UP``'s financial term is a verified zero — the resend creates
+    no second link — so exposing it as a row would invite somebody to tune away a fact
+    about the provider's API. The rest have no requirement asking for them to change.
+    """
+    config = dataclasses.replace(
+        CONFIG,
+        PAYMENT_LINK_FINANCIAL_COST=Minor(777),
+        MESSAGE_COMMUNICATION_COST=Minor(13),
+    )
+    unconfigured = set(CandidateAction) - {
+        CandidateAction.PAYMENT_LINK,
+        CandidateAction.CUSTOMER_MESSAGE,
+    }
+    for action in unconfigured:
+        assert cost_prior_for(action, config) == COST_PRIORS[action], action
 
 
 # ---------------------------------------------------------------------------

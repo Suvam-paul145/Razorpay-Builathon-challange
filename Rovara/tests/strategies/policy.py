@@ -35,6 +35,7 @@ def policy_input(
     *,
     action: CandidateAction | None = None,
     state: CaseState | None = None,
+    contact_suppressed: bool | None = None,
 ) -> PolicyInput:
     """A complete ``PolicyInput`` exploring the values that make checks fail.
 
@@ -42,6 +43,13 @@ def policy_input(
     consent flag and a ``None`` diagnosis are both generated, because R8.C17's
     "no assume-fine branch" is only tested if the generator actually produces unreadable
     inputs.
+
+    ``contact_suppressed`` is drawn by default and pinnable, and the pin is what Property 36
+    needs. That property replaces every Customer_Signal field with arbitrary content and asserts
+    the twelve check outcomes do not move — which is only a statement about signals if the
+    suppression state is *held fixed*, because a hard stop is a signal whose whole purpose is to
+    move check 5. Drawn here so the ordinary policy properties see both values; pinned there so
+    the one property that must not see it move can say so.
     """
     evaluated_at = _EPOCH
     chosen_action = action if action is not None else draw(st.sampled_from(ACTION_PRECEDENCE))
@@ -85,6 +93,9 @@ def policy_input(
             st.sampled_from((None, "failed", "captured", "authorized", "refunded"))
         ),
         customer_opted_out=draw(st.one_of(st.none(), st.booleans())),
+        contact_suppressed=(
+            draw(st.booleans()) if contact_suppressed is None else contact_suppressed
+        ),
         consent_expires_at=draw(
             st.sampled_from(
                 (

@@ -69,6 +69,8 @@ def installed_secrets() -> Iterator[None]:
         {
             "REVORA_PAYLOAD_ENCRYPTION_KEYS": "1:" + base64.b64encode(b"E" * 32).decode(),
             "REVORA_CUSTOMER_KEY_SECRET": base64.b64encode(b"F" * 32).decode(),
+            "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS": "1:"
+            + base64.b64encode(b"F" * 32).decode(),
             "REVORA_SESSION_TOKEN_SECRET": base64.b64encode(b"G" * 32).decode(),
         }
     )

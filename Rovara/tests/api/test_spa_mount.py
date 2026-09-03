@@ -220,3 +220,118 @@ def test_the_default_web_root_points_at_the_repository_build_directory() -> None
     assert (root.parent.parent / "pyproject.toml").is_file(), (
         f"default_web_root resolved to {root}, which is not beside the project's pyproject.toml"
     )
+
+
+# ---------------------------------------------------------------------------
+# The second entry: the customer response page
+# ---------------------------------------------------------------------------
+#
+# ``web/`` builds two bundles. ``dist/`` is the dashboard, mounted above under ``APP_PREFIX``;
+# ``dist-customer/`` is the customer response page, served by the frontend host at ``/pay/*`` and
+# **not mounted here at all** — ``mount_spa`` is unchanged and keeps ``/app``. A second mount at
+# ``/pay`` for a single-host deployment would follow the same pattern and is not built.
+#
+# The two entries exist because a ``/pay/:token`` route inside the dashboard SPA would ship an
+# unauthenticated stranger the entire administrative surface as readable source. Nothing in it is a
+# secret, but it is a map.
+#
+# What is asserted here is the one thing the frontend's own tests cannot assert as cheaply: that the
+# customer entry has not acquired a router. The ``basename`` test above exists because a mismatch
+# between the router's basename and the server's prefix renders a blank page with a clean console
+# and no error; the customer entry answers that by having no router, and this keeps it answered.
+
+_CUSTOMER_DIR = "customer"
+
+_ROUTER_PACKAGES = re.compile(r"react-router|@tanstack/react-query")
+
+_IMPORT_SPECIFIER = re.compile(r"""^\s*import\s[^\n]*?['"]([^'"]+)['"]""", re.MULTILINE)
+
+
+def _customer_entry_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "web" / "src" / _CUSTOMER_DIR
+
+
+def _customer_modules() -> list[Path]:
+    """The customer entry's own modules, excluding its tests.
+
+    Tests are excluded because they *name* the forbidden packages in order to assert their
+    absence, and a check that could not tell a citation from an import would be a check nobody
+    can write an assertion about.
+    """
+    root = _customer_entry_root()
+    return sorted(
+        path
+        for path in root.glob("*.js*")
+        if path.suffix in {".js", ".jsx"} and ".test." not in path.name
+    )
+
+
+def test_the_customer_entry_imports_no_router() -> None:
+    """The customer page has no router, so it has no ``basename`` to disagree with anything.
+
+    Read over **import specifiers** rather than over the source text, and the distinction is
+    load-bearing: those modules document at length why they carry neither ``react-router-dom``
+    nor ``@tanstack/react-query``, so a substring search would match the prose explaining the
+    absence and the check would fail on the very comment that justifies it.
+
+    Reintroducing a router here is not forbidden — it is required to come with an answer to the
+    question this test stands in for, which is what the basename test above pays for the hard way.
+    """
+    modules = _customer_modules()
+    if not modules:  # pragma: no cover - the frontend is present in this repo
+        pytest.skip("web/src/customer is not present")
+
+    # Anti-vacuity. Three modules — the entry, the page and the API client — so a glob that
+    # quietly matched nothing is a failure rather than a pass.
+    assert len(modules) >= 3, f"expected the customer entry's three modules, found {modules}"
+
+    specifiers: list[str] = []
+    for module in modules:
+        for specifier in _IMPORT_SPECIFIER.findall(module.read_text(encoding="utf-8")):
+            specifiers.append(specifier)
+            assert not _ROUTER_PACKAGES.search(specifier), (
+                f"{module.name} imports {specifier!r}; the customer entry uses no router and no "
+                "query client, which is what removes the basename failure mode rather than "
+                "adding a second instance of it"
+            )
+
+    # The other half of the anti-vacuity check: the pattern found real specifiers. Asserted across
+    # the entry rather than per file, because ``api.js`` imports nothing at all.
+    assert "react" in specifiers, f"no import of react found in {[m.name for m in modules]}"
+    assert "react-dom/client" in specifiers
+
+
+def test_the_customer_entry_reads_its_token_from_the_path() -> None:
+    """The positive half. No router *and* the token comes out of ``window.location.pathname``.
+
+    Without this, the test above is satisfied by a file that imports nothing and does nothing. The
+    token is read from the path rather than a query string because a query string is where URLs
+    leak — into referrers, access logs and any third-party script on the page — and this URL is a
+    bearer credential, which is also why the API sends ``referrer-policy: no-referrer`` and
+    ``base-uri 'none'`` on every customer response.
+    """
+    entry = _customer_entry_root() / "main.jsx"
+    if not entry.is_file():  # pragma: no cover - the frontend is present in this repo
+        pytest.skip("web/src/customer/main.jsx not present")
+    source = entry.read_text(encoding="utf-8")
+    assert "window.location.pathname" in source, (
+        "the customer entry does not read window.location.pathname; with no router, that is the "
+        "only place its token can come from"
+    )
+
+
+def test_the_customer_page_is_not_mounted_on_the_api(client: TestClient) -> None:
+    """``/pay/*`` belongs to the frontend host, and the API says so by 404ing.
+
+    Pinned rather than left implicit. The assumed deployment serves the customer page from the
+    frontend host, so an API that answered here would mean a second, undeclared static mount had
+    appeared — and the customer document carries its own stricter CSP, which the dashboard's mount
+    does not send.
+    """
+    for path in ("/pay", "/pay/", "/pay/acme-tools/rvc_token"):
+        response = client.get(path)
+        assert response.status_code == 404, path
+        assert _INDEX_MARKER not in response.text, (
+            f"{path} was answered with the dashboard shell; the customer page is a separate "
+            "bundle with a separate document and a separate policy"
+        )

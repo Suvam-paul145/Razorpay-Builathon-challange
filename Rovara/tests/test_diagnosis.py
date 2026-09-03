@@ -37,16 +37,30 @@ from revora.audit.events import (
     DIAGNOSIS_UNMAPPED_REASON,
     MERCHANT_INTEGRATION_FAULT,
 )
+from revora.customer.signals import DELAY_REASON_CAUSE, cause_for_delay_reason
 from revora.diagnosis.service import (
     DETERMINISTIC_CONFIDENCE,
+    SUBSTITUTION_BELOW_FLOOR,
     UNKNOWN_CONFIDENCE,
     DiagnosisOutcome,
     RecordedDiagnosis,
     _requires_policy_evaluation,
     _resolve_from_match,
+    resolve_stated_reason_diagnosis,
 )
-from revora.domain.enums import DiagnosisMethod, RiskCause
-from revora.domain.failure_taxonomy import MatchOutcome, classify_failure
+from revora.domain.enums import (
+    DelayReason,
+    DiagnosisEvidenceSource,
+    DiagnosisMethod,
+    RiskCause,
+)
+from revora.domain.failure_taxonomy import (
+    EVIDENCE_SOURCE,
+    MatchOutcome,
+    classify_failure,
+    match_evidence,
+)
+from revora.platform.config import default_configuration
 
 pytestmark = pytest.mark.pure
 
@@ -300,3 +314,229 @@ def test_reasoning_invoked_can_be_stated_by_the_ai_path() -> None:
     assert (
         _outcome(DiagnosisMethod.AI_ASSISTED, reasoning_layer_invoked=True)
     ).reasoning_layer_invoked is True
+
+
+# ---------------------------------------------------------------------------
+# The Delay_Reason mapping table, and the second deterministic source
+# ---------------------------------------------------------------------------
+
+
+STATED_CONFIDENCE = Decimal("0.900")
+"""``CUSTOMER_STATED_CAUSE_CONFIDENCE``'s catalogue default, written out rather than read
+from the configuration.
+
+Deliberate duplication, and the one place in this file where it is: a test that asks the
+catalogue what the number is would agree with the catalogue however the catalogue changed,
+including a change to 0.10 that R20.C7 forbids. The assertion below that ties this to the
+catalogue is the one that catches a drift; this constant is what makes it an assertion
+rather than a tautology."""
+
+
+def _provider(cause: RiskCause = RiskCause.UNKNOWN) -> RecordedDiagnosis:
+    """What the failure taxonomy would have produced, as the refinement's starting point."""
+    method = (
+        DiagnosisMethod.FALLBACK_UNKNOWN
+        if cause is RiskCause.UNKNOWN
+        else DiagnosisMethod.DETERMINISTIC
+    )
+    confidence = UNKNOWN_CONFIDENCE if cause is RiskCause.UNKNOWN else DETERMINISTIC_CONFIDENCE
+    return RecordedDiagnosis(
+        cause=cause,
+        original_cause=cause,
+        confidence=confidence,
+        method=method,
+        substituted_to_unknown=False,
+        substitution_reason=None,
+    )
+
+
+def test_the_mapping_table_is_exactly_what_r20_c5_declares() -> None:
+    """R20.C5, row by row, as a literal.
+
+    Written out rather than derived, because this table *is* the requirement. A test that
+    computed the expected mapping from the same source the code reads would pass whatever
+    the table said, and every row of it is an ``[ASSUMPTION]`` about what a stranger meant
+    by a phrase — precisely the kind of value that gets adjusted without the requirement
+    being reopened.
+    """
+    assert DELAY_REASON_CAUSE == {
+        DelayReason.SALARY_OR_CASHFLOW_TIMING: RiskCause.INSUFFICIENT_FUNDS,
+        DelayReason.BANK_OR_CARD_PROBLEM: RiskCause.BANK_OR_NETWORK_FAILURE,
+        DelayReason.AMOUNT_TOO_HIGH_RIGHT_NOW: RiskCause.INSUFFICIENT_FUNDS,
+        DelayReason.OTHER: None,
+        DelayReason.DISPUTES_THE_CHARGE: None,
+        DelayReason.NO_LONGER_WANTS_THE_ORDER: None,
+    }
+
+
+def test_the_mapping_table_is_total_over_the_enumeration() -> None:
+    """Every ``DelayReason`` has a row, so ``None`` never means "nobody added one".
+
+    The table's own import-time check enforces this; asserting it here is what makes the
+    check's absence a failure too. A seventh member falling through as ``None`` would read
+    as "this reason names no cause" — a legitimate answer for three of the six members
+    today — so the omission would be invisible rather than loud.
+    """
+    assert set(DELAY_REASON_CAUSE) == set(DelayReason)
+    for reason in DelayReason:
+        # No KeyError, and the accessor and the table agree.
+        assert cause_for_delay_reason(reason) == DELAY_REASON_CAUSE[reason]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (DelayReason.SALARY_OR_CASHFLOW_TIMING, RiskCause.INSUFFICIENT_FUNDS),
+        (DelayReason.BANK_OR_CARD_PROBLEM, RiskCause.BANK_OR_NETWORK_FAILURE),
+        (DelayReason.AMOUNT_TOO_HIGH_RIGHT_NOW, RiskCause.INSUFFICIENT_FUNDS),
+    ],
+)
+def test_a_mapped_reason_records_a_deterministic_cause_at_the_stated_confidence(
+    reason: DelayReason, expected: RiskCause
+) -> None:
+    """R20.C4 for each of the three reasons that name a cause.
+
+    ``DETERMINISTIC`` at a *configured* confidence rather than at 1.0 is the whole shape of
+    the requirement: the method says a closed table produced it with no model involved, and
+    the confidence says we believe a customer less than we believe the provider. R3.C10
+    reserves exactly 1.0 for the provider, so the inequality is asserted rather than left
+    implied.
+    """
+    recorded = resolve_stated_reason_diagnosis(
+        reason=reason,
+        provider=_provider(),
+        stated_confidence=STATED_CONFIDENCE,
+        confidence_floor=FLOOR,
+    )
+    assert recorded.cause is expected
+    assert recorded.method is DiagnosisMethod.DETERMINISTIC
+    assert recorded.confidence == STATED_CONFIDENCE
+    assert recorded.confidence < DETERMINISTIC_CONFIDENCE
+    assert recorded.substituted_to_unknown is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        DelayReason.OTHER,
+        DelayReason.DISPUTES_THE_CHARGE,
+        DelayReason.NO_LONGER_WANTS_THE_ORDER,
+    ],
+)
+@pytest.mark.parametrize(
+    "provider_cause",
+    [RiskCause.UNKNOWN, RiskCause.INSUFFICIENT_FUNDS, RiskCause.FRAUD_OR_RISK_SIGNAL],
+)
+def test_a_reason_naming_no_cause_leaves_the_recorded_diagnosis_untouched(
+    reason: DelayReason, provider_cause: RiskCause
+) -> None:
+    """R20.C6, and the two Hard_Stop_Reasons on the same terms.
+
+    Untouched means *the same object*, not an equal one. The caller distinguishes "the
+    customer's words refined the cause" from "they did not" by identity, so an equal copy
+    would make the refinement flag depend on a comparison that a later field addition could
+    silently break.
+
+    Run against three provider causes rather than one because "unchanged" is only
+    interesting when there was something to change. ``UNKNOWN`` alone would pass even if the
+    function overwrote the cause with ``UNKNOWN``.
+    """
+    provider = _provider(provider_cause)
+    assert (
+        resolve_stated_reason_diagnosis(
+            reason=reason,
+            provider=provider,
+            stated_confidence=STATED_CONFIDENCE,
+            confidence_floor=FLOOR,
+        )
+        is provider
+    )
+
+
+def test_a_stated_cause_below_the_floor_is_substituted_and_says_why() -> None:
+    """The stated path goes through R3.C8's gate like every other path.
+
+    R20.C7 forbids configuring ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` below
+    ``DIAGNOSIS_CONFIDENCE_FLOOR``, and this is what the system does if that ordering is
+    ever violated anyway: substitute to ``UNKNOWN`` and record ``CONFIDENCE_BELOW_FLOOR``.
+    The alternative — exempting a customer-derived cause from the gate — would let the least
+    trustworthy source in the system be the one input that outranks the rule.
+    """
+    recorded = resolve_stated_reason_diagnosis(
+        reason=DelayReason.SALARY_OR_CASHFLOW_TIMING,
+        provider=_provider(),
+        stated_confidence=Decimal("0.100"),
+        confidence_floor=FLOOR,
+    )
+    assert recorded.cause is RiskCause.UNKNOWN
+    assert recorded.original_cause is RiskCause.INSUFFICIENT_FUNDS
+    assert recorded.substituted_to_unknown is True
+    assert recorded.substitution_reason == SUBSTITUTION_BELOW_FLOOR
+
+
+def test_the_configured_stated_confidence_sits_between_the_floor_and_the_reserved_value(
+) -> None:
+    """R20.C7 and R3.C10 as a bound on the catalogue's default.
+
+    Both ends matter and for different reasons. Below the floor the capture is inert — every
+    stated cause would be substituted to ``UNKNOWN`` and the second cycle would decide on
+    exactly the evidence the first had. At 1.0 a stored confidence would stop meaning "the
+    provider told us", which is the one thing that value is reserved to mean.
+    """
+    configured = default_configuration().CUSTOMER_STATED_CAUSE_CONFIDENCE
+    assert configured == STATED_CONFIDENCE
+    assert configured >= default_configuration().DIAGNOSIS_CONFIDENCE_FLOOR
+    assert configured < DETERMINISTIC_CONFIDENCE
+
+
+def test_a_refinement_cannot_switch_off_the_fraud_gate() -> None:
+    """R3.C6 survives R20.C4.
+
+    The failure this guards against is specific and it is the worst one available on this
+    path: a customer whose card was declined for risk says "my salary is late", the cause is
+    refined to ``INSUFFICIENT_FUNDS``, and the fraud routing the provider's decline demanded
+    is gone — an untrusted input having switched off a gate no trusted input can. So the
+    superseded cause is read whether or not it is the one that got recorded.
+    """
+    provider = _provider(RiskCause.FRAUD_OR_RISK_SIGNAL)
+    refined = resolve_stated_reason_diagnosis(
+        reason=DelayReason.SALARY_OR_CASHFLOW_TIMING,
+        provider=provider,
+        stated_confidence=STATED_CONFIDENCE,
+        confidence_floor=FLOOR,
+    )
+    assert refined.cause is RiskCause.INSUFFICIENT_FUNDS
+    assert _requires_policy_evaluation(refined) is False, (
+        "the refined diagnosis alone carries no risk signal, which is exactly why the "
+        "superseded cause has to be passed in"
+    )
+    assert _requires_policy_evaluation(refined, superseded=provider.cause) is True
+
+
+def test_the_evidence_source_enumeration_distinguishes_the_two_sources() -> None:
+    """The audit-trail half of R20.C4.
+
+    Two deterministic tables can now each produce a ``DETERMINISTIC`` cause, so the method
+    no longer answers "what was read". A reviewer weighing a recommendation has to be able
+    to tell a provider error code from a stranger's account of their own finances without
+    joining back to the signal table, and a two-member enumeration is how that is stated.
+    """
+    assert set(DiagnosisEvidenceSource) == {
+        DiagnosisEvidenceSource.PROVIDER_ERROR_CODE,
+        DiagnosisEvidenceSource.CUSTOMER_STATED_REASON,
+    }
+    evidence = match_evidence(
+        classify_failure(
+            error_reason="insufficient_funds",
+            error_source="bank",
+            error_step="authorization",
+            error_code="BAD_REQUEST_ERROR",
+            risk_reason_codes=frozenset(),
+        ),
+        error_reason="insufficient_funds",
+        error_source="bank",
+        error_step="authorization",
+        error_code="BAD_REQUEST_ERROR",
+        payment_method="card",
+    )
+    assert evidence[EVIDENCE_SOURCE] == DiagnosisEvidenceSource.PROVIDER_ERROR_CODE.value

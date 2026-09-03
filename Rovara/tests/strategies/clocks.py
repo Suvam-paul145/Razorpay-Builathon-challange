@@ -102,6 +102,11 @@ def boundary_deltas(config: Configuration) -> tuple[tuple[str, timedelta], ...]:
     * ``CUSTOMER_DATA_RETENTION`` is the boundary past which contact data must be redacted —
       while the ``customer_key`` survives, because destroying it would revoke every recorded
       opt-out.
+    * ``WAIT_REVIEW_INTERVAL`` is when a case that chose restraint becomes due for a review
+      (R30.C5). The Review_Sweeper's predicate is ``next_review_at <= now``, so *exactly* at the
+      interval the case must be found and one second before it must not — and at twelve hours it is
+      the second-shortest bound here, which means a plan that never targeted it would cross it
+      constantly and land on it never.
 
     ``POLICY_DECISION_VALIDITY`` is here too, and it is the shortest of them at fifteen minutes.
     It is the bound most likely to be crossed by accident in a long plan, which is exactly why it
@@ -114,6 +119,7 @@ def boundary_deltas(config: Configuration) -> tuple[tuple[str, timedelta], ...]:
     """
     bounds: tuple[tuple[str, timedelta], ...] = (
         ("policy-validity", config.POLICY_DECISION_VALIDITY),
+        ("wait-review", config.WAIT_REVIEW_INTERVAL),
         ("cooldown", config.COOLDOWN_INTERVAL),
         ("outcome-wait", config.OUTCOME_WAIT_TIMEOUT),
         ("window", config.RECOVERY_WINDOW_DURATION),

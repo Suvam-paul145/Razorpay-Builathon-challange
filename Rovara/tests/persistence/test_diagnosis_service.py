@@ -26,7 +26,7 @@ database and the per-test merchant.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -39,13 +39,27 @@ from revora.audit.events import (
     DIAGNOSIS_UNMAPPED_REASON,
     MERCHANT_INTEGRATION_FAULT,
 )
-from revora.diagnosis.service import run_diagnosis
-from revora.domain.enums import CaseState, DiagnosisMethod, RiskCause
+from revora.diagnosis.service import (
+    EVIDENCE_CAUSE_REFINED,
+    EVIDENCE_CUSTOMER_SIGNAL_ID,
+    EVIDENCE_STATED_REASON,
+    EVIDENCE_SUPERSEDED_CAUSE,
+    run_diagnosis,
+)
+from revora.domain.enums import (
+    CaseState,
+    CustomerSignalKind,
+    DelayReason,
+    DiagnosisEvidenceSource,
+    DiagnosisMethod,
+    RiskCause,
+)
 from revora.domain.failure_taxonomy import (
     EVIDENCE_MATCH_KEY,
     EVIDENCE_MATCHED,
     EVIDENCE_OUTCOME,
     EVIDENCE_RULE_ID,
+    EVIDENCE_SOURCE,
     MatchKey,
     MatchOutcome,
 )
@@ -512,3 +526,269 @@ def test_the_taxonomy_outcome_is_persisted_for_every_diagnosis(
         evidence = _diagnosis_rows(owner_engine, case_id)[0]["evidence"]
         assert isinstance(evidence, dict)
         assert evidence[EVIDENCE_OUTCOME] == outcome.value
+
+
+# ---------------------------------------------------------------------------
+# R20.C4 — the second deterministic source, against real rows
+# ---------------------------------------------------------------------------
+
+
+def _seed_delay_reason(
+    engine: Engine,
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    reason: DelayReason,
+    *,
+    submitted_at: datetime | None = None,
+) -> uuid.UUID:
+    """One persisted ``DELAY_REASON`` signal, written directly.
+
+    Raw SQL rather than through ``record_signal`` for the reason ``_seed_case`` gives: going
+    through the write path would make every assertion below depend on token verification, the
+    submission caps and the review enqueue, each of which has its own tests. What the
+    diagnosis engine reads is a row, and this is that row.
+    """
+    signal_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO customer_signal (
+                    id, merchant_id, case_id, token_id, kind, delay_reason,
+                    submitted_at, created_at
+                ) VALUES (
+                    :id, :merchant_id, :case_id, :token_id, :kind, :delay_reason,
+                    :submitted_at, now()
+                )
+                """
+            ),
+            {
+                "id": str(signal_id),
+                "merchant_id": str(merchant_id),
+                "case_id": str(case_id),
+                "token_id": f"tok{signal_id.hex[:23]}",
+                "kind": CustomerSignalKind.DELAY_REASON.value,
+                "delay_reason": reason.value,
+                "submitted_at": now() if submitted_at is None else submitted_at,
+            },
+        )
+    return signal_id
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (DelayReason.SALARY_OR_CASHFLOW_TIMING, RiskCause.INSUFFICIENT_FUNDS),
+        (DelayReason.BANK_OR_CARD_PROBLEM, RiskCause.BANK_OR_NETWORK_FAILURE),
+        (DelayReason.AMOUNT_TOO_HIGH_RIGHT_NOW, RiskCause.INSUFFICIENT_FUNDS),
+    ],
+)
+def test_a_stated_reason_refines_the_next_cycles_cause(
+    owner_engine: Engine,
+    factory: sessionmaker[Session],
+    merchant_id: uuid.UUID,
+    reason: DelayReason,
+    expected: RiskCause,
+) -> None:
+    """R20.C4 end to end, for each of the three reasons that name a cause.
+
+    Two cycles rather than one, because the requirement is about the *next* decision cycle and
+    a single-cycle test would not show that anything changed. Cycle 0 diagnoses an unmapped
+    provider reason as ``UNKNOWN``; the customer then says why; cycle 1 records the mapped
+    cause at ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` with the signal named in the evidence.
+
+    The stored ``confidence`` is read back and compared as a ``Decimal``, not as a float: the
+    column is ``NUMERIC(4,3)`` and the value is compared against a configured floor, so a
+    round trip through binary would make the boundary case non-deterministic.
+    """
+    case_id = _seed_case(owner_engine, merchant_id, error_reason="a_reason_nobody_mapped")
+    first = _run(factory, merchant_id, case_id)
+    assert first.cause is RiskCause.UNKNOWN
+    assert first.evidence_source is DiagnosisEvidenceSource.PROVIDER_ERROR_CODE
+    assert first.customer_signal_id is None
+
+    signal_id = _seed_delay_reason(owner_engine, merchant_id, case_id, reason)
+    _advance_cycle(owner_engine, case_id)
+    second = _run(factory, merchant_id, case_id)
+
+    assert second.cause is expected
+    assert second.method is DiagnosisMethod.DETERMINISTIC
+    assert second.confidence == default_configuration().CUSTOMER_STATED_CAUSE_CONFIDENCE
+    assert second.evidence_source is DiagnosisEvidenceSource.CUSTOMER_STATED_REASON
+    assert second.customer_signal_id == signal_id
+    assert second.substituted_to_unknown is False
+
+    rows = _diagnosis_rows(owner_engine, case_id)
+    assert len(rows) == 2
+    row = rows[1]
+    assert row["cause"] == expected.value
+    assert row["method"] == DiagnosisMethod.DETERMINISTIC.value
+    assert Decimal(str(row["confidence"])) == Decimal("0.900")
+    assert row["ai_invocation_id"] is None, (
+        "a customer-stated cause is deterministic; no model was consulted for it either"
+    )
+    evidence = row["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence[EVIDENCE_SOURCE] == DiagnosisEvidenceSource.CUSTOMER_STATED_REASON.value
+    assert evidence[EVIDENCE_CUSTOMER_SIGNAL_ID] == str(signal_id)
+    assert evidence[EVIDENCE_STATED_REASON] == reason.value
+    assert evidence[EVIDENCE_CAUSE_REFINED] is True
+    assert evidence[EVIDENCE_SUPERSEDED_CAUSE] == RiskCause.UNKNOWN.value
+    # The provider table's own coverage is still measured as a miss. A stated reason
+    # resolving what the table could not must not flatter the table.
+    assert evidence[EVIDENCE_MATCHED] is False
+    assert second.coverage_gap is True
+
+    with owner_engine.connect() as connection:
+        recorded = connection.execute(
+            text(
+                "SELECT diagnosis FROM audit_record "
+                "WHERE case_id = :c AND event_type = :e ORDER BY seq DESC LIMIT 1"
+            ),
+            {"c": str(case_id), "e": DIAGNOSIS_RECORDED},
+        ).scalar_one()
+    assert isinstance(recorded, dict)
+    assert recorded[EVIDENCE_SOURCE] == DiagnosisEvidenceSource.CUSTOMER_STATED_REASON.value
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        DelayReason.OTHER,
+        DelayReason.DISPUTES_THE_CHARGE,
+        DelayReason.NO_LONGER_WANTS_THE_ORDER,
+    ],
+)
+def test_a_reason_naming_no_cause_leaves_the_recorded_cause_unchanged(
+    owner_engine: Engine,
+    factory: sessionmaker[Session],
+    merchant_id: uuid.UUID,
+    reason: DelayReason,
+) -> None:
+    """R20.C6, and the two Hard_Stop_Reasons on the same terms.
+
+    The provider's cause is a *hit* here rather than a miss, which is what makes "unchanged"
+    an assertion with something to lose. The stated reason is still recorded in the evidence,
+    with ``delay_reason_refined_cause`` false — a merchant asking why the second contact
+    repeated the first needs "they answered, and their answer named no cause" to be
+    distinguishable from "they never answered", and a missing key would collapse the two.
+    """
+    case_id = _seed_case(owner_engine, merchant_id, error_reason="insufficient_funds")
+    first = _run(factory, merchant_id, case_id)
+    assert first.cause is RiskCause.INSUFFICIENT_FUNDS
+
+    signal_id = _seed_delay_reason(owner_engine, merchant_id, case_id, reason)
+    _advance_cycle(owner_engine, case_id)
+    second = _run(factory, merchant_id, case_id)
+
+    assert second.cause is first.cause
+    assert second.confidence == Decimal("1.000")
+    assert second.method is DiagnosisMethod.DETERMINISTIC
+    assert second.evidence_source is DiagnosisEvidenceSource.PROVIDER_ERROR_CODE
+    assert second.customer_signal_id == signal_id, (
+        "the signal informed the run even though it changed nothing, and the record says so"
+    )
+
+    evidence = _diagnosis_rows(owner_engine, case_id)[1]["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence[EVIDENCE_CAUSE_REFINED] is False
+    assert evidence[EVIDENCE_STATED_REASON] == reason.value
+    assert EVIDENCE_SUPERSEDED_CAUSE not in evidence
+    assert evidence[EVIDENCE_SOURCE] == DiagnosisEvidenceSource.PROVIDER_ERROR_CODE.value
+
+
+def test_no_stated_reason_leaves_the_evidence_document_as_it_was(
+    owner_engine: Engine, factory: sessionmaker[Session], merchant_id: uuid.UUID
+) -> None:
+    """A case with no Customer_Signal records none of R20.C4's keys.
+
+    The third of the three states. Absent means "nobody was asked or nobody answered", which
+    is not the same as ``OTHER``, and writing the keys with null-ish values would make the
+    distinction unreadable.
+    """
+    case_id = _seed_case(owner_engine, merchant_id, error_reason="insufficient_funds")
+    outcome = _run(factory, merchant_id, case_id)
+
+    assert outcome.evidence_source is DiagnosisEvidenceSource.PROVIDER_ERROR_CODE
+    assert outcome.customer_signal_id is None
+    evidence = _diagnosis_rows(owner_engine, case_id)[0]["evidence"]
+    assert isinstance(evidence, dict)
+    for key in (
+        EVIDENCE_CUSTOMER_SIGNAL_ID,
+        EVIDENCE_STATED_REASON,
+        EVIDENCE_CAUSE_REFINED,
+        EVIDENCE_SUPERSEDED_CAUSE,
+    ):
+        assert key not in evidence
+
+
+def test_the_most_recent_stated_reason_wins(
+    owner_engine: Engine, factory: sessionmaker[Session], merchant_id: uuid.UUID
+) -> None:
+    """A corrected reason supersedes the first one.
+
+    A customer who submits a second reason has changed their answer, and diagnosing on the
+    superseded one would make the correction pointless. Ordering by ``submitted_at`` descending
+    is what does it, so the two rows are given distinct instants rather than relying on
+    insertion order.
+    """
+    case_id = _seed_case(owner_engine, merchant_id, error_reason="a_reason_nobody_mapped")
+    moment = now()
+    _seed_delay_reason(
+        owner_engine,
+        merchant_id,
+        case_id,
+        DelayReason.BANK_OR_CARD_PROBLEM,
+        submitted_at=moment - timedelta(hours=2),
+    )
+    latest = _seed_delay_reason(
+        owner_engine,
+        merchant_id,
+        case_id,
+        DelayReason.SALARY_OR_CASHFLOW_TIMING,
+        submitted_at=moment,
+    )
+
+    outcome = _run(factory, merchant_id, case_id)
+
+    assert outcome.cause is RiskCause.INSUFFICIENT_FUNDS
+    assert outcome.customer_signal_id == latest
+
+
+def test_a_refinement_does_not_switch_off_the_fraud_routing(
+    owner_engine: Engine, factory: sessionmaker[Session], merchant_id: uuid.UUID
+) -> None:
+    """R3.C6 survives R20.C4, against a real row.
+
+    A provider risk decline plus a customer saying their salary is late. The recorded cause
+    becomes ``INSUFFICIENT_FUNDS``, which is a reasonable thing to plan around, and the fraud
+    routing the decline demanded still fires — otherwise the least trustworthy input in the
+    system would be the one that can switch off a gate no trusted input can. The superseded
+    cause is in the evidence, which is both how a reviewer sees it and how a retried job
+    recomputes the routing without re-reading the event.
+    """
+    case_id = _seed_case(
+        owner_engine, merchant_id, error_reason="payment_risk_check_failed"
+    )
+    first = _run(factory, merchant_id, case_id)
+    assert first.cause is RiskCause.FRAUD_OR_RISK_SIGNAL
+    assert first.requires_policy_evaluation is True
+
+    _seed_delay_reason(
+        owner_engine, merchant_id, case_id, DelayReason.SALARY_OR_CASHFLOW_TIMING
+    )
+    _advance_cycle(owner_engine, case_id)
+    second = _run(factory, merchant_id, case_id)
+
+    assert second.cause is RiskCause.INSUFFICIENT_FUNDS
+    assert second.requires_policy_evaluation is True
+    evidence = _diagnosis_rows(owner_engine, case_id)[1]["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence[EVIDENCE_SUPERSEDED_CAUSE] == RiskCause.FRAUD_OR_RISK_SIGNAL.value
+
+    # And a retried job reads it back rather than losing it.
+    retried = _run(factory, merchant_id, case_id)
+    assert retried.already_recorded is True
+    assert retried.requires_policy_evaluation is True
+    assert retried.evidence_source is DiagnosisEvidenceSource.CUSTOMER_STATED_REASON
+    assert retried.customer_signal_id == second.customer_signal_id

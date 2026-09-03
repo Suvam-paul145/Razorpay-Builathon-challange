@@ -58,6 +58,13 @@ def _metrics(*, incremental: IncrementalFinding, labels: tuple[str, ...]) -> Coh
         natural_recovered_revenue=1_100_000,
         total_recovery_cost=12_000,
         unresolved_revenue=6_200_000,
+        # R31.C12's four terms. Distinct values, so a serializer that emitted one of them
+        # twice or put the sum in a term's slot would show up as a wrong number rather
+        # than as a coincidence.
+        financial_cost=4_800,
+        communication_cost=400,
+        risk_cost=0,
+        customer_cost=16_000,
         blocked_case_count=3,
         escalated_case_count=1,
         unnecessary_action_count=0,

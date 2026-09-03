@@ -107,6 +107,8 @@ def installed_secrets() -> Iterator[None]:
         {
             "REVORA_PAYLOAD_ENCRYPTION_KEYS": "1:" + base64.b64encode(b"I" * 32).decode(),
             "REVORA_CUSTOMER_KEY_SECRET": base64.b64encode(b"J" * 32).decode(),
+            "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS": "1:"
+            + base64.b64encode(b"J" * 32).decode(),
             "REVORA_SESSION_TOKEN_SECRET": base64.b64encode(b"K" * 32).decode(),
             "REVORA_RAZORPAY_KEY_ID": "rzp_test_integration",
             "REVORA_RAZORPAY_KEY_SECRET": "integration-secret",

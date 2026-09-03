@@ -410,6 +410,8 @@ def installed_secrets() -> Iterator[None]:
         {
             "REVORA_PAYLOAD_ENCRYPTION_KEYS": "1:" + base64.b64encode(b"P" * 32).decode(),
             "REVORA_CUSTOMER_KEY_SECRET": base64.b64encode(b"3" * 32).decode(),
+            "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS": "1:"
+            + base64.b64encode(b"3" * 32).decode(),
         }
     )
     previous = set_secret_store(SecretStore(resolver))
