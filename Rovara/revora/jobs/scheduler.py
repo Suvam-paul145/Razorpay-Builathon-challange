@@ -3,7 +3,8 @@
 The worker moves work off the request path; the scheduler is what puts the periodic
 work there in the first place. It enqueues, on an interval, the sweeps that keep the
 system correct without depending on any single job having run: lifecycle evaluation,
-execution reconciliation, payment-state reconciliation, detection-gap backfill, and
+execution reconciliation, payment-state reconciliation, detection-gap backfill, the
+customer-data retention sweep, the review sweep over cases that chose restraint, and
 the calibration report trigger.
 
 Every enqueue carries a dedupe key built from the sweep kind and the interval bucket,
@@ -24,6 +25,7 @@ import uuid
 from datetime import datetime
 from typing import Final
 
+from revora.cases.review import CASE_REVIEW_KIND
 from revora.jobs.queue import enqueue
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.clock import now
@@ -37,6 +39,7 @@ except ImportError:  # pragma: no cover
 
 __all__ = [
     "CALIBRATION_REPORT_KIND",
+    "CASE_REVIEW_KIND",
     "CUSTOMER_DATA_RETENTION_KIND",
     "DETECTION_GAP_BACKFILL_KIND",
     "EXECUTION_RECONCILIATION_KIND",
@@ -66,10 +69,17 @@ PERIODIC_SWEEP_KINDS: Final[tuple[str, ...]] = (
     DETECTION_GAP_BACKFILL_KIND,
     CALIBRATION_REPORT_KIND,
     CUSTOMER_DATA_RETENTION_KIND,
+    CASE_REVIEW_KIND,
 )
 """Every periodic sweep kind. The worker registers a handler for each; the ones whose
 owners do not exist yet are registered as no-ops so a scheduled sweep completes rather
-than dead-lettering."""
+than dead-lettering.
+
+``CASE_REVIEW_KIND`` is defined in ``revora.cases.review`` rather than above, and imported.
+It is the one sweep kind that is also enqueued from below this layer — the detection service
+and the customer response surface both trigger a review, and neither may import
+``revora.jobs`` — so the constant lives at the lowest layer that all three callers can see.
+Its interval is ``REVIEW_SWEEP_INTERVAL``."""
 
 
 def enqueue_sweep(

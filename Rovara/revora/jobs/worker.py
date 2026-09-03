@@ -26,8 +26,11 @@ from collections.abc import Callable
 from typing import Final
 
 from revora.cases.retention import sweep_customer_data_retention
+from revora.cases.review import CASE_REVIEW_KIND, sweep_due_reviews
 from revora.cases.sweeper import sweep_expired_cases
+from revora.customer.suppression import CONTACT_SUPPRESSION_KIND
 from revora.detection.service import run_detection
+from revora.domain.enums import HardStopReason, ReviewTrigger
 from revora.execution.reconcile import reconcile_intents
 from revora.ingestion.backfill import backfill_detection_gap
 from revora.ingestion.service import DETECTION_JOB_KIND
@@ -41,11 +44,13 @@ from revora.jobs.pipeline import (
     enqueue_after_detection,
     enqueue_after_recovery_signal,
     handle_candidates,
+    handle_contact_suppression,
     handle_diagnosis,
     handle_execution,
     handle_optimizer,
     handle_outcome,
     handle_policy,
+    handle_review,
 )
 from revora.jobs.queue import ClaimedJob, claim_one, complete, enqueue, fail
 from revora.jobs.scheduler import (
@@ -162,6 +167,60 @@ def _handle_lifecycle(claimed: ClaimedJob) -> None:
     sweep_expired_cases(
         claimed.merchant_id,
         on_terminal=observation_writer(config, correlation_id=claimed.correlation_id),
+    )
+
+
+def _handle_contact_suppression(claimed: ClaimedJob) -> None:
+    """Apply what a Hard_Stop_Reason causes beyond the request that recorded it (R21.C4-C7).
+
+    The Hard_Stop_Reason travels in the payload rather than being re-derived from the
+    ``customer_signal`` row, and rather than being read back off ``contact_suppression``. Payloads
+    hold ids and enumeration members here for a reason worth stating: re-deriving it would mean
+    this handler deciding *again* which reason applies, and the whole point of R20.C1's typed
+    enumeration is that the decision was made once, at the boundary, against a validated
+    submission. A second derivation is a second place the mapping can be wrong.
+
+    Absent or unrecognised, the ``HardStopReason`` constructor raises and the job fails into the
+    retry path rather than defaulting. There is no safe default: guessing ``DISPUTES_THE_CHARGE``
+    for a cancellation would file a fulfilment question as a chargeback risk, and the reverse
+    hides a chargeback.
+    """
+    handle_contact_suppression(
+        claimed.merchant_id,
+        _case_id_of(claimed),
+        hard_stop_reason=HardStopReason(str(claimed.payload["hard_stop_reason"])),
+        correlation_id=claimed.correlation_id,
+    )
+
+
+def _handle_case_review(claimed: ClaimedJob) -> None:
+    """One kind, two shapes of work: the periodic sweep, or one case's review.
+
+    Distinguished by whether the payload carries a ``case_id``. They share a job kind because
+    they are one mechanism — the sweep exists only to enqueue the reviews — and splitting them
+    would put a second kind in ``PERIODIC_SWEEP_KINDS`` that no clock ever enqueues, which is
+    the shape of a sweep everybody assumes is running.
+
+    The sweep needs no terminal callback, unlike the lifecycle sweep: it transitions nothing.
+    A review's own terminal path lives in :func:`revora.jobs.pipeline.handle_review`, which
+    can reach ``revora.memory`` directly from this layer.
+    """
+    raw_case_id = claimed.payload.get("case_id")
+    if raw_case_id is None:
+        sweep_due_reviews(claimed.merchant_id, correlation_id=claimed.correlation_id)
+        return
+
+    raw_trigger = claimed.payload.get("review_trigger")
+    trigger = (
+        ReviewTrigger.SCHEDULED_REVIEW
+        if raw_trigger is None
+        else ReviewTrigger(str(raw_trigger))
+    )
+    handle_review(
+        claimed.merchant_id,
+        uuid.UUID(str(raw_case_id)),
+        trigger=trigger,
+        correlation_id=claimed.correlation_id,
     )
 
 
@@ -323,6 +382,8 @@ def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str
             claimed, _resolve()
         ),
         CUSTOMER_DATA_RETENTION_KIND: _handle_customer_data_retention,
+        CASE_REVIEW_KIND: _handle_case_review,
+        CONTACT_SUPPRESSION_KIND: _handle_contact_suppression,
         CALIBRATION_REPORT_KIND: _handle_not_yet_implemented,
     }
 

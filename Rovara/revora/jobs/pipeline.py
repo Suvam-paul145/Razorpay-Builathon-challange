@@ -13,6 +13,11 @@ diagnosis (harmless but wasteful) or resume from a position it has no durable re
 (not harmless). With a job per step the case's own state *is* the resume point, and the
 sweeper can always tell what should happen next from persisted rows alone.
 
+:func:`handle_review` is the one step that is not part of that sequence. It re-enters it, from
+``POLICY_CHECK`` back to ``DECISION_PENDING``, for a case whose last cycle chose restraint —
+and it runs the same four steps rather than any of its own, so a reviewed case is decided on
+exactly the terms a new one is.
+
 **Why the follow-on enqueue is inside the transition.** ``apply_transition`` takes an
 ``on_success`` callback that runs in its transaction, so the state change and the job that
 acts on it commit together. That is the whole reason the queue is a table rather than a
@@ -43,30 +48,50 @@ second implementation of the guarantee.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.orm import Session
 
-from revora.audit.events import POLICY_DECISION_RECORDED
+from revora.audit.events import (
+    ACTION_CANCELLED_CONTACT_SUPPRESSED,
+    CASE_ESCALATED,
+    CASE_REVIEWED,
+    POLICY_DECISION_RECORDED,
+)
 from revora.audit.writer import AuditEntry, AuditWriter
-from revora.cases.manager import apply_transition
+from revora.cases.manager import apply_locked_transition, apply_transition
+from revora.customer.suppression import suppression_in_force
 from revora.detection.service import DetectionServiceResult
 from revora.diagnosis.service import run_diagnosis
-from revora.domain.actions import CandidateAction, needs_provider_call
-from revora.domain.enums import CaseState, PolicyVerdict, RiskCause, TerminalReason
+from revora.domain.actions import NULL_ACTIONS, CandidateAction, needs_provider_call
+from revora.domain.enums import (
+    CaseState,
+    HardStopReason,
+    PolicyVerdict,
+    ReviewTrigger,
+    RiskCause,
+    TerminalReason,
+)
+from revora.domain.transitions import is_terminal
 from revora.estimation.baseline import run_baseline_estimation
 from revora.estimation.candidates import run_candidate_estimation
 from revora.execution.engine import ExecutionOutcome, execute_approved_action
 from revora.experiment.control import assign_case
 from revora.memory.store import observation_writer
 from revora.optimizer.service import run_optimizer
-from revora.outcome.monitor import observe_payment_outcome
+from revora.outcome.monitor import (
+    observe_payment_outcome,
+    record_post_suppression_actions,
+)
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.config import ConfigurationRepository
 from revora.persistence.repositories.consent import CustomerConsentRepository
 from revora.persistence.repositories.diagnosis import DiagnosisRepository
+from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.persistence.repositories.jobs import JobRepository
 from revora.persistence.repositories.policy import PolicyDecisionRepository
 from revora.persistence.repositories.recommendations import RecommendationRepository
@@ -79,6 +104,7 @@ from revora.policy.input import PolicyInput
 from revora.policy.rules import rule_set_from_config
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from revora.persistence.models import RecoveryCase
     from revora.providers.razorpay import PaymentProviderClient
 
 __all__ = [
@@ -96,6 +122,7 @@ __all__ = [
     "handle_optimizer",
     "handle_outcome",
     "handle_policy",
+    "handle_review",
     "rule_set_from_config",
     "run_policy_evaluation",
 ]
@@ -103,6 +130,39 @@ __all__ = [
 _logger = get_logger(__name__)
 
 _POLICY_ACTOR: Final = "policy_engine"
+_REVIEW_ACTOR: Final = "review_engine"
+_SUPPRESSION_ACTOR: Final = "contact_suppression"
+
+SUPPRESSION_TERMINAL_REASON: Final[Mapping[HardStopReason, TerminalReason]] = (
+    MappingProxyType(
+        {
+            HardStopReason.DISPUTES_THE_CHARGE: TerminalReason.CUSTOMER_DISPUTED_CHARGE,
+            HardStopReason.NO_LONGER_WANTS_THE_ORDER: (
+                TerminalReason.CUSTOMER_CANCELLED_ORDER
+            ),
+        }
+    )
+)
+"""R21.C4 and R21.C5 as a table, total over :class:`HardStopReason`.
+
+Two rows and both are the whole content of a requirement clause, which is why they are a table
+rather than an ``if``: R21.C4 and R21.C5 differ only in this mapping, and stating it as data
+means the two clauses are checkable by reading one expression. The check below keeps it total, so
+a third Hard_Stop_Reason fails at import rather than falling through to a ``KeyError`` inside a
+worker transaction — the place a missing row would be most expensive to discover.
+
+The two reasons stay distinct rather than collapsing onto one escalation reason because what has
+to happen next differs: a dispute implies a possible chargeback, a cancellation implies fulfilment
+and refund questions. Both are a person's problem, and not the same person's."""
+
+_unmapped_hard_stops = sorted(
+    reason.value for reason in HardStopReason if reason not in SUPPRESSION_TERMINAL_REASON
+)
+if _unmapped_hard_stops:  # pragma: no cover - import-time invariant
+    raise RuntimeError(
+        "SUPPRESSION_TERMINAL_REASON is not total over HardStopReason; missing "
+        f"{_unmapped_hard_stops}"
+    )
 
 DIAGNOSIS_JOB_KIND: Final[str] = "diagnosis"
 CANDIDATE_JOB_KIND: Final[str] = "estimation"
@@ -319,6 +379,12 @@ def handle_policy(
     and no effect follows. A blocked case is not a failed case and must not be made to look like one
     — the lifecycle sweeper will terminate it when its window closes, and the dashboard shows the
     reason in the meantime.
+
+    An approved *null* action — ``DO_NOTHING`` or ``WAIT`` — also stops at ``POLICY_CHECK``, and it
+    is the one of these that leaves something behind: a ``next_review_at`` instant, written in the
+    transition's own transaction, at which the case will be looked at again (R30.C3). Before that
+    instant existed, a case Revora correctly decided not to act on had no route to a second
+    decision cycle at all, and waited out its window as though it had been abandoned.
     """
     with tenant_transaction(merchant_id) as session:
         config = _config(session, merchant_id)
@@ -339,6 +405,30 @@ def handle_policy(
         if version is None:
             return
 
+    # R30.C3: a selection of ``DO_NOTHING`` or ``WAIT`` gets a review instant, and it is
+    # written *inside* the transition into ``POLICY_CHECK`` rather than in a commit after it.
+    # A case resting at ``POLICY_CHECK`` with ``next_review_at`` null is invisible to the
+    # Review_Sweeper's index predicate, so a crash between two commits would reproduce exactly
+    # the defect R30 exists to fix — silently, on whichever cases were unlucky. The callback
+    # runs on the row this transition already holds locked, so it reads the immutable
+    # ``window_end_at`` it clamps against under that lock.
+    #
+    # Attached only for a null action, because that is R30.C3's precondition. A ``DEFERRED``,
+    # ``BLOCKED`` or ``ESCALATE`` verdict also rests at ``POLICY_CHECK``, and a case that was
+    # refused is not a case that chose restraint — giving it a review instant would put the
+    # sweeper in charge of retrying decisions the policy engine already declined.
+    chose_restraint = outcome.authorized and outcome.selected_action in NULL_ACTIONS
+    review_at: datetime | None = None
+
+    def _schedule_review(session: Session, case: RecoveryCase) -> None:
+        nonlocal review_at
+        review_at = _review_instant(
+            moment=now(),
+            window_end_at=case.window_end_at,
+            interval=config.WAIT_REVIEW_INTERVAL,
+        )
+        case.next_review_at = review_at
+
     recorded = apply_transition(
         merchant_id,
         case_id,
@@ -348,6 +438,7 @@ def handle_policy(
         actor=_POLICY_ACTOR,
         action=outcome.selected_action,
         correlation_id=correlation_id,
+        on_success=_schedule_review if chose_restraint else None,
     )
     if not outcome.authorized or not recorded.applied:
         return
@@ -405,16 +496,386 @@ def handle_policy(
         return
 
     # A null action. Nothing to schedule and nothing to execute — Revora decided not to act this
-    # cycle, which is a complete and defensible answer. The case stays at ``POLICY_CHECK`` and the
-    # lifecycle sweeper owns its ending, so "we chose not to act" does not become "we failed".
+    # cycle, which is a complete and defensible answer. The case stays at ``POLICY_CHECK``
+    # carrying the review instant written above (R30.C3, R30.C12), so restraint is a decision to
+    # revisit rather than a decision to abandon. The lifecycle sweeper still owns the ending if
+    # no review ever changes the answer, so "we chose not to act" does not become "we failed".
+    #
+    # ``review_scheduled`` false with an authorized null action means the window had already
+    # closed when the selection was recorded — see :func:`_review_instant`.
     _logger.info(
         "no action to execute this cycle",
         merchant_id=str(merchant_id),
         case_id=str(case_id),
         selected_action=None if action is None else action.value,
         selection_reason=outcome.primary_reason,
+        next_review_at=None if review_at is None else review_at.isoformat(),
+        review_scheduled=review_at is not None,
     )
 
+
+# ---------------------------------------------------------------------------
+# Step 4b: review — a second decision cycle for a case that chose restraint
+# ---------------------------------------------------------------------------
+
+
+def handle_review(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    trigger: ReviewTrigger,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Look at a case that chose restraint again, and start it on a fresh decision cycle.
+
+    Assembled from the four steps the forward path already uses — diagnosis, baseline,
+    candidates, optimizer — rather than reimplementing any of them. A second implementation
+    of "what does this case cost and what is it worth" would be a second answer, and the
+    whole claim of R30 is that a reviewed case is decided on *exactly* the terms a new case
+    is. So this handler contributes no arithmetic of its own. What it contributes is the
+    ordering, the cap, and the record.
+
+    **The decision-cycle numbering.** All four steps read ``case.decision_cycle_count`` off
+    the row themselves and file under it; none of them takes a cycle number. Because they run
+    *before* the transition into ``DECISION_PENDING`` — which is the edge that increments the
+    counter — a case resting at ``POLICY_CHECK`` with the counter at ``n`` produces a
+    diagnosis, a baseline, a candidate set and a recommendation all filed under cycle ``n``,
+    which is the ``n+1``-th decision cycle of the case's life. Passing a cycle number in, or
+    running any step after the transition, would file the recommendation under ``n+1`` where
+    every lookup for it searches ``n``. That failure is silent — ``for_cycle`` returns ``None``
+    rather than raising — and it presents as a pipeline stalled in ``DECISION_PENDING``, a
+    case-detail view with no policy decision, and a training observation with a null cause.
+    See ``RecommendationRepository.active_decision_cycle``.
+
+    **The cap is checked here as well as in the sweep's query, and both are load-bearing.**
+    The query excludes capped cases so no pointless job is queued; this gate terminates a case
+    that reached the cap between that read and this lock. R30.C10 is this one — the sweep
+    cannot satisfy it, because a sweep that merely declines to enqueue leaves a capped case
+    sitting at ``POLICY_CHECK`` until its window elapses, which is a different ending with a
+    different reason on the record.
+
+    **Nothing here reads the trigger except the audit record.** R30.C15 requires the policy
+    evaluation to take no input from the Review_Trigger and none from the count of prior
+    reviews, and the structure is what enforces it: policy runs in its own job, from
+    ``POLICY_JOB_KIND``, whose payload carries a case id and a correlation id and no trigger.
+    There is nothing for it to branch on.
+    """
+    review_at_start = now()
+    new_action: CandidateAction | None = None
+
+    with tenant_transaction(merchant_id) as session:
+        config = _config(session, merchant_id)
+        case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+        if case is None:
+            _logger.warning("review for missing case", case_id=str(case_id))
+            return
+
+        # Re-checked under the lock, because the sweep read the due set in a transaction that
+        # has since committed and any trigger's enqueue is older than this claim. A case that
+        # has been approved and scheduled, terminated, or already reviewed is not an error
+        # here: it is a review that arrived after the question stopped being open.
+        state = CaseState(case.state)
+        if state is not CaseState.POLICY_CHECK:
+            _logger.info(
+                "review skipped: case is no longer waiting at POLICY_CHECK",
+                case_id=str(case_id),
+                observed_state=state.value,
+                review_trigger=trigger.value,
+            )
+            return
+
+        version = case.version
+        cycles_before = case.decision_cycle_count
+        unresolved_amount = int(case.payment_amount)
+        at_cap = cycles_before >= config.MAX_RECOVERY_ATTEMPTS
+        previous_action = _previously_selected_action(session, merchant_id, case_id)
+
+        if not at_cap:
+            run_diagnosis(session, merchant_id, case_id, config, correlation_id=correlation_id)
+            baseline = run_baseline_estimation(
+                session, merchant_id, case_id, config, correlation_id=correlation_id
+            )
+            if not baseline.requires_candidate_estimation:
+                # Same stop as the forward path: a missing baseline must never be read as a
+                # baseline of zero, which would make every intervention look maximally
+                # valuable. The case keeps its ``next_review_at``, so the next sweep pass
+                # retries — and if the estimate never becomes available, the lifecycle sweep
+                # still ends the case when its window closes.
+                _logger.warning(
+                    "review produced no baseline; case stays at POLICY_CHECK",
+                    case_id=str(case_id),
+                    failure_reason=baseline.failure_reason,
+                )
+                return
+            run_candidate_estimation(
+                session, merchant_id, case_id, config, correlation_id=correlation_id
+            )
+            recommendation = run_optimizer(
+                session, merchant_id, case_id, config, correlation_id=correlation_id
+            )
+            if recommendation.recommendation_id is None:
+                _logger.warning(
+                    "review produced no recommendation; case stays at POLICY_CHECK",
+                    case_id=str(case_id),
+                    failure_reason=recommendation.failure_reason,
+                )
+                return
+            new_action = recommendation.selected_action
+
+    def _record(session: Session, case: RecoveryCase) -> None:
+        """Write ``CASE_REVIEWED`` in the transition's own transaction.
+
+        In ``on_success`` rather than a commit of its own so the record exists exactly when
+        the review applied — R30.C11 wants one record per completed review, and a record
+        written after a separate commit can outlive a rolled-back transition or be lost by a
+        crash between the two.
+
+        ``case.decision_cycle_count`` read here is the counter *after* the review, because
+        the transition's counter effects have already been applied to this row.
+        ``case.next_review_at`` is ``None`` on both paths, and that is the honest value: the
+        one writer of ``recovery_case.state`` clears it on every edge out of ``POLICY_CHECK``,
+        and the *next* review instant does not exist yet — it is written by
+        :func:`handle_policy` if this cycle's selection is a null action too.
+        """
+        _write_review_audit(
+            session,
+            merchant_id,
+            case_id,
+            config=config,
+            trigger=trigger,
+            previous_action=previous_action,
+            new_action=new_action,
+            decision_cycle_count=case.decision_cycle_count,
+            next_review_at=case.next_review_at,
+            unresolved_amount=unresolved_amount,
+            correlation_id=correlation_id,
+            moment=review_at_start,
+        )
+
+    if at_cap:
+        # R30.C10. Terminal, so the training set is owed a row: nothing revisits a terminal
+        # case, and an edge without ``observation_writer`` is a permanent hole in what the
+        # memory layer learns. This hole would be systematically the cases Revora tried
+        # hardest on, since reaching the cap takes the maximum number of cycles.
+        #
+        # ``next_review_at`` needs no clearing at this call site. ``apply_locked_transition``
+        # clears it on every edge whose source is ``POLICY_CHECK``, keyed on the source state
+        # rather than on a list of edges, so this one inherits it by construction.
+        observation = observation_writer(config, correlation_id=correlation_id)
+
+        def _terminate(session: Session, case: RecoveryCase) -> None:
+            observation(session, case)
+            _record(session, case)
+
+        apply_transition(
+            merchant_id,
+            case_id,
+            expected_version=version,
+            target_state=CaseState.STOPPED,
+            reason="decision cycle limit reached at review",
+            actor=_REVIEW_ACTOR,
+            terminal_reason=TerminalReason.DECISION_CYCLE_LIMIT_REACHED,
+            correlation_id=correlation_id,
+            on_success=_terminate,
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        return
+
+    def _advance(session: Session, case: RecoveryCase) -> None:
+        _record(session, case)
+        _after(session, merchant_id, case_id, POLICY_JOB_KIND, correlation_id)
+
+    apply_transition(
+        merchant_id,
+        case_id,
+        expected_version=version,
+        target_state=CaseState.DECISION_PENDING,
+        reason=f"review triggered by {trigger.value}",
+        actor=_REVIEW_ACTOR,
+        action=new_action,
+        correlation_id=correlation_id,
+        on_success=_advance,
+        disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+        max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contact_Suppression: the transitional consequences of a hard stop (R21.C4-C7)
+# ---------------------------------------------------------------------------
+
+
+def handle_contact_suppression(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    hard_stop_reason: HardStopReason,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Apply everything a Contact_Suppression causes that the accepting request could not.
+
+    The suppression row and the token revocation were written inside the request that accepted the
+    Customer_Signal, because R21.C1 and R21.C10 require them to be atomic with it. Everything in
+    this handler is the other four clauses, and every one of them is something R19.C9 forbids that
+    request from doing: a state transition (C4, C5), the cancellation of scheduled actions (C6) and
+    the treatment of an intent that was already in flight (C7). So the accepting request enqueued
+    one ``contact_suppression`` job and the worker is here to run it.
+
+    **One transaction, and the ordering inside it is the whole design.**
+
+    1. **Lock the case.** Everything after this is serialized against the pipeline's own writer,
+       which is what makes the intent read and the approval read below a snapshot rather than a
+       guess.
+    2. **Return early if the case is already terminal.** Not an error and not rare: a customer can
+       submit a hard stop on a case that a sweep expired seconds earlier, and a retried job finds
+       the case this handler itself escalated. Either way the correct action is none — a case holds
+       one terminal reason, and overwriting the first one would rewrite history to say the customer
+       objected to a case that had already ended. This early return is also what makes the handler
+       idempotent without an ``is_post_payment``-style flag column: a second run writes nothing.
+    3. **Record the in-flight intents** (C7), before the transition. Ordered first among the writes
+       because these are statements about what was already true when the suppression arrived, and a
+       reader walking the audit log in sequence should see *what had gone out* before seeing *what
+       we did about it*.
+    4. **Record one cancellation per approved-but-unconsumed decision** (C6). "For which no
+       execution-intent record exists" is ``consumed_by_intent_id IS NULL``, so the set comes
+       straight from the schema rather than from an inference about what was probably scheduled.
+    5. **Record ``CASE_ESCALATED``** carrying the unresolved ``payment_amount`` in minor units
+       (C4, C5), before the transition, for the reason ``DELAYED_RECOVERY_RECONCILED`` is written
+       before its transition in the Outcome_Monitor: the audit sequence is allocated under the case
+       row lock this transaction already holds, and the transition is the last thing that happens
+       so that a failure anywhere above it leaves the case where it was.
+    6. **Transition to ``ESCALATED``** with ``CUSTOMER_DISPUTED_CHARGE`` or
+       ``CUSTOMER_CANCELLED_ORDER``, through ``apply_locked_transition`` — the only writer of
+       ``recovery_case.state``, reached in its locked form because this transaction already holds
+       the row and the wrapper would deadlock against itself.
+
+    **Neither counter moves, and that is structural rather than checked here.** The
+    executed-action and customer-message counters have exactly one edge that increments them,
+    ``ACTION_SCHEDULED -> EXECUTING``, and every edge into a terminal state carries
+    ``NO_EFFECTS``. So R21.C6's "SHALL leave the executed-action counter and the customer-message
+    counter unchanged" is a property of the transition table, not of this function remembering.
+
+    **No provider request is issued from anywhere in this path.** This module cannot issue one —
+    there is no provider client in this function's arguments — and the queued execution jobs that
+    could are neutered by the terminal state, because ``execute_approved_action`` re-requests
+    authority against reloaded state and check 2 refuses a terminal case. R21.C12's later
+    reconciliation to ``RECOVERED`` is likewise a read rather than a request, and it leaves the
+    suppression in force because nothing but :func:`revora.customer.suppression.release_suppression`
+    can clear ``released_at`` and only a named Merchant_User can call it.
+    """
+    with tenant_transaction(merchant_id) as session:
+        config = ConfigurationRepository(session).load(merchant_id)
+        case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+        if case is None:  # pragma: no cover - RESTRICT makes a case undeletable
+            _logger.warning("suppression consequence on missing case", case_id=str(case_id))
+            return
+
+        state = CaseState(case.state)
+        if is_terminal(state):
+            _logger.info(
+                "suppression consequence skipped: case already terminal",
+                case_id=str(case_id),
+                state=state.value,
+                terminal_reason=case.terminal_reason,
+            )
+            return
+
+        writer = AuditWriter(
+            session,
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        unresolved_amount = int(case.payment_amount)
+        terminal_reason = SUPPRESSION_TERMINAL_REASON[hard_stop_reason]
+
+        in_flight = record_post_suppression_actions(
+            merchant_id,
+            case_id,
+            writer,
+            ExecutionIntentRepository(session).list_for_case(merchant_id, case_id),
+            correlation_id=correlation_id,
+        )
+
+        cancelled = PolicyDecisionRepository(session).list_approved_unconsumed(
+            merchant_id, case_id
+        )
+        for decision in cancelled:
+            writer.write_for_case(
+                merchant_id,
+                case_id,
+                AuditEntry(
+                    event_type=ACTION_CANCELLED_CONTACT_SUPPRESSED,
+                    actor=_SUPPRESSION_ACTOR,
+                    action=str(decision.selected_action),
+                    idempotency_key=decision.idempotency_key,
+                    decision={
+                        "policy_decision_id": str(decision.id),
+                        "hard_stop_reason": hard_stop_reason.value,
+                        "detail": "contact suppressed before any external call; action "
+                        "cancelled, counters unchanged",
+                    },
+                ),
+                correlation_id=correlation_id,
+            )
+
+        writer.write_for_case(
+            merchant_id,
+            case_id,
+            AuditEntry(
+                event_type=CASE_ESCALATED,
+                actor=_SUPPRESSION_ACTOR,
+                previous_state=state.value,
+                new_state=CaseState.ESCALATED.value,
+                decision={
+                    "hard_stop_reason": hard_stop_reason.value,
+                    "terminal_reason": terminal_reason.value,
+                    # R21.C4, R21.C5: the unresolved amount in minor currency units. An
+                    # ``int`` from a ``BIGINT`` column, never a float and never re-derived
+                    # from a formatted string.
+                    "unresolved_amount": unresolved_amount,
+                    "cancelled_actions": len(cancelled),
+                    "in_flight_actions": in_flight,
+                },
+            ),
+            correlation_id=correlation_id,
+        )
+
+        # Terminal, so the training set is owed a row: nothing revisits a terminal case, and an
+        # edge without ``observation_writer`` is a permanent hole in what the memory layer
+        # learns. Systematically the cases where a customer objected, which is the population a
+        # model most needs to stop proposing contact for.
+        _, rejection = apply_locked_transition(
+            session,
+            merchant_id,
+            case,
+            expected_version=int(case.version),
+            target_state=CaseState.ESCALATED,
+            reason=f"contact suppressed: {hard_stop_reason.value}",
+            actor=_SUPPRESSION_ACTOR,
+            terminal_reason=terminal_reason,
+            correlation_id=correlation_id,
+            on_success=observation_writer(config, correlation_id=correlation_id),
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        if rejection is not None:  # pragma: no cover - every non-terminal edge is legal
+            _logger.warning(
+                "suppression escalation refused",
+                case_id=str(case_id),
+                outcome=rejection.outcome.value,
+                state=state.value,
+            )
+            return
+
+    _logger.info(
+        "contact suppression applied",
+        case_id=str(case_id),
+        hard_stop_reason=hard_stop_reason.value,
+        terminal_reason=terminal_reason.value,
+        cancelled_actions=len(cancelled),
+        in_flight_actions=in_flight,
+    )
 
 # ---------------------------------------------------------------------------
 # Step 5: execution — the only step that can produce an external effect
@@ -609,6 +1070,11 @@ def run_policy_evaluation(
         verified_captured=_verified_captured(case.verified_payment_status),
         verified_status=case.verified_payment_status,
         diagnosed_cause=cause,
+        # R21.C3 and R21.C8. Resolved here rather than in the engine because
+        # ``policy-isolation`` forbids ``revora.policy`` from importing ``revora.persistence``,
+        # and keyed on the Suppression_Scope rather than the case, so a case opened later for a
+        # suppressed order finds the suppression on its first cycle.
+        contact_suppressed=suppression_in_force(session, merchant_id, case),
         open_intent_exists=decisions.open_intent_exists(merchant_id, case_id),
         intent_exists_for_key=decisions.intent_exists_for_key(merchant_id, prospective_key),
         selected_action=action,
@@ -684,6 +1150,31 @@ def _config(session: Session, merchant_id: uuid.UUID) -> Configuration:
     return ConfigurationRepository(session).load(merchant_id)
 
 
+def _review_instant(
+    *, moment: datetime, window_end_at: datetime, interval: timedelta
+) -> datetime | None:
+    """When a case that chose restraint should be looked at again, or ``None`` for not at all.
+
+    ``min(moment + interval, window_end_at)`` is R30.C3's clamp. The ``review_within_window``
+    CHECK on ``recovery_case`` refuses anything past the window end, so the clamp is verified
+    below the application rather than trusted here — the arithmetic and the constraint agree,
+    and if they ever stop agreeing the write fails loudly instead of scheduling a review for
+    after the case is dead.
+
+    ``None`` when the clamped instant lands at or before ``moment``, which is to say when the
+    recovery window had already closed by the time the policy job recorded this selection — a
+    case whose window elapsed between the optimizer's cycle and this job's run. The clamp
+    would then yield an instant in the past, the sweeper would find the case due on its very
+    next pass, and the review it triggered would spend a decision cycle on an evaluation whose
+    window check refuses every candidate action including the null ones. Writing nothing leaves
+    the case exactly where the lifecycle sweep expects to find it, and the lifecycle sweep is
+    the component that owns an elapsed window (R2.C12). A review that cannot lead to an action
+    is not a review; it is a busy loop that leaves audit records.
+    """
+    review_at = min(moment + interval, window_end_at)
+    return review_at if review_at > moment else None
+
+
 def _current_version(merchant_id: uuid.UUID, case_id: uuid.UUID) -> int | None:
     """Re-read the case version after an idempotent early return.
 
@@ -706,6 +1197,82 @@ def _after(
     """Enqueue the next step inside the transition's transaction."""
     enqueue_next(
         session, merchant_id, kind=kind, case_id=case_id, correlation_id=correlation_id
+    )
+
+
+def _previously_selected_action(
+    session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID
+) -> CandidateAction | None:
+    """The action the case's most recent completed cycle selected, or ``None``.
+
+    Read *before* the review's own optimizer runs, because the optimizer writes a
+    recommendation that would then be the newest one and the record's "previous" and "new"
+    fields would both name it — which is the exact comparison R30.C11 asks the record to
+    make, collapsed into a tautology.
+
+    ``None`` where the case has no recommendation at all, which is a case that reached
+    ``POLICY_CHECK`` some other way. It is not the same as a selection of ``DO_NOTHING``, and
+    reporting it as one would put a decision on the record that was never made.
+    """
+    recommendation = RecommendationRepository(session).latest_for_case(merchant_id, case_id)
+    if recommendation is None:
+        return None
+    return CandidateAction(recommendation.selected_action)
+
+
+def _write_review_audit(
+    session: Session,
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    config: Configuration,
+    trigger: ReviewTrigger,
+    previous_action: CandidateAction | None,
+    new_action: CandidateAction | None,
+    decision_cycle_count: int,
+    next_review_at: datetime | None,
+    unresolved_amount: int,
+    correlation_id: uuid.UUID | None,
+    moment: datetime,
+) -> None:
+    """One ``CASE_REVIEWED`` record per completed review (R30.C11).
+
+    ``selection_changed`` is computed and stored rather than left for a reader to derive from
+    the two action fields. The question the record exists to answer is "was restraint
+    re-examined", and a boolean makes that a ``WHERE`` instead of a comparison every consumer
+    has to get right — including the one that has to decide what a null previous action means.
+
+    ``unresolved_amount`` is R30.C10's "record the unresolved payment_amount in minor currency
+    units", carried on the terminating path and on the continuing one alike: what is still
+    owed is the figure that makes both readable without a join back to the case.
+    """
+    AuditWriter(
+        session,
+        disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+        max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+    ).write_for_case(
+        merchant_id,
+        case_id,
+        AuditEntry(
+            event_type=CASE_REVIEWED,
+            actor=_REVIEW_ACTOR,
+            action=None if new_action is None else new_action.value,
+            decision={
+                "review_trigger": trigger.value,
+                "reviewed_at": moment.isoformat(),
+                "previous_selected_action": (
+                    None if previous_action is None else previous_action.value
+                ),
+                "new_selected_action": None if new_action is None else new_action.value,
+                "selection_changed": previous_action is not new_action,
+                "decision_cycle_count": decision_cycle_count,
+                "next_review_at": None if next_review_at is None else next_review_at.isoformat(),
+                "unresolved_amount": unresolved_amount,
+                "config_version": config.version,
+            },
+        ),
+        correlation_id=correlation_id,
+        occurred_at=moment,
     )
 
 
