@@ -1,9 +1,16 @@
 """The FastAPI application. One factory, so there is one place the surface is enumerated.
 
 Reading :func:`create_app` should tell you every route this process serves and which of them are
-unauthenticated. There are exactly two: the inbound webhook, which authenticates by HMAC over the
-raw body instead of by session, and ``GET /health``, which reveals nothing but liveness. Everything
-else depends on :func:`revora.api.auth.authenticate` and therefore on a session row.
+unauthenticated. There are exactly three: the inbound webhook, which authenticates by HMAC
+over the raw body
+instead of by session; ``GET /health``, which reveals nothing but liveness; and the customer
+response surface mounted at ``/customer``, which authenticates by a per-case bearer token and is
+the only one of the three that serves a Recovery_Case field. Everything else depends on
+:func:`revora.api.auth.authenticate` and therefore on a session row.
+
+**The customer surface is a mounted sub-application, not a router**, because it is the one part of
+this process that carries CORS middleware and a set of response headers the dashboard must not
+have. See the mount below, and ``revora.api.routers.customer`` for why each control exists.
 
 **The schema revision is verified at startup and the process refuses to serve on a mismatch.** A
 worker or an API running against a schema it was not built for produces wrong numbers rather than
@@ -35,6 +42,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from revora.api import webhooks
 from revora.api.routers import cases, consent, experiments, health, metrics, sessions
+from revora.api.routers.customer import CUSTOMER_MOUNT, build_customer_app
 from revora.api.spa import mount_spa
 from revora.persistence.repositories.engine import get_engine
 from revora.persistence.repositories.schema import EXPECTED_REVISION, verify_schema_revision
@@ -80,6 +88,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(
     *,
     cors_origins: Sequence[str] | None = None,
+    customer_origins: Sequence[str] | None = None,
     verify_schema: bool = True,
     serve_dashboard: bool = True,
 ) -> FastAPI:
@@ -94,6 +103,15 @@ def create_app(
             installing one with an empty list.
         verify_schema: set ``False`` only in tests that construct the app without a database.
             Production must not, and the parameter is named so a grep for it finds every caller.
+        customer_origins: exact origins permitted to call the *customer* surface from a browser.
+            A second list rather than a widening of ``cors_origins``, because the two surfaces have
+            different trust levels: the dashboard is same-origin with this API by deployment and
+            installs no CORS middleware at all, while the customer page is cross-origin by
+            deployment and must. One list would mean widening the customer page's origins also
+            widened the dashboard's, which is precisely the coupling ADR-9 exists to prevent.
+            ``None`` reads ``REVORA_CUSTOMER_ORIGINS``; an empty sequence installs no CORS
+            middleware on the customer surface either, which is correct for a single-host
+            deployment.
         serve_dashboard: mount the built SPA when ``web/dist`` exists. Defaults on, because the
             same-origin deployment is the intended one. A test asserting on the API's 404 behaviour
             sets it ``False`` so a catch-all cannot answer in place of the real response — the
@@ -120,9 +138,31 @@ def create_app(
             allow_headers=["authorization", "content-type", "x-revora-dashboard-key"],
         )
 
-    # Unauthenticated, both by design and both documented as such.
+    # Unauthenticated, all three by design and all three documented as such.
     app.include_router(webhooks.router)
     app.include_router(health.router)
+
+    # The customer response surface: the third unauthenticated entry point, and the only one that
+    # serves a Recovery_Case field. Authenticated by a per-case bearer token whose whole design is
+    # a bound — one case, one tenant, one expiry, a submission cap — rather than by a session.
+    #
+    # **Mounted as a sub-application rather than included as a router, and that is the whole
+    # reason it is shaped differently from every other route above.** It needs two middlewares
+    # nothing else in this process may have: a CORS middleware, because the customer page is
+    # cross-origin by deployment while the dashboard is not, and a response-header middleware
+    # carrying `no-store`, `no-referrer` and a content-security policy. Starlette scopes
+    # middleware to an application, not to a path prefix, so adding either to `app` would apply it
+    # to the dashboard API and the webhook and would relax ADR-9's posture to serve one page.
+    #
+    # Mounted *before* `mount_spa`, on the same terms as every router above: the SPA registers
+    # routes under `/app` and the bare `/`, so it cannot shadow this, and the ordering is kept
+    # anyway so that no future catch-all can.
+    app.mount(
+        CUSTOMER_MOUNT,
+        build_customer_app(
+            origins=None if customer_origins is None else tuple(customer_origins)
+        ),
+    )
 
     # Session-authenticated. Every one of these depends on `authenticate`.
     app.include_router(sessions.router)

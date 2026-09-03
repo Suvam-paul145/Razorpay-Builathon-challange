@@ -19,6 +19,14 @@ state it is in, so a reader can tell "no policy decision" from "blocked by polic
 :func:`data_unavailable` means a figure was asked for and could not be computed in time, and it
 applies to that figure alone — the rest of a metrics response still returns, with its own
 timestamps. Substituting zero for either is not a display bug; it is a false financial statement.
+
+**A human-readable label is chosen here, never in the browser (R26.C14).** ``DO_NOTHING`` and
+``WAIT`` share one label because they are the same thing to a merchant — the case is being watched,
+not abandoned — while the three Terminal_States get three distinct labels because they are three
+different problems. A client that composed the shared label from two enum values would be one
+`if` away from rendering restraint as an ending, and it would be a second vocabulary that could
+disagree with this one. So the tables are here and the wire carries the label *and* the stored
+member, which is the rest of what R26.C14 asks for.
 """
 
 from __future__ import annotations
@@ -28,6 +36,8 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Final
 
+from revora.domain.actions import CandidateAction
+from revora.domain.enums import CaseState, HardStopReason
 from revora.domain.money import (
     INDIAN_GROUPING,
     WESTERN_GROUPING,
@@ -36,16 +46,22 @@ from revora.domain.money import (
 )
 
 __all__ = [
+    "CASE_STATE_LABELS",
     "CURRENCY_SYMBOLS",
     "DATA_UNAVAILABLE",
+    "HARD_STOP_LABELS",
     "NOT_YET_RECORDED",
     "PRESENT",
+    "SELECTED_ACTION_LABELS",
+    "WAITING_AND_WATCHING",
     "MoneyField",
+    "case_state_label",
     "data_unavailable",
     "grouping_for",
     "money",
     "not_yet_recorded",
     "rate",
+    "selected_action_label",
     "symbol_for",
 ]
 
@@ -180,3 +196,114 @@ def data_unavailable(figure: str, reason: str) -> dict[str, object]:
     are what make them usable.
     """
     return {"status": DATA_UNAVAILABLE, "figure": figure, "detail": reason}
+
+
+# ---------------------------------------------------------------------------
+# Labels (R26.C14, R30.C13). Chosen here, rendered verbatim, member kept alongside.
+# ---------------------------------------------------------------------------
+
+WAITING_AND_WATCHING: Final[str] = "Waiting and watching"
+"""The one label ``DO_NOTHING`` and ``WAIT`` share (R26.C14).
+
+They are two distinct recorded selections and R30.C12 keeps them distinct in storage — the *stored
+member* travels beside this label for exactly that reason. But to a merchant they are one situation:
+Revora looked, decided this customer is better left alone for now, and will look again. A separate
+label for each would invite the reader to guess at a difference that has no operational consequence,
+and the far worse alternative — the one this label exists to displace — is either of them reading as
+"nothing is happening"."""
+
+_HUMAN_LABEL_UNKNOWN: Final[str] = "Unlabelled"
+
+
+def _sentence(member: str) -> str:
+    """``PAYMENT_LINK`` -> ``Payment link``. The default when a member needs no special wording."""
+    lower = member.replace("_", " ").lower()
+    return lower[:1].upper() + lower[1:]
+
+
+SELECTED_ACTION_LABELS: Final[dict[str, str]] = dict(
+    MappingProxyType(
+        {
+            CandidateAction.DO_NOTHING.value: WAITING_AND_WATCHING,
+            CandidateAction.WAIT.value: WAITING_AND_WATCHING,
+            CandidateAction.RETRY.value: "Retry the charge",
+            CandidateAction.DELAYED_RETRY.value: "Retry the charge later",
+            CandidateAction.PAYMENT_LINK.value: "Send a payment link",
+            CandidateAction.CUSTOMER_MESSAGE.value: "Message the customer",
+            CandidateAction.PAYMENT_METHOD_UPDATE.value: "Ask for a different card",
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP.value: "Follow up on a promise to pay",
+            CandidateAction.HUMAN_ESCALATION.value: "Hand to a person",
+        }
+    )
+)
+"""Every ``CandidateAction``, labelled. Total on purpose, and a test asserts the totality.
+
+Total rather than defaulted so that adding a candidate action forces a decision about how it reads
+to a merchant, in the same commit. A ``.get`` with a fallback would let a new action ship under a
+machine-generated label nobody chose."""
+
+CASE_STATE_LABELS: Final[dict[str, str]] = dict(
+    MappingProxyType(
+        {
+            CaseState.NEW.value: "Just arrived",
+            CaseState.DETECTED.value: "Failure detected",
+            CaseState.DIAGNOSED.value: "Cause identified",
+            CaseState.DECISION_PENDING.value: "Deciding",
+            CaseState.POLICY_CHECK.value: "Decision recorded",
+            CaseState.ACTION_SCHEDULED.value: "Action authorised",
+            CaseState.EXECUTING.value: "Acting now",
+            CaseState.WAITING_FOR_OUTCOME.value: "Waiting for the payment",
+            CaseState.RECOVERED.value: "Recovered",
+            CaseState.STOPPED.value: "Stopped trying",
+            CaseState.BLOCKED.value: "Blocked by policy",
+            CaseState.EXPIRED.value: "Recovery window closed",
+            CaseState.ESCALATED.value: "With a person",
+            CaseState.FAILED.value: "Failed",
+        }
+    )
+)
+"""Every ``CaseState``, labelled, with the three R26.C14 names pairwise distinct.
+
+``STOPPED``, ``BLOCKED`` and ``EXPIRED`` are the same money and three different problems, so
+R26.C14 requires three distinct labels and a test asserts they stay distinct. ``POLICY_CHECK`` reads
+as *decision recorded* rather than as anything ending, which is R30.C13's half of the same claim:
+the state a case rests in when it chose restraint must not be worded as a conclusion."""
+
+
+HARD_STOP_LABELS: Final[dict[str, str]] = dict(
+    MappingProxyType(
+        {
+            HardStopReason.DISPUTES_THE_CHARGE.value: "Disputes the charge",
+            HardStopReason.NO_LONGER_WANTS_THE_ORDER.value: "No longer wants the order",
+        }
+    )
+)
+"""The two Hard_Stop_Reasons, labelled for the ``ESCALATED`` grouping (R21.C11).
+
+Two labels rather than one "objected to the charge", because the two need different work from
+different people: a dispute is a possible chargeback and a cancellation is a fulfilment and refund
+question. This grouping is somebody's queue, and the label is what they triage on.
+
+Phrased in the present tense and in the customer's voice — *disputes*, *no longer wants* — matching
+``TERMINAL_REASON_LABELS``' four customer-stated endings. Every other label on this screen describes
+something Revora concluded; these two describe something a person said, and a label reading
+"contact suppressed" would name the consequence rather than the statement."""
+
+_unlabelled_hard_stops = sorted(
+    reason.value for reason in HardStopReason if reason.value not in HARD_STOP_LABELS
+)
+if _unlabelled_hard_stops:  # pragma: no cover - import-time invariant
+    raise RuntimeError(
+        f"HARD_STOP_LABELS is missing {_unlabelled_hard_stops}; a Hard_Stop_Reason must not "
+        "reach a merchant under a machine-generated label nobody chose"
+    )
+
+
+def selected_action_label(action: str) -> str:
+    """The human label for a recorded Candidate_Action. ``DO_NOTHING`` and ``WAIT`` share one."""
+    return SELECTED_ACTION_LABELS.get(action, _sentence(action) or _HUMAN_LABEL_UNKNOWN)
+
+
+def case_state_label(state: str) -> str:
+    """The human label for a Recovery_Case state. Each Terminal_State gets its own."""
+    return CASE_STATE_LABELS.get(state, _sentence(state) or _HUMAN_LABEL_UNKNOWN)

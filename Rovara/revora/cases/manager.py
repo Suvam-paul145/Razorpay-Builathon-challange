@@ -8,8 +8,16 @@ call site. It does five things in one transaction (R16.C1):
 2. checks the caller's ``expected_version`` (optimistic concurrency, R16.C7);
 3. looks up ``(from, to)`` in the derived transition table in ``domain``;
 4. applies the transition's counter effects — and counters only ever increase;
-5. writes the new state, the bumped version, and one ``STATE_TRANSITION`` audit
+5. clears ``next_review_at`` when the case is leaving ``POLICY_CHECK`` (R30.C4);
+6. revokes every live Customer_Access_Token when the case enters a Terminal_State
+   (R18.C8), so a customer's link stops working the moment the case ends;
+7. writes the new state, the bumped version, and one ``STATE_TRANSITION`` audit
    record, with any follow-on job enqueued in the same transaction via ``on_success``.
+
+Steps 5 and 6 are both conditioned on a *state* rather than on a list of edges, and
+that is the same decision twice: a list of edges maintained here is a list a future
+edge escapes, and both escapes are silent — a stale review instant on a case that
+left ``POLICY_CHECK``, a live bearer token on a case that ended.
 
 A rejected transition changes nothing and records the rejection in a *separate*
 transaction, so the rejection is durable even when the caller's own work rolls back.
@@ -41,10 +49,11 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter
 from revora.domain.actions import CandidateAction, is_customer_visible
-from revora.domain.enums import CaseState, TerminalReason
+from revora.domain.enums import CaseState, TerminalReason, TokenRevocationReason
 from revora.domain.transitions import is_terminal, rule_for
 from revora.persistence.models import RecoveryCase
 from revora.persistence.repositories.cases import RecoveryCaseRepository
+from revora.persistence.repositories.customer import CustomerAccessTokenRepository
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.clock import now
 from revora.platform.logging import get_logger
@@ -322,10 +331,65 @@ def apply_locked_transition(
     moment = now()
     if effects.sets_last_outbound_at:
         case.last_outbound_at = moment
+    if current is CaseState.POLICY_CHECK:
+        # R30.C4: a case leaving POLICY_CHECK for *any* reason loses its review instant,
+        # in this transaction, atomically with the state change.
+        #
+        # The condition is on the source state, not on the edge. Every edge out of
+        # POLICY_CHECK has ``current is POLICY_CHECK`` by definition, so this covers the
+        # forward edge to ACTION_SCHEDULED, all five termination edges, and the REVIEW
+        # edge back to DECISION_PENDING — and it covers whatever edge leaves POLICY_CHECK
+        # next, without anybody remembering to come back here. A list of edges maintained
+        # here is a list a future edge escapes, and the escape would be silent: a stale
+        # ``next_review_at`` on a case no longer at POLICY_CHECK is invisible to the
+        # sweeper's index predicate right up until the case returns to POLICY_CHECK and
+        # gets reviewed on an instant computed for a decision cycle that has passed.
+        #
+        # Here rather than at the call sites for the same reason the counter effects are
+        # here: this is the one writer of ``recovery_case.state``, so it is the one place
+        # that cannot be bypassed.
+        case.next_review_at = None
     case.state = target_state.value
     case.version += 1
     if terminal_reason is not None and is_terminal(target_state):
         case.terminal_reason = terminal_reason.value
+
+    revoked_tokens = 0
+    if is_terminal(target_state):
+        # R18.C8, first half: a case entering a Terminal_State ends the customer's access to
+        # it, in this transaction, atomically with the state change. Served by
+        # ``ix_customer_access_token_merchant_id_case_id``; every later request carrying one
+        # of these tokens is refused with 410.
+        #
+        # The condition is on the *target* state rather than on a list of edges, for the same
+        # reason the ``next_review_at`` clear above is on the source state: a list maintained
+        # here is a list a future terminal edge escapes, and the escape would be silent — a
+        # live token on an ended case is a customer able to keep writing signals to a case
+        # nobody is working any more.
+        #
+        # Here rather than at the call sites because this is the one writer of
+        # ``recovery_case.state``, so it is the one place that cannot be bypassed. It calls
+        # the repository directly rather than ``revora.customer.tokens``: ``revora.customer``
+        # sits *above* ``revora.cases`` in the layering contract, precisely so that nothing
+        # on the unauthenticated customer surface is reachable from the decision path, and
+        # importing upward to save two lines would spend that guarantee. The suppression half
+        # of R18.C8, which runs above this layer, does go through
+        # ``revora.customer.tokens.revoke_tokens_for_case``.
+        revoked_tokens = CustomerAccessTokenRepository(session).revoke_for_case(
+            merchant_id,
+            case_id,
+            moment=moment,
+            reason=TokenRevocationReason.CASE_TERMINAL,
+        )
+
+    # The revoked count travels on the existing STATE_TRANSITION record rather than in a
+    # record of its own. A second record would be a second audited occurrence for one
+    # occurrence, and the transition is already the reason the tokens died — while a case with
+    # no tokens, which is most of them, would otherwise gain a record saying nothing happened.
+    # Absent when zero, so the field's presence means access was actually withdrawn.
+    decision: dict[str, object] = {"reason": reason}
+    if revoked_tokens:
+        decision["customer_tokens_revoked"] = revoked_tokens
 
     AuditWriter(session, **writer_kwargs).write_for_case(
         merchant_id,
@@ -336,7 +400,7 @@ def apply_locked_transition(
             previous_state=current.value,
             new_state=target_state.value,
             action=action.value if action is not None else None,
-            decision={"reason": reason},
+            decision=decision,
         ),
         correlation_id=correlation_id,
         occurred_at=moment,

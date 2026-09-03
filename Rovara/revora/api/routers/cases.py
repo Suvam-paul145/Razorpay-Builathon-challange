@@ -19,19 +19,35 @@ because a client that requests 500 wants as many as it can have and a 422 would 
 **Ownership is a control surface, not a label.** Assigning suspends every automated action through
 policy check 7, so the write goes through ``revora.cases.ownership`` — locked, audited, and in the
 layer that owns the case — rather than being an ``UPDATE`` here.
+
+**The timeline is read in one transaction and projected outside it.** :func:`get_case_timeline`
+opens a single ``tenant_transaction``, does every read inside it, reduces the rows to frozen views
+and then calls the projection with no session in scope. That is deliberate on both halves: one
+transaction means a concurrent write cannot change the input half way through a projection, and no
+session means the projection has nothing to write with — see :mod:`revora.timeline.stages`.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from datetime import timedelta
+from typing import Annotated, Final
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from revora.api.auth import AuthenticatedSession, deny_cross_tenant
 from revora.api.deps import TenantSession
-from revora.api.views import audit_document, case_detail, case_summary
+from revora.api.rendering import data_unavailable
+from revora.api.views import (
+    TimelineInputs,
+    audit_document,
+    case_detail,
+    case_summary,
+    timeline_inputs,
+)
 from revora.cases.ownership import (
     OwnershipOutcome,
     OwnershipResult,
@@ -43,10 +59,44 @@ from revora.persistence.models import RecoveryCase
 from revora.persistence.repositories.audit import AuditRecordRepository
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.session import tenant_transaction
+from revora.platform.clock import now
+from revora.platform.logging import get_logger
+from revora.timeline.stages import project
 
-__all__ = ["router"]
+__all__ = ["TIMELINE_QUERY_TIMEOUT", "router"]
+
+_logger = get_logger(__name__)
 
 router = APIRouter(tags=["cases"])
+
+TIMELINE_QUERY_TIMEOUT: Final[timedelta] = timedelta(seconds=3)
+"""How long the timeline's reads may take before R26.C10's data-unavailable path applies.
+
+Three seconds, an **[ASSUMPTION]** taken from the design and measured by nothing. Nine indexed
+per-case reads should be far inside it; the bound exists so that a case whose audit trail has grown
+past what a single request can read degrades into a named absence rather than into a page that
+hangs.
+
+**This is a module constant and every other bound in Revora is a configuration row, so the deviation
+needs its reason.** ``revora.platform.config`` states the rule plainly — a change to a bound must be
+recorded with an approving user, and a redeploy cannot name a person — and a bound belonging in that
+catalogue also needs a seed row, which means an Alembic revision. At the time this endpoint was
+written the configuration catalogue and the migration chain were both being edited by concurrent
+work on a different feature, and adding a ``ConfigurationBound`` with no accompanying seed migration
+does not degrade gracefully: ``default_configuration`` raises ``ConfigurationError`` on a bound with
+no row, so every request in the system would fail rather than this one being slow.
+
+So the constant is here, named exactly as the requirement names it, and moving it is a two-line
+change: a ``ConfigurationBound("TIMELINE_QUERY_TIMEOUT", ValueKind.DURATION_SECONDS, "3", …)`` in
+the catalogue, the matching ``timedelta`` field on ``Configuration``, and a seed row in the
+migration that seeds the rest. Until then this value cannot be changed without a deploy, which is a
+real limitation and is the whole of what the deviation costs.
+
+Enforced as a Postgres ``statement_timeout`` rather than as a Python deadline, for the reason
+``routers/metrics.py`` gives at length: a timer in the application leaves the query running on the
+server, so a dashboard that times out repeatedly piles work onto the database it is already
+struggling to read. A ``statement_timeout`` cancels the statement.
+"""
 
 
 class CaseListResponse(BaseModel):
@@ -89,7 +139,10 @@ def list_cases(
         )
         has_more = len(rows) > page_size
         page = rows[:page_size]
-        cases = [case_summary(session, current.merchant_id, case) for case in page]
+        cases = [
+            case_summary(session, current.merchant_id, case, config=current.config)
+            for case in page
+        ]
 
     return CaseListResponse(
         cases=cases,
@@ -160,6 +213,119 @@ def get_case_audit(
     if records is None:
         raise deny_cross_tenant(current, resource="recovery_case", requested_id=case_id)
     return AuditTrailResponse(case_id=str(case_id), records=records)
+
+
+class CaseTimelineResponse(BaseModel):
+    """The projected timeline, or a named absence — never a partial one dressed as whole.
+
+    ``available`` is the field a client branches on, and it exists so the branch is one boolean
+    rather than a shape test. When it is ``false``, ``timeline`` is ``null`` and ``unavailable``
+    carries the marker naming this case; when it is ``true``, the reverse. Both keys are always
+    present, so the response shape does not change with the outcome — a client whose rendering path
+    depended on that would have two paths for one screen and the rare one would be the broken one.
+    """
+
+    case_id: str
+    available: bool
+    timeline: dict[str, object] | None = None
+    unavailable: dict[str, object] | None = None
+
+
+@router.get(
+    "/cases/{case_id}/timeline",
+    response_model=CaseTimelineResponse,
+    responses={404: {"description": "No case with this id is visible to this session."}},
+)
+def get_case_timeline(
+    case_id: uuid.UUID,
+    current: TenantSession,
+) -> CaseTimelineResponse:
+    """One case's nine-stage timeline, projected from its Audit_Records (R26.C1 through C11).
+
+    **One transaction, every read, then the projection outside it.** The reads happen inside a
+    single ``tenant_transaction`` under ``TIMELINE_QUERY_TIMEOUT``, are reduced to frozen views
+    there, and the projection runs after the block has closed. So a concurrent write cannot change
+    the input part-way through — the input is a snapshot by the time anything looks at it — and the
+    projection is called with no session in scope, which is what makes "it performs no write" a
+    statement about what is expressible rather than about what it happens to do.
+
+    **``now()`` is read here and passed in.** The projection reads no clock; it takes the instant as
+    an argument and uses it for exactly one decision, whether the ``DECIDED`` stage is
+    ``IN_PROGRESS`` because a further review remains permitted (R30.C14). Reading the clock at this
+    boundary is what lets P56 assert that two projections of one unchanged input are equal — with
+    the same ``now``, they are, and a projection that called ``now()`` itself could not promise it.
+
+    **On timeout, a marker naming the case and no substituted anything** (R26.C10). Not a zero, not
+    an empty stage list dressed as nine ``UPCOMING`` stages, and not a status invented to fill a
+    row. Every stage successfully projected is still presented — which, because the reads are one
+    transaction, is either all nine or none, and the honest response when it is none says so.
+
+    The rejected alternative is worth recording, because it looks better and is not. Splitting the
+    reads into two transactions — the audit spine in one, the figures in another — would let the
+    nine stages project with their statuses intact when only the figure reads timed out, so more of
+    the page would survive. It is rejected because the second transaction reads a later snapshot:
+    the statuses would come from one instant and the figures from another, and a case that executed
+    in between would show a stage marked ``UPCOMING`` beside a figure that only exists because it
+    happened. A timeline that is internally inconsistent is worse than a timeline that is absent,
+    and R26.C7's identical-on-repeat claim would no longer hold either.
+
+    A gap in the audit sequence does **not** take this path. The timeline still renders, with the
+    banner :class:`~revora.timeline.stages.SequenceIntegrity` carries, and no stage is asserted
+    ``DONE`` on the strength of an absent record (R26.C11) — that guarantee is a property of the
+    completion rules rather than of this handler, which is why the gap is reported rather than
+    handled.
+    """
+    timeout_ms = int(TIMELINE_QUERY_TIMEOUT.total_seconds() * 1000)
+    moment = now()
+
+    try:
+        with tenant_transaction(current.merchant_id) as session:
+            session.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
+            case = RecoveryCaseRepository(session).get(current.merchant_id, case_id)
+            inputs: TimelineInputs | None = (
+                None
+                if case is None
+                else timeline_inputs(
+                    session, current.merchant_id, case, config=current.config
+                )
+            )
+    except (OperationalError, DBAPIError) as exc:
+        # Broad on the same terms as `routers/metrics.py`: a cancelled statement surfaces as a
+        # driver error whose class depends on the driver and on the phase it was cancelled in, and
+        # treating an unrecognised one as a hard failure would turn a slow read into a 500 on a page
+        # that is allowed to say "not available" instead.
+        _logger.warning(
+            "case timeline unavailable within TIMELINE_QUERY_TIMEOUT",
+            merchant_id=str(current.merchant_id),
+            case_id=str(case_id),
+            timeout_ms=timeout_ms,
+            error=type(exc).__name__,
+        )
+        return CaseTimelineResponse(
+            case_id=str(case_id),
+            available=False,
+            unavailable=data_unavailable(
+                f"case_timeline:{case_id}",
+                "the audit trail for this case could not be read within "
+                "TIMELINE_QUERY_TIMEOUT. No stage is shown, because none was projected — "
+                "nothing below has been substituted with a status or a zero.",
+            ),
+        )
+
+    if inputs is None:
+        raise deny_cross_tenant(current, resource="recovery_case", requested_id=case_id)
+
+    timeline = project(
+        inputs.records,
+        inputs.case,
+        inputs.signals,
+        inputs.intents,
+        inputs.figures,
+        moment,
+    )
+    return CaseTimelineResponse(
+        case_id=str(case_id), available=True, timeline=timeline.as_document()
+    )
 
 
 class OwnershipResponse(BaseModel):

@@ -35,7 +35,12 @@ ENV_WORKERS: Final[str] = "REVORA_API_WORKERS"
 ENV_CORS_ORIGINS: Final[str] = "REVORA_API_CORS_ORIGINS"
 """Comma-separated exact origins. Absent means no CORS middleware at all, which is the correct
 configuration when the SPA is served from the same origin — and stronger than installing the
-middleware with an empty list, because there is then nothing to misconfigure later."""
+middleware with an empty list, because there is then nothing to misconfigure later.
+
+Governs the **dashboard** API only. The customer surface reads ``REVORA_CUSTOMER_ORIGINS`` through
+``revora.api.routers.customer.customer_origins``, and the two lists are deliberately separate: the
+dashboard is same-origin with this API by deployment and the customer page is not, so one list
+would mean widening the second also widened the first."""
 
 _DEFAULT_HOST: Final[str] = "0.0.0.0"
 _DEFAULT_PORT: Final[int] = 8000
