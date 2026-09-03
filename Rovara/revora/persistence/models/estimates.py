@@ -128,13 +128,23 @@ class BaselineEstimate(RowBase):
 
 
 class CandidateEstimate(RowBase):
-    """One action's simulated intervention probability and its three costs.
+    """One action's simulated intervention probability and its four costs.
 
-    Costs are split three ways rather than summed because they answer different
-    questions and are configured separately: ``action_cost`` is what the action
-    costs to perform, ``risk_cost`` is the expected cost of it going wrong, and
-    ``customer_cost`` prices the intrusion on the customer. A single ``cost``
-    column would make the customer's interest invisible in the arithmetic.
+    Costs are split four ways rather than summed because they answer different
+    questions and are configured separately: ``financial_cost`` is what the merchant
+    pays to perform the action, ``communication_cost`` is what reaching the customer
+    costs, ``risk_cost`` is the expected cost of it going wrong, and ``customer_cost``
+    prices the intrusion on the customer. A single ``cost`` column would make the
+    customer's interest invisible in the arithmetic, and a blended action term would
+    make it impossible to say which cost caused an exclusion (R31.C1).
+
+    ``financial_cost_method`` and ``communication_cost_method`` are a label *per cost
+    figure*, which the row-level ``method`` cannot be: ``method`` records
+    ``weakest_method`` over the whole row, so it cannot say that the financial term is
+    a migrated non-measurement while the probability is real. A row marked
+    ``COST_SPLIT_NOT_MEASURED`` came from ``0008``'s split of a blended ``action_cost``,
+    and R31.C10 requires that marking be shown beside the figures so a migrated zero
+    does not read as a measured zero.
     """
 
     __tablename__ = "candidate_estimate"
@@ -147,9 +157,16 @@ class CandidateEstimate(RowBase):
     )
     action: Mapped[str] = mapped_column(Text, nullable=False)
     intervention_probability: Mapped[Decimal] = mapped_column(PROBABILITY, nullable=False)
-    action_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    financial_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    communication_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
     risk_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
     customer_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    financial_cost_method: Mapped[str | None] = mapped_column(Text)
+    communication_cost_method: Mapped[str | None] = mapped_column(Text)
+    """Nullable, and unlike ``execution_intent.effect_kind`` there is no server default
+    to backfill with: there is no correct value to guess. R31.C5's "leave neither label
+    unset" is an obligation on the estimator, not something the column can assert."""
+
     method: Mapped[str] = mapped_column(Text, nullable=False)
     provenance: Mapped[str] = mapped_column(Text, nullable=False, server_default="REAL")
     availability: Mapped[str] = mapped_column(Text, nullable=False)
@@ -163,7 +180,8 @@ class CandidateEstimate(RowBase):
             "intervention_probability >= 0 AND intervention_probability <= 1",
             name="intervention_probability_in_range",
         ),
-        nonnegative_money_check("action_cost"),
+        nonnegative_money_check("financial_cost"),
+        nonnegative_money_check("communication_cost"),
         nonnegative_money_check("risk_cost"),
         nonnegative_money_check("customer_cost"),
         # An unavailable action must say why. "Unavailable" with no reason is what
@@ -181,6 +199,8 @@ class CandidateEstimate(RowBase):
         ),
         enum_check("candidate_estimate", "action", CandidateAction),
         enum_check("candidate_estimate", "method", EstimationMethod),
+        enum_check("candidate_estimate", "financial_cost_method", EstimationMethod),
+        enum_check("candidate_estimate", "communication_cost_method", EstimationMethod),
         enum_check("candidate_estimate", "provenance", Provenance),
         enum_check("candidate_estimate", "availability", ActionAvailability),
         Index("ix_candidate_estimate_case_id", "case_id"),
@@ -260,9 +280,16 @@ class RecommendationCandidate(RowBase):
     action: Mapped[str] = mapped_column(Text, nullable=False)
     incremental_probability: Mapped[Decimal] = mapped_column(SIGNED_INCREMENT, nullable=False)
     expected_incremental_revenue: Mapped[int] = mapped_column(MONEY, nullable=False)
-    action_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    financial_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    communication_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
     risk_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
     customer_cost: Mapped[int] = mapped_column(MONEY, nullable=False, server_default="0")
+    financial_cost_method: Mapped[str | None] = mapped_column(Text)
+    communication_cost_method: Mapped[str | None] = mapped_column(Text)
+    """Carried on the ranked candidate as well as on the estimate it came from, because
+    the dashboard renders the comparison from these rows and R31.C10's marking has to
+    travel with the two figures it qualifies rather than be joined back for."""
+
     net_recovery_value: Mapped[int] = mapped_column(MONEY, nullable=False)
     excluded: Mapped[bool] = mapped_column(nullable=False, server_default="false")
     exclusion_reason: Mapped[str | None] = mapped_column(Text)
@@ -275,7 +302,8 @@ class RecommendationCandidate(RowBase):
             "incremental_probability >= -1 AND incremental_probability <= 1",
             name="incremental_probability_in_range",
         ),
-        nonnegative_money_check("action_cost"),
+        nonnegative_money_check("financial_cost"),
+        nonnegative_money_check("communication_cost"),
         nonnegative_money_check("risk_cost"),
         nonnegative_money_check("customer_cost"),
         # An exclusion always has a reason, and a reason implies an exclusion.
@@ -291,4 +319,6 @@ class RecommendationCandidate(RowBase):
         ),
         enum_check("recommendation_candidate", "action", CandidateAction),
         enum_check("recommendation_candidate", "exclusion_reason", ExclusionReason),
+        enum_check("recommendation_candidate", "financial_cost_method", EstimationMethod),
+        enum_check("recommendation_candidate", "communication_cost_method", EstimationMethod),
     )

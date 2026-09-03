@@ -32,6 +32,12 @@ from revora.persistence.models.base import (
     enum_backed_columns,
 )
 from revora.persistence.models.cases import Diagnosis, RecoveryCase
+from revora.persistence.models.customer import (
+    ContactSuppression,
+    CustomerAccessToken,
+    CustomerSignal,
+    PromiseToPay,
+)
 from revora.persistence.models.estimates import (
     BaselineEstimate,
     CandidateEstimate,
@@ -87,8 +93,11 @@ __all__ = [
     "Base",
     "BaselineEstimate",
     "CandidateEstimate",
+    "ContactSuppression",
     "CreatedAtMixin",
+    "CustomerAccessToken",
     "CustomerConsent",
+    "CustomerSignal",
     "DetectionVerdictRecord",
     "Diagnosis",
     "EnumBackedColumn",
@@ -112,6 +121,7 @@ __all__ = [
     "PolicyCheckResult",
     "PolicyDecision",
     "PolicyRuleSet",
+    "PromiseToPay",
     "Recommendation",
     "RecommendationCandidate",
     "RecoveryCase",
@@ -124,7 +134,14 @@ __all__ = [
 ]
 
 ALL_TABLES: tuple[str, ...] = tuple(sorted(Base.metadata.tables))
-"""Every table name, sorted. Thirty-three of them.
+"""Every table name, sorted. Thirty-seven of them.
+
+``customer_access_token``, ``customer_signal``, ``contact_suppression`` and
+``promise_to_pay`` arrived with migration ``0008`` and the customer response loop. They
+are the four tables a customer with no session can cause rows in, and each declares its
+own row-level security in that migration rather than inheriting it: ``0003`` derived its
+table list from the metadata as it stood then, so a table added later gets no policy
+from it.
 
 ``experiment_result`` was added in migration 0005 alongside
 ``memory_observation.diagnosis_method``. Both exist because the evidence phase needs to

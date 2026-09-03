@@ -292,6 +292,46 @@ class RecoveryCaseRepository(MerchantScopedRepository[RecoveryCase]):
         )
         return list(self.session.execute(statement).scalars())
 
+    def list_due_for_review(
+        self,
+        merchant_id: uuid.UUID,
+        *,
+        now: datetime,
+        max_decision_cycles: int,
+        limit: int,
+    ) -> Sequence[RecoveryCase]:
+        """Cases waiting at ``POLICY_CHECK`` whose review instant has been reached.
+
+        Served by ``ix_recovery_case_due_for_review``, the partial index that exists for
+        exactly this scan — a case waiting at ``POLICY_CHECK`` is a small minority of a
+        merchant's rows.
+
+        ``max_decision_cycles`` filters out cases already at the cap, so the sweep does
+        not enqueue work whose only outcome is a transition to ``STOPPED``. The handler
+        re-checks it under the row lock anyway, because this read releases before it
+        acts; the filter here is about not queueing pointless jobs, not about the bound.
+
+        ``now`` is passed in rather than read here so a test that moves the clock does
+        not have the repository consulting a different one. Ordered by ``next_review_at``
+        so the case that has been due longest goes first. No row lock: the sweep reads
+        the due set in one transaction, releases, then acts on each separately, and a
+        version conflict there is not an error — the case is revisited next pass.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                RecoveryCase.state == CaseState.POLICY_CHECK.value,
+                RecoveryCase.next_review_at.is_not(None),
+                RecoveryCase.next_review_at <= now,
+                RecoveryCase.decision_cycle_count < max_decision_cycles,
+            )
+            .order_by(RecoveryCase.next_review_at)
+            .limit(limit)
+        )
+        return list(self.session.execute(statement).scalars())
+
     def list_by_state(
         self,
         merchant_id: uuid.UUID,

@@ -1,10 +1,17 @@
 """Repositories, sessions, locks and the startup schema check.
 
 The organizing rule of this package: **every read, list, query and export function
-takes ``merchant_id`` as a required argument.** There is one documented exception,
-:func:`~revora.persistence.repositories.jobs.claimable_merchant_ids`, which returns
-merchant ids and no tenant data, and exists because a worker must choose a tenant
-before it can bind a transaction to one.
+takes ``merchant_id`` as a required argument.** The documented exceptions are the
+functions that run *before* a tenant is known and return merchant identity and
+nothing else:
+:func:`~revora.persistence.repositories.jobs.claimable_merchant_ids`, because a
+worker must choose a tenant before it can bind a transaction to one;
+:func:`~revora.persistence.repositories.tenancy.schedulable_merchants`, because the
+ticker must enumerate tenants to create work for one — and a tenant with an empty
+queue is precisely the one whose sweeps have not been enqueued yet, so the worker's
+question cannot answer the ticker's; and
+:func:`~revora.persistence.repositories.tenancy.merchant_by_slug`, because an inbound
+webhook arrives carrying a slug and no session.
 
 Row-level security backs this up, but it is the backstop rather than the control.
 The mistake that actually happens is a forgotten ``WHERE`` in application code, and
@@ -26,6 +33,12 @@ from revora.persistence.repositories.cases import (
 from revora.persistence.repositories.config import (
     ConfigurationRepository,
     load_configuration,
+)
+from revora.persistence.repositories.customer import (
+    ContactSuppressionRepository,
+    CustomerAccessTokenRepository,
+    CustomerSignalRepository,
+    PromiseToPayRepository,
 )
 from revora.persistence.repositories.engine import (
     DatabaseNotConfiguredError,
@@ -75,6 +88,9 @@ __all__ = [
     "TENANT_SETTING",
     "AuditRecordRepository",
     "ConfigurationRepository",
+    "ContactSuppressionRepository",
+    "CustomerAccessTokenRepository",
+    "CustomerSignalRepository",
     "DatabaseNotConfiguredError",
     "ExecutionIntentRepository",
     "JobAttemptRepository",
@@ -83,6 +99,7 @@ __all__ = [
     "MerchantSessionRepository",
     "MerchantUserRepository",
     "PaymentStateReadRepository",
+    "PromiseToPayRepository",
     "RecoveryCaseRepository",
     "RecoveryOutcomeRepository",
     "SchemaRevisionMismatchError",

@@ -122,6 +122,38 @@ class PolicyDecisionRepository(MerchantScopedRepository[PolicyDecision]):
         )
         return self.session.execute(statement).scalars().first()
 
+    def list_approved_unconsumed(
+        self, merchant_id: uuid.UUID, case_id: uuid.UUID
+    ) -> Sequence[PolicyDecision]:
+        """Every ``APPROVED`` decision on a case that has not authorized an effect yet.
+
+        The plural of :meth:`latest_approved_unconsumed`, and the two are not
+        interchangeable. Execution wants *the* approval to act on, so it takes the
+        newest. R21.C6 wants *every* action a Contact_Suppression cancels, one audit
+        record each, so it needs the whole set — and the set can hold more than one,
+        because a case that was approved, left unexecuted and later re-decided has an
+        approval per cycle that nothing consumed.
+
+        ``consumed_by_intent_id IS NULL`` is exactly R21.C6's "for which no
+        execution-intent record exists", and ``one_intent_per_decision`` makes that
+        correspondence one-to-one rather than approximate — so a count of these rows is a
+        count of cancelled actions and not an estimate of one.
+
+        Oldest first, unlike the singular read. These are written to the audit log in
+        order, and a record sequence that ran newest-first would read as though the
+        cancellations happened backwards.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                PolicyDecision.case_id == case_id,
+                PolicyDecision.verdict == PolicyVerdict.APPROVED.value,
+                PolicyDecision.consumed_by_intent_id.is_(None),
+            )
+            .order_by(PolicyDecision.evaluated_at)
+        )
+        return list(self.session.execute(statement).scalars())
+
     def check_results_for(
         self, merchant_id: uuid.UUID, policy_decision_id: uuid.UUID
     ) -> Sequence[PolicyCheckResult]:

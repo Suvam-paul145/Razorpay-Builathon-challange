@@ -44,16 +44,34 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from revora.domain.actions import CandidateAction
-from revora.domain.enums import CaseState, IntentState, OutcomeClass
+from revora.domain.enums import CaseState, ExecutionEffectKind, IntentState, OutcomeClass
 from revora.persistence.models.base import MONEY, TIMESTAMPTZ, RowBase, enum_check
 
-__all__ = ["UNRESOLVED_INTENT_STATES_SQL", "ExecutionIntent", "PaymentStateRead", "RecoveryOutcome"]
+__all__ = [
+    "RECONCILABLE_EFFECT_KIND_SQL",
+    "UNRESOLVED_INTENT_STATES_SQL",
+    "ExecutionIntent",
+    "PaymentStateRead",
+    "RecoveryOutcome",
+]
 
 UNRESOLVED_INTENT_STATES_SQL: str = ", ".join(
     f"'{state.value}'" for state in (IntentState.ATTEMPTED, IntentState.UNCERTAIN)
 )
 """The two states the reconciliation sweeper looks for. Rendered from the enum so
 the index predicate cannot drift from the state names."""
+
+RECONCILABLE_EFFECT_KIND_SQL: str = (
+    f"effect_kind = '{ExecutionEffectKind.PAYMENT_LINK_CREATE.value}'"
+)
+"""The one effect a provider read can answer a question about.
+
+A resend response carries only a success boolean and no notification identifier, so a
+resend is re-readable by nothing and an ``UNCERTAIN`` resend intent is *permanently*
+unresolvable rather than slow to resolve. This clause in
+``ix_execution_intent_unresolved`` is what keeps such a row out of the set the
+reconciliation sweep scans — absent from the read, not skipped by a branch someone can
+delete. Rendered from the enum for the same reason the state list is."""
 
 
 class ExecutionIntent(RowBase):
@@ -98,6 +116,19 @@ class ExecutionIntent(RowBase):
     """Whether this intent's attempt was counted against the case bounds. Recorded
     so a reconciliation that runs twice cannot count it twice."""
 
+    effect_kind: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=ExecutionEffectKind.PAYMENT_LINK_CREATE.value,
+    )
+    """Which external effect was attempted, and the reason the index below is narrow.
+
+    The server default stays on the column after ``0008``'s backfill. It is what made
+    every pre-``0008`` row correct — every intent written before it was a link creation
+    — and dropping it afterwards would show as a permanent autogenerate diff, which is
+    how genuine drift stops being visible among the noise. The resend path passes this
+    column explicitly rather than relying on the default being wrong for it."""
+
     __table_args__ = (
         # THE exactly-once constraint (P3). A second intent for one idempotency key
         # cannot be committed, so a second external effect cannot happen.
@@ -116,14 +147,24 @@ class ExecutionIntent(RowBase):
         ),
         enum_check("execution_intent", "state", IntentState),
         enum_check("execution_intent", "action", CandidateAction),
+        enum_check("execution_intent", "effect_kind", ExecutionEffectKind),
         # Reason: the reconciliation sweeper claims unresolved intents oldest
         # first. Partial, because the resolved ones are the overwhelming majority
         # and indexing them would make this scan read them.
+        #
+        # The effect-kind clause is the mechanism, not an optimization. Both
+        # reconcile_intents and promote_stale_intents read their candidates through
+        # this one predicate, so narrowing it is what removes resend rows from the set
+        # being scanned — and a future reader who drops the filter from the query gets
+        # a sequential scan and a failing performance assertion before they get a
+        # duplicate SMS.
         Index(
             "ix_execution_intent_unresolved",
             "state",
             "attempt_started_at",
-            postgresql_where=text(f"state IN ({UNRESOLVED_INTENT_STATES_SQL})"),
+            postgresql_where=text(
+                f"state IN ({UNRESOLVED_INTENT_STATES_SQL}) AND {RECONCILABLE_EFFECT_KIND_SQL}"
+            ),
         ),
         Index("ix_execution_intent_case_id_attempt_ordinal", "case_id", "attempt_ordinal"),
     )

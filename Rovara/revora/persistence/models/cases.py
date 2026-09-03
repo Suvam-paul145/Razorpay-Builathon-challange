@@ -134,6 +134,17 @@ class RecoveryCase(RowBase):
 
     audit_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
+    next_review_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    """When a case waiting at ``POLICY_CHECK`` should be looked at again (R30.C3).
+
+    ``NULL`` is the normal state: a case has a review instant only while it has chosen
+    not to act and is waiting. Every edge out of ``POLICY_CHECK`` clears it in the same
+    transaction as the state change, which is why the sweeper's index predicate can
+    rely on the state and the column together.
+
+    Bounded by ``window_end_at`` at the schema level rather than only in the writer —
+    see ``review_within_window`` below."""
+
     human_owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("merchant_user.id", ondelete="RESTRICT")
     )
@@ -184,6 +195,14 @@ class RecoveryCase(RowBase):
             "AND decision_cycle_count >= 0 AND audit_seq >= 0",
             name="counters_nonnegative",
         ),
+        # The second clause of P63 as a database constraint: no persisted review
+        # instant can fall outside the recovery window, whatever the clamp arithmetic
+        # in ``handle_policy`` computes. Expressible as a table CHECK because both
+        # columns are on the same row and R2.C5 means ``window_end_at`` never moves.
+        CheckConstraint(
+            "next_review_at IS NULL OR next_review_at <= window_end_at",
+            name="review_within_window",
+        ),
         enum_check("recovery_case", "state", CaseState),
         enum_check("recovery_case", "terminal_reason", TerminalReason),
         enum_check("recovery_case", "provenance", Provenance),
@@ -196,6 +215,19 @@ class RecoveryCase(RowBase):
         Index("ix_recovery_case_merchant_id_detected_at", "merchant_id", "detected_at"),
         # Reason: the opt-out sweep and the cross-case consent join.
         Index("ix_recovery_case_merchant_id_customer_key", "merchant_id", "customer_key"),
+        # Reason: the Review_Sweeper's scan for a reached review instant (R30.C5).
+        # Partial on both conjuncts, because a case waiting at POLICY_CHECK is a small
+        # minority of a merchant's rows and a full index would make the sweep read the
+        # rest. The state literal comes from CaseState so a rename cannot leave the
+        # predicate matching nothing.
+        Index(
+            "ix_recovery_case_due_for_review",
+            "merchant_id",
+            "next_review_at",
+            postgresql_where=text(
+                f"state = '{CaseState.POLICY_CHECK.value}' AND next_review_at IS NOT NULL"
+            ),
+        ),
     )
 
 

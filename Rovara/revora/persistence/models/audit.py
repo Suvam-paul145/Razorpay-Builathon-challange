@@ -48,7 +48,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from revora.domain.actions import CandidateAction
-from revora.domain.enums import CaseState
+from revora.domain.enums import CaseState, ReasoningCallKind
 from revora.persistence.models.base import (
     AUDIT_TIMESTAMP,
     CONFIDENCE,
@@ -143,6 +143,18 @@ class AiInvocation(RowBase):
     case_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("recovery_case.id", ondelete="RESTRICT")
     )
+    call_kind: Mapped[str | None] = mapped_column(Text)
+    """Which of the three sanctioned advisory calls this was (R27.C12).
+
+    Nullable, and that is a statement rather than a convenience: a row written before
+    the Reasoning_Adapter existed genuinely does not know its kind, and backfilling one
+    would assert a fact nobody recorded. ``enum_check`` admits ``NULL`` by construction
+    and refuses a fourth kind.
+
+    A separate column rather than encoding the kind into ``prompt_contract_id``, because
+    both are queried independently: "how many ``CAUSE_HYPOTHESIS`` calls fell back this
+    week" should be a ``WHERE``, not a ``LIKE`` over a version string."""
+
     prompt_contract_id: Mapped[str] = mapped_column(Text, nullable=False)
     """Which versioned, code-declared contract governed the call. The contract's
     allow-list is what stops a field reaching the model that should not."""
@@ -164,6 +176,7 @@ class AiInvocation(RowBase):
 
     __table_args__ = (
         CheckConstraint("latency_ms IS NULL OR latency_ms >= 0", name="latency_nonnegative"),
+        enum_check("ai_invocation", "call_kind", ReasoningCallKind),
         Index("ix_ai_invocation_case_id", "case_id"),
         # Reason: the AI reliability report counts invocations and fallbacks per
         # merchant over a window.
