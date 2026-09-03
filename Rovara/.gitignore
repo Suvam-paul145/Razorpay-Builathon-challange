@@ -12,6 +12,9 @@ venv/
 htmlcov/
 .coverage
 dist/
+# The customer response page's build output. Named explicitly because `dist/` above matches only
+# directories called exactly `dist`, so the second Vite entry's artifact would otherwise be committed.
+dist-customer/
 build/
 node_modules/
 docs/provider-findings.local.md

@@ -1,10 +1,16 @@
 # Local development only. Not a deployment topology.
 #
-# Brings up a Postgres for local work and both process roles from the one image, so
-# a developer can see the API and the worker running against the same database the
-# way production will. The automated test suite does NOT use this — the pg test tier
-# spins up its own throwaway Postgres via testcontainers, so tests stay isolated
-# from whatever state a dev session left behind.
+# Brings up a Postgres for local work and all three process roles from the one image,
+# so a developer can see the API, the worker and the ticker running against the same
+# database the way production will. The automated test suite does NOT use this — the pg
+# test tier spins up its own throwaway Postgres via testcontainers, so tests stay
+# isolated from whatever state a dev session left behind.
+#
+# Still not a topology, and the ticker is the service that makes saying so worthwhile:
+# production runs one API replica per unit of traffic, several workers, and exactly one
+# ticker. A compose file has no way to express "exactly one" and no reason to try, so
+# what is honest here is that the roles are all *present* and reachable from one
+# database — not that this is how many of each to run.
 
 services:
   db:
@@ -49,6 +55,29 @@ services:
     build: .
     environment:
       REVORA_ROLE: worker
+      REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_local_dev@db:5432/revora
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  ticker:
+    # The schedule. Without it the worker has nothing periodic to claim: every sweep job
+    # is produced here, so a compose stack running api + worker alone would never expire a
+    # case, reconcile an intent, re-read payment state, backfill a detection gap, redact
+    # customer data, or review a case that chose restraint. Nothing would look broken.
+    #
+    # One replica, deliberately. Running two is safe — every enqueue is dedupe-keyed by
+    # sweep kind and interval bucket, so the second collides and does nothing — but the
+    # reason this is a separate role at all is to give the schedule one owner and one log
+    # stream to read "did the tick happen" from.
+    #
+    # Same image and the same env_file as the worker: the role is the only difference, and
+    # keeping the dependency set identical is the whole argument for one image.
+    build: .
+    environment:
+      REVORA_ROLE: ticker
       REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_local_dev@db:5432/revora
     env_file:
       - .env

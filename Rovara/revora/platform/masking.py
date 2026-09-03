@@ -94,6 +94,16 @@ DEFAULT_FIELD_KINDS: Final[Mapping[str, FieldKind]] = {
     "payment_link_url": FieldKind.PROVIDER_SHORT_URL,
     "provider_short_url": FieldKind.PROVIDER_SHORT_URL,
     "short_url": FieldKind.PROVIDER_SHORT_URL,
+    # Bearer capability — the customer's token. Note what is *absent*: ``token_id``.
+    # The handle is separately random and discloses nothing about the secret, and it is
+    # the form R18.C11 requires every log line and audit field to carry, so masking it
+    # would remove the only identifier that makes a rejected request traceable.
+    "access_token": FieldKind.CUSTOMER_ACCESS_TOKEN,
+    "bearer_token": FieldKind.CUSTOMER_ACCESS_TOKEN,
+    "customer_access_token": FieldKind.CUSTOMER_ACCESS_TOKEN,
+    "presented_token": FieldKind.CUSTOMER_ACCESS_TOKEN,
+    "token_secret": FieldKind.CUSTOMER_ACCESS_TOKEN,
+    "wire_token": FieldKind.CUSTOMER_ACCESS_TOKEN,
 }
 """Field names that are sensitive wherever they appear.
 
@@ -105,7 +115,15 @@ leak are the ones nobody remembered to declare. A caller that knows better passe
 #: Kinds that reveal nothing at all. A payment link's trailing characters are part
 #: of the capability, and no operator needs them to debug, so the disclosure window
 #: is zero rather than four.
-_ZERO_DISCLOSURE_KINDS: Final[frozenset[FieldKind]] = frozenset({FieldKind.PROVIDER_SHORT_URL})
+#:
+#: ``CUSTOMER_ACCESS_TOKEN`` joins it for the same reason and one more: the trailing
+#: characters of ``rvc_<token_id>.<secret>`` are the *end of the secret*, so a four-character
+#: window would disclose four characters of the one value that must have no reversible
+#: representation anywhere. An operator needs the ``token_id`` to trace a request, and the
+#: ``token_id`` travels as its own unmasked field.
+_ZERO_DISCLOSURE_KINDS: Final[frozenset[FieldKind]] = frozenset(
+    {FieldKind.PROVIDER_SHORT_URL, FieldKind.CUSTOMER_ACCESS_TOKEN}
+)
 
 
 def sensitive(kind: FieldKind) -> dict[str, FieldKind]:

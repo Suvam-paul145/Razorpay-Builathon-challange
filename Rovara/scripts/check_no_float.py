@@ -36,6 +36,9 @@ CURRENCY_BEARING: tuple[str, ...] = (
     "revora/memory",
     "revora/synthetic",
     "revora/api",
+    "revora/customer",
+    "revora/reasoning",
+    "revora/timeline",
 )
 """Paths where a float is a bug rather than a style question.
 
@@ -82,6 +85,34 @@ to produce the string a merchant reads, and that is exactly the operation somebo
 the rendered string agree with the stored integer beside it; a float would let the two
 disagree in the last digit, on the surface where the disagreement is most visible and
 least explicable.
+
+``customer`` joined with the customer response loop, and it is listed *before* it holds a
+currency figure rather than after. The customer page presents an amount, formatted on the
+server from the stored integer, to the one person who is being asked to pay it — so this is
+the surface where a rounding error is read by the payer rather than by an operator. A guard
+added once the projection exists is a guard added after the commit that could have needed it.
+
+``reasoning`` joined with the customer response loop too, and the figure it protects is not a
+currency one — it is ``confidence``. ``revora/reasoning/schemas.py`` already parses every
+response body with ``parse_float=Decimal`` precisely so a model's confidence never passes
+through binary form, and the reason that matters is comparison: a confidence compared against
+``AI_CONFIDENCE_CEILING`` and against ``DIAGNOSIS_CONFIDENCE_FLOOR`` must give the same answer
+twice, and a value that went through binary representation on the way in cannot promise that.
+The module says so in prose; this entry is what keeps the promise after somebody "simplifies"
+the parse.
+
+``timeline`` joined in task 50, when the package it names came into existence — and the two
+halves of that sentence are the entry's whole justification. A path naming a missing directory
+is silently skipped by :func:`_iter_target_files`, so listing ``revora/timeline`` while it was
+empty would have grown this list without growing the guard, and the file count below would not
+have moved to say so. It moved from 62 to 65 when the package landed, which is the only
+evidence available that the addition took effect. The figure it protects is a currency one at
+one remove: the timeline presents no amount it computed, only the pre-formatted string the
+server's renderer produced — and *that* is the reason a float here would be hard to notice.
+A helper that took the minor units and divided them to build its own sentence would produce a
+figure disagreeing with the one beside it on the same screen, and every other guard in the
+system would stay green, because the disagreement would be between two presentations rather
+than between a total and its rows.
 """
 
 ALLOWED_SUBSTRINGS: tuple[str, ...] = (

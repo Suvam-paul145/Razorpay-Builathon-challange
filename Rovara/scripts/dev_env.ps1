@@ -9,6 +9,28 @@
 # worker end up pointed at different databases — which presents as "cases open but never
 # progress", with nothing in either log saying why.
 
+# Refuse to run in a child process, loudly.
+#
+# `powershell -File dev_env.ps1` and `.\scripts\dev_env.ps1` both do the work somewhere the
+# calling shell cannot see, so the variables load, the success message prints, and the parent
+# shell gets nothing. That failure is invisible: the next command fails with
+# "REVORA_DATABASE_URL is not set", which reads like a problem with .env rather than with how
+# this script was invoked. When dot-sourced, InvocationName is exactly '.'.
+if ($MyInvocation.InvocationName -ne '.') {
+    Write-Host ''
+    Write-Host 'This script must be DOT-SOURCED, not run.' -ForegroundColor Red
+    Write-Host 'A child process cannot set its parent shell''s environment, so running it loads'
+    Write-Host 'every variable into a process that then exits. Nothing reaches you.'
+    Write-Host ''
+    Write-Host '  correct:  . .\scripts\dev_env.ps1' -ForegroundColor Green
+    Write-Host '            ^ the leading dot and the space are the whole difference'
+    Write-Host ''
+    Write-Host '  wrong:    .\scripts\dev_env.ps1'
+    Write-Host '  wrong:    powershell -File .\scripts\dev_env.ps1'
+    Write-Host ''
+    exit 1
+}
+
 $envFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env'
 if (-not (Test-Path $envFile)) {
     Write-Error "no .env at $envFile"
@@ -44,6 +66,7 @@ $missing = @(
     'REVORA_DATABASE_URL',
     'REVORA_PAYLOAD_ENCRYPTION_KEYS',
     'REVORA_CUSTOMER_KEY_SECRET',
+    'REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS',
     'REVORA_SESSION_TOKEN_SECRET',
     'REVORA_RAZORPAY_KEY_ID',
     'REVORA_RAZORPAY_KEY_SECRET'

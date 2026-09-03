@@ -29,6 +29,12 @@ Three of the values differ from the requirements table, and deliberately:
   fraud-or-risk diagnosis derives from membership in this set, so extending it does
   not require a release.
 
+Two of the bounds are cost priors rather than limits — ``PAYMENT_LINK_FINANCIAL_COST``
+and ``MESSAGE_COMMUNICATION_COST``, which R31.C11 requires to be versioned rows on the
+same terms as everything else here. They live in this catalogue and
+``revora.estimation.candidates`` reads their defaults back out through
+:func:`money_default`, so the two numbers are written down exactly once.
+
 The accessor is a frozen dataclass with one typed attribute per bound, so a caller
 writes ``config.MAX_RECOVERY_ATTEMPTS`` and gets an ``int``. A string-keyed lookup
 would type-check everywhere and fail at the one call site that misspelt a key.
@@ -37,7 +43,7 @@ would type-check everywhere and fail at the one call site that misspelt a key.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
@@ -49,13 +55,20 @@ from revora.domain.money import Minor
 
 __all__ = [
     "CATALOGUE",
+    "COST_SPLIT_BOUND_KEYS",
+    "CUSTOMER_STATED_CAUSE_BOUND_KEYS",
+    "CUSTOMER_SURFACE_BOUND_KEYS",
+    "CUSTOMER_TOKEN_BOUND_KEYS",
     "DEFAULTS_MERCHANT_ID",
     "DEFAULT_CONFIG_VERSION",
+    "REVIEW_LOOP_BOUND_KEYS",
+    "SWEEP_INTERVAL_BOUND_KEYS",
     "Configuration",
     "ConfigurationBound",
     "ConfigurationError",
     "ValueKind",
     "default_configuration",
+    "money_default",
     "parse_value",
     "seed_rows",
 ]
@@ -256,6 +269,103 @@ _BOUNDS: tuple[ConfigurationBound, ...] = (
         "OUTCOME_WAIT_TIMEOUT", ValueKind.DURATION_SECONDS, "259200",
         "Maximum wait for an outcome after an executed action (72 hours)",
     ),
+    # --- The review loop of R30. These two are the only new bounds it needs, and they
+    # are bounds rather than constants for the ordinary reason: how long a merchant is
+    # willing to leave a case waiting before looking at it again is that merchant's
+    # judgement about their own customers, and R15.C6 means changing it is a recorded
+    # decision with a person's name on it. [ASSUMPTION] defaults on both.
+    ConfigurationBound(
+        "WAIT_REVIEW_INTERVAL", ValueKind.DURATION_SECONDS, "43200",
+        "Interval after a null-action selection before the case is reviewed (12 hours)",
+    ),
+    ConfigurationBound(
+        "REVIEW_SWEEP_INTERVAL", ValueKind.DURATION_SECONDS, "300",
+        "Maximum interval between review sweeps over cases whose review is due (5 minutes)",
+    ),
+    # --- The Customer_Access_Token of R18. Both are bounds rather than constants for the
+    # ordinary reason, and both are the kind of bound a merchant has an opinion about: how
+    # long a payment link's companion page stays reachable, and how many times one customer
+    # may say something about one payment. Neither is a check constraint —
+    # ``CUSTOMER_TOKEN_MAX_SUBMISSIONS`` deliberately so, because encoding today's 5 in the
+    # schema would make raising it a migration; the durable enforcement is the comparison
+    # inside ``increment_accepted_submissions``' own ``UPDATE`` statement.
+    # [ASSUMPTION] defaults on both.
+    ConfigurationBound(
+        "CUSTOMER_TOKEN_LIFETIME", ValueKind.DURATION_SECONDS, "259200",
+        "Maximum age of a customer access token before it stops being served (72 hours)",
+        note=(
+            "[ASSUMPTION] 72 hours, and deliberately shorter than RECOVERY_WINDOW_DURATION. "
+            "R18.C2 makes the expiry the *earlier* of this and the case's window end, so a "
+            "value at or above the window duration would make this bound inert and leave the "
+            "window as the only thing bounding a bearer credential's life."
+        ),
+    ),
+    ConfigurationBound(
+        "CUSTOMER_TOKEN_MAX_SUBMISSIONS", ValueKind.INTEGER, "5",
+        "Accepted customer signal writes permitted on one customer access token",
+    ),
+    # --- The public customer surface of R19 and R29. Four bounds, and the pairing is
+    # the thing to read: the two *rate* limits guard the read path and are enforced by a
+    # process-local fixed-window counter, so they are coarse by construction (see
+    # ``revora.platform.ratelimit``); the two *cap* bounds guard the write path and are
+    # enforced durably, one inside the conditional UPDATE that increments the token's
+    # counter and one against a count under that token's row lock. Putting them in one
+    # block invites the comparison, because treating a rate limit as a correctness bound is
+    # the mistake this arrangement exists to prevent.
+    # [ASSUMPTION] defaults on all four.
+    ConfigurationBound(
+        "CUSTOMER_PAGE_RATE_LIMIT", ValueKind.INTEGER, "30",
+        "Accepted customer response page requests per minute per customer access token",
+        note=(
+            "[ASSUMPTION] 30 per minute per token. A coarse flood guard, not a quota: the "
+            "counter is per process, so two API replicas admit twice this. The durable bound "
+            "on the write path is CUSTOMER_TOKEN_MAX_SUBMISSIONS, which no replica count can "
+            "exceed."
+        ),
+    ),
+    ConfigurationBound(
+        "CUSTOMER_PAGE_SOURCE_RATE_LIMIT", ValueKind.INTEGER, "120",
+        "Accepted customer response page requests per minute per source identifier",
+        note=(
+            "[ASSUMPTION] 120 per minute per source, four times the per-token rate. Higher "
+            "because a source identifier is shared: everyone behind one NAT presents the same "
+            "one, so a per-source rate equal to the per-token rate would refuse the second "
+            "customer on a mobile network rather than the attacker."
+        ),
+    ),
+    ConfigurationBound(
+        "MAX_CUSTOMER_SIGNALS_PER_CASE", ValueKind.INTEGER, "5",
+        "Customer signals recorded per recovery case",
+    ),
+    ConfigurationBound(
+        "DELAY_NOTE_MAX_LENGTH", ValueKind.INTEGER, "500",
+        "Retained length of a delay-reason note, in characters",
+        note=(
+            "[ASSUMPTION] 500 characters, and the same number is a CHECK constraint on "
+            "customer_signal.delay_reason_note. The column is the backstop and this row is the "
+            "authority: lowering the bound takes effect on the next write, while raising it "
+            "above the column's 500 cannot, so the writer truncates to the smaller of the two "
+            "rather than attempting a row the schema would refuse."
+        ),
+    ),
+    # --- The one bound the Delay_Reason cause refinement of R20.C4 introduces. It sits
+    # here rather than beside DIAGNOSIS_CONFIDENCE_FLOOR because it is a customer-surface
+    # figure, and the pairing with the four above is the thing to read: those four bound
+    # what a customer may submit, this one bounds how much weight what they submitted
+    # carries once it reaches a decision. [ASSUMPTION] default.
+    ConfigurationBound(
+        "CUSTOMER_STATED_CAUSE_CONFIDENCE", ValueKind.DECIMAL, "0.90",
+        "Confidence recorded on a diagnosis derived from a customer-stated delay reason",
+        note=(
+            "[ASSUMPTION] 0.90, and nothing has measured whether a stated reason "
+            "correlates with the recovery outcome at all. Below 1.0 because a customer's "
+            "account of their own finances is not the provider's own error field, and "
+            "1.0 is reserved for DETERMINISTIC causes read off the provider (R3.C10). "
+            "At or above DIAGNOSIS_CONFIDENCE_FLOOR because a value below it would be "
+            "substituted to UNKNOWN under R3.C8 and the whole capture would be inert "
+            "(R20.C7)."
+        ),
+    ),
     # --- Policy and execution. [ASSUMPTION] defaults.
     ConfigurationBound(
         "POLICY_DECISION_VALIDITY", ValueKind.DURATION_SECONDS, "900",
@@ -307,6 +417,25 @@ _BOUNDS: tuple[ConfigurationBound, ...] = (
     ConfigurationBound(
         "MAX_PAYMENT_STATE_READ_ATTEMPTS", ValueKind.INTEGER, "5",
         "Read attempts before PAYMENT_STATE_UNVERIFIABLE escalation",
+    ),
+    # --- Cost priors for the four-term cost decomposition (R31.C11). These two are
+    # bounds for the same reason every other value here is: a provider fee and a
+    # per-message delivery cost are numbers a merchant renegotiates, and a
+    # renegotiation is a recorded decision with a person's name on it, not a redeploy.
+    # They are the only two of the six cost priors in
+    # ``revora.estimation.candidates`` that R31.C11 names, and the remaining four stay
+    # in that module: the promise follow-up's financial term is a *verified* zero
+    # rather than a tunable figure, and nothing has asked for the other three to be
+    # changeable. ``COST_PRIORS`` reads its two values from the defaults declared
+    # here, so the number is written down once and the accessor, the seeded row and
+    # the prior table cannot disagree. [ASSUMPTION] defaults.
+    ConfigurationBound(
+        "PAYMENT_LINK_FINANCIAL_COST", ValueKind.MONEY_MINOR, "300",
+        "Provider fee attributable to creating one payment link, in minor units",
+    ),
+    ConfigurationBound(
+        "MESSAGE_COMMUNICATION_COST", ValueKind.MONEY_MINOR, "25",
+        "Per-message delivery cost of one customer-visible action, in minor units",
     ),
     # --- Estimation and calibration. [ASSUMPTION] defaults.
     ConfigurationBound(
@@ -392,12 +521,231 @@ _BOUNDS: tuple[ConfigurationBound, ...] = (
         "DASHBOARD_METRICS_TIMEOUT", ValueKind.DURATION_SECONDS, "5",
         "Maximum wait for a metrics figure before a data-unavailable indication",
     ),
+    # --- The rest of the sweep schedule. Four of the seven periodic sweeps already had
+    # an interval here — LIFECYCLE_EVALUATION_INTERVAL, EXECUTION_RECONCILIATION_INTERVAL,
+    # PAYMENT_STATE_RECONCILIATION_INTERVAL and REVIEW_SWEEP_INTERVAL. These are the other
+    # three, and their absence was not a gap in the catalogue so much as a gap in the
+    # deployment: nothing produced the sweeps at all, so nothing had ever needed to ask how
+    # often. ``revora.jobs.ticker`` is what asks, and it refuses a kind it cannot price
+    # rather than falling back to a default — which is why all seven have to be here.
+    # An interval is a bound rather than a constant for the ordinary reason (R15.C6): how
+    # often a merchant is willing to pay for a provider listing call, or to have its
+    # customers' contact data swept, is that merchant's judgement, and changing it is a
+    # recorded decision with a person's name on it. [ASSUMPTION] defaults on all three.
+    ConfigurationBound(
+        "DETECTION_GAP_BACKFILL_INTERVAL", ValueKind.DURATION_SECONDS, "900",
+        "Interval between provider listing passes that backfill undelivered failures",
+        note=(
+            "[ASSUMPTION] 15 minutes, and deliberately the longest of the three. Each "
+            "pass is a provider listing call whose cost falls on the merchant's API "
+            "quota rather than on Revora, and the failure it catches — a disabled or "
+            "broken webhook — persists for hours once it starts, so detecting it four "
+            "times an hour and detecting it sixty times an hour close the same gap. It "
+            "is well inside DETECTION_LATENCY_BOUND's sibling concern for the ordinary "
+            "path: a delivered webhook is still detected in seconds, and this is only "
+            "the path for one that never arrived."
+        ),
+    ),
+    ConfigurationBound(
+        "CALIBRATION_REPORT_INTERVAL", ValueKind.DURATION_SECONDS, "3600",
+        "Interval between checks of whether a calibration report is due",
+        note=(
+            "[ASSUMPTION] hourly, and this is the interval of the *check*, not of the "
+            "report. What decides that a report is due is "
+            "CALIBRATION_REPORT_CASE_TRIGGER or CALIBRATION_REPORT_TIME_TRIGGER (7 "
+            "days); this bound only says how often those two are consulted. Hourly is "
+            "three orders of magnitude finer than the time trigger, which is what keeps "
+            "the sweep from being the thing that decides when a report appears."
+        ),
+    ),
+    ConfigurationBound(
+        "CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL", ValueKind.DURATION_SECONDS, "3600",
+        "Interval between redaction passes over contact data past its retention period",
+        note=(
+            "[ASSUMPTION] hourly, and named SWEEP_INTERVAL so it cannot be read as "
+            "CUSTOMER_DATA_RETENTION, which is the retention *period* (180 days) and a "
+            "different kind of number entirely. Confusing the two in either direction is "
+            "expensive: an hourly retention period would redact live cases, and a "
+            "180-day sweep interval would miss R17.C11's deadline by half a year. "
+            "R17.C11 gives 24 hours after the period elapses, and no configured interval "
+            "expressed that before this row existed — hourly leaves 24 passes inside the "
+            "deadline, which is the margin a merchant with a backlog needs, since one "
+            "pass redacts a batch and re-enqueues its own successor while more remains."
+        ),
+    ),
 )
 
 CATALOGUE: Mapping[str, ConfigurationBound] = MappingProxyType(
     {bound.key: bound for bound in _BOUNDS}
 )
 """Every bound, by key. Read-only — a component must not add one at runtime."""
+
+COST_SPLIT_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "PAYMENT_LINK_FINANCIAL_COST",
+    "MESSAGE_COMMUNICATION_COST",
+)
+"""The two bounds R31.C11 names, as a named subset rather than as a list in a migration.
+
+Migration ``0009`` seeds exactly these keys, and it selects them through this tuple so
+that the migration contains no key string and no value of its own. A migration that
+spelt the keys out would be a third place the pair is written down, which is the failure
+the whole arrangement exists to avoid.
+
+Every member must be a ``MONEY_MINOR`` bound; the check below is at import time because a
+mistake here would otherwise surface as a seeded row of the wrong kind."""
+
+if any(CATALOGUE[key].kind is not ValueKind.MONEY_MINOR for key in COST_SPLIT_BOUND_KEYS):
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "every COST_SPLIT_BOUND_KEYS member must be a MONEY_MINOR bound"
+    )
+
+REVIEW_LOOP_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "WAIT_REVIEW_INTERVAL",
+    "REVIEW_SWEEP_INTERVAL",
+)
+"""The two bounds R30 introduces, as a named subset for the seed migration to select.
+
+Migration ``0010`` seeds exactly these keys through this tuple, on the pattern ``0009``
+set: the migration holds no key string, no value and no purpose text of its own, so the
+accessor and the seeded row cannot disagree about a default.
+
+Both must be ``DURATION_SECONDS``; the check below is at import time because a mistake
+here would otherwise surface as a seeded row of the wrong kind, parsed by the accessor
+into a value of the wrong type."""
+
+if any(
+    CATALOGUE[key].kind is not ValueKind.DURATION_SECONDS for key in REVIEW_LOOP_BOUND_KEYS
+):
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "every REVIEW_LOOP_BOUND_KEYS member must be a DURATION_SECONDS bound"
+    )
+
+SWEEP_INTERVAL_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "DETECTION_GAP_BACKFILL_INTERVAL",
+    "CALIBRATION_REPORT_INTERVAL",
+    "CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL",
+)
+"""The three sweep intervals the ticker role introduces, for migration ``0014`` to select.
+
+A tuple rather than the mapping ``CUSTOMER_TOKEN_BOUND_KEYS`` uses, because all three are
+durations and a uniform kind check is available — which is the stronger guarantee of the two,
+so it is taken where it can be, on the pattern ``0009`` set and ``0010`` through ``0013``
+followed. The migration holds no key string, no value, no kind and no purpose text of its own.
+
+The three are grouped because they arrived together and for one reason: ``revora.jobs.ticker``
+prices every member of ``PERIODIC_SWEEP_KINDS`` from a bound and refuses a kind it cannot
+price, so these were the three that had to exist before a schedule could run at all. They are
+not otherwise related — a provider listing pass, a report trigger check and a privacy
+redaction pass answer to three different requirements.
+
+Every member must be ``DURATION_SECONDS``; the check below is at import time because a
+mistake here would otherwise surface as a seeded row of the wrong kind, parsed by the accessor
+into a value the ticker would then divide a timestamp by."""
+
+if any(
+    CATALOGUE[key].kind is not ValueKind.DURATION_SECONDS for key in SWEEP_INTERVAL_BOUND_KEYS
+):
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "every SWEEP_INTERVAL_BOUND_KEYS member must be a DURATION_SECONDS bound"
+    )
+
+CUSTOMER_TOKEN_BOUND_KEYS: Final[Mapping[str, ValueKind]] = MappingProxyType(
+    {
+        "CUSTOMER_TOKEN_LIFETIME": ValueKind.DURATION_SECONDS,
+        "CUSTOMER_TOKEN_MAX_SUBMISSIONS": ValueKind.INTEGER,
+    }
+)
+"""The two bounds R18 introduces, as a named subset for the seed migration to select.
+
+Migration ``0011`` seeds exactly these keys through this mapping, on the pattern ``0009`` set
+and ``0010`` followed: the migration holds no key string, no value and no purpose text of its
+own, so the accessor and the seeded row cannot disagree about a default.
+
+A mapping rather than the tuple its two predecessors use, because these two bounds are of
+**different kinds** — a duration and a count — so there is no single kind to assert. Pairing
+each key with the kind it must have keeps the same import-time guarantee the tuples get from a
+uniform check: a bound renamed or re-typed in the catalogue fails here rather than seeding a row
+the accessor will later parse into a value of the wrong type."""
+
+CUSTOMER_SURFACE_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "CUSTOMER_PAGE_RATE_LIMIT",
+    "CUSTOMER_PAGE_SOURCE_RATE_LIMIT",
+    "MAX_CUSTOMER_SIGNALS_PER_CASE",
+    "DELAY_NOTE_MAX_LENGTH",
+)
+"""The four bounds the public customer surface introduces, for migration ``0012`` to select.
+
+A tuple rather than the mapping ``CUSTOMER_TOKEN_BOUND_KEYS`` uses, because all four are counts
+and a uniform kind check is available — which is the stronger guarantee of the two, so it is
+taken where it can be. The migration holds no key string, no value and no purpose text of its
+own, on the pattern ``0009`` set and ``0010`` and ``0011`` followed."""
+
+if any(
+    CATALOGUE[key].kind is not ValueKind.INTEGER for key in CUSTOMER_SURFACE_BOUND_KEYS
+):
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "every CUSTOMER_SURFACE_BOUND_KEYS member must be an INTEGER bound"
+    )
+
+CUSTOMER_STATED_CAUSE_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "CUSTOMER_STATED_CAUSE_CONFIDENCE",
+)
+"""The one bound R20.C4 introduces, for migration ``0013`` to select.
+
+A tuple of one rather than a bare string, so the migration's row-count assertion and its
+``key = ANY(:keys)`` downgrade read the same way as ``0009`` through ``0012``. A second
+bound added to this group later is an edit here and nowhere else.
+
+It must be ``DECIMAL``: a confidence is compared against ``DIAGNOSIS_CONFIDENCE_FLOOR``
+and stored in a ``NUMERIC(4,3)`` column, and an ``INTEGER`` or ``DURATION_SECONDS``
+mis-declaration would surface as a seeded row the accessor parses into the wrong type and
+a comparison that rounds. The check is at import time for that reason."""
+
+if any(
+    CATALOGUE[key].kind is not ValueKind.DECIMAL
+    for key in CUSTOMER_STATED_CAUSE_BOUND_KEYS
+):
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "every CUSTOMER_STATED_CAUSE_BOUND_KEYS member must be a DECIMAL bound"
+    )
+
+_mistyped_customer_token_bounds = sorted(
+    key for key, kind in CUSTOMER_TOKEN_BOUND_KEYS.items() if CATALOGUE[key].kind is not kind
+)
+if _mistyped_customer_token_bounds:
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "CUSTOMER_TOKEN_BOUND_KEYS disagrees with the catalogue about the kind of "
+        f"{_mistyped_customer_token_bounds}"
+    )
+
+
+def money_default(key: str) -> Minor:
+    """The catalogue default of a ``MONEY_MINOR`` bound, typed.
+
+    The one supported way for a module below the persistence layer to name a configured
+    money bound's default. ``revora.estimation.candidates`` uses it for the two cost
+    priors of R31.C11: the estimator's prior table needs a value at import time, before
+    any session exists to read a row through, and this makes that value *the catalogue's
+    default* rather than a second literal that happens to match it today.
+
+    Parsed through :func:`parse_value`, the same function the accessor uses, so a default
+    that the accessor would reject cannot reach a prior table by another route.
+
+    Raises:
+        ConfigurationError: if ``key`` is not a bound, is not ``MONEY_MINOR``, or has an
+            unparseable default.
+    """
+    bound = CATALOGUE.get(key)
+    if bound is None:
+        raise ConfigurationError(f"no configuration bound named {key!r}")
+    if bound.kind is not ValueKind.MONEY_MINOR:
+        raise ConfigurationError(
+            f"bound {key!r} is {bound.kind.value}, not {ValueKind.MONEY_MINOR.value}"
+        )
+    parsed = parse_value(bound.kind, bound.default)
+    if isinstance(parsed, bool) or not isinstance(parsed, int):  # pragma: no cover
+        raise ConfigurationError(f"bound {key!r} did not parse to an integer")
+    return Minor(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +792,18 @@ class Configuration:
     ESCALATION_AMOUNT_THRESHOLD: Minor
     OUTCOME_WAIT_TIMEOUT: timedelta
 
+    WAIT_REVIEW_INTERVAL: timedelta
+    REVIEW_SWEEP_INTERVAL: timedelta
+
+    CUSTOMER_TOKEN_LIFETIME: timedelta
+    CUSTOMER_TOKEN_MAX_SUBMISSIONS: int
+
+    CUSTOMER_PAGE_RATE_LIMIT: int
+    CUSTOMER_PAGE_SOURCE_RATE_LIMIT: int
+    MAX_CUSTOMER_SIGNALS_PER_CASE: int
+    DELAY_NOTE_MAX_LENGTH: int
+    CUSTOMER_STATED_CAUSE_CONFIDENCE: Decimal
+
     POLICY_DECISION_VALIDITY: timedelta
     PROVIDER_CALL_TIMEOUT: timedelta
     EXECUTION_LOCK_LEASE: timedelta
@@ -455,6 +815,9 @@ class Configuration:
     OUTCOME_READ_LATENCY_BOUND: timedelta
     PAYMENT_STATE_RECONCILIATION_INTERVAL: timedelta
     MAX_PAYMENT_STATE_READ_ATTEMPTS: int
+
+    PAYMENT_LINK_FINANCIAL_COST: Minor
+    MESSAGE_COMMUNICATION_COST: Minor
 
     BASELINE_ESTIMATION_TIMEOUT: timedelta
     MIN_SEGMENT_SAMPLE_SIZE: int
@@ -479,6 +842,10 @@ class Configuration:
     SESSION_LIFETIME: timedelta
     DASHBOARD_PAGE_SIZE: int
     DASHBOARD_METRICS_TIMEOUT: timedelta
+
+    DETECTION_GAP_BACKFILL_INTERVAL: timedelta
+    CALIBRATION_REPORT_INTERVAL: timedelta
+    CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL: timedelta
 
     defaulted_keys: frozenset[str] = field(default_factory=frozenset)
     """Bounds that had no row and fell back to the placeholder. Non-empty is a
@@ -545,14 +912,33 @@ def default_configuration() -> Configuration:
     )
 
 
-def seed_rows() -> Iterable[dict[str, object]]:
-    """The rows the seed migration inserts, one per bound.
+def seed_rows(*, keys: Collection[str] | None = None) -> Iterable[dict[str, object]]:
+    """The rows a seed migration inserts, one per bound.
 
     Generated from the catalogue rather than written out again in SQL, so the
     accessor and the seeded rows cannot disagree about a default. ``is_assumption``
     is true on every one of them, because it is.
+
+    Args:
+        keys: restrict the output to these bounds. ``None`` yields every bound, which
+            is what migration ``0004`` wants. A later migration seeding bounds added
+            after ``0004`` passes the subset it introduced — see
+            :data:`COST_SPLIT_BOUND_KEYS` — so it neither re-states a value nor has to
+            re-insert rows that already exist.
+
+    Raises:
+        ConfigurationError: if ``keys`` names something that is not a bound. Silently
+            yielding nothing would make a renamed key look like a migration that ran.
     """
-    for bound in _BOUNDS:
+    if keys is None:
+        selected = _BOUNDS
+    else:
+        unknown = frozenset(keys) - frozenset(CATALOGUE)
+        if unknown:
+            raise ConfigurationError(f"no configuration bound named {sorted(unknown)}")
+        wanted = frozenset(keys)
+        selected = tuple(bound for bound in _BOUNDS if bound.key in wanted)
+    for bound in selected:
         yield {
             "key": bound.key,
             "value": bound.default,

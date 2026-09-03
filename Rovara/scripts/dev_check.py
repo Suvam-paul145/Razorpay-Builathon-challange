@@ -37,6 +37,7 @@ _REQUIRED = (
     "REVORA_DATABASE_URL",
     "REVORA_PAYLOAD_ENCRYPTION_KEYS",
     "REVORA_CUSTOMER_KEY_SECRET",
+    "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS",
     "REVORA_SESSION_TOKEN_SECRET",
     "REVORA_RAZORPAY_KEY_ID",
     "REVORA_RAZORPAY_KEY_SECRET",
@@ -123,7 +124,10 @@ def main() -> int:
             print(f"  - {problem}")
         return 1
 
-    print("ready. Start the API, then the worker, then send a webhook.")
+    print("ready. Start the API, the worker and the ticker, then send a webhook.")
+    print("  the ticker (REVORA_ROLE=ticker, python -m revora.jobs.ticker_main) is what")
+    print("  produces the seven periodic sweeps. Without it the worker has nothing")
+    print("  periodic to claim and no case ever expires — with nothing in any log.")
     return 0
 
 

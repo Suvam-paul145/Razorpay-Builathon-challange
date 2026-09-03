@@ -46,6 +46,7 @@ from revora.platform.clock import ensure_utc
 
 __all__ = [
     "CREDENTIAL_UNAVAILABLE",
+    "ENV_CUSTOMER_TOKEN_SIGNING_SECRETS",
     "WEBHOOK_REDELIVERY_WINDOW",
     "CredentialUnavailableError",
     "EnvironmentSecretResolver",
@@ -68,6 +69,15 @@ ENV_RAZORPAY_KEY_ID: Final[str] = "REVORA_RAZORPAY_KEY_ID"
 ENV_RAZORPAY_KEY_SECRET: Final[str] = "REVORA_RAZORPAY_KEY_SECRET"
 ENV_PAYLOAD_ENCRYPTION_KEYS: Final[str] = "REVORA_PAYLOAD_ENCRYPTION_KEYS"
 ENV_CUSTOMER_KEY_SECRET: Final[str] = "REVORA_CUSTOMER_KEY_SECRET"
+ENV_CUSTOMER_TOKEN_SIGNING_SECRETS: Final[str] = "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS"
+"""Versioned HMAC secrets the Customer_Access_Token ``secret_hash`` is keyed with.
+
+Same ``version:base64`` shape as ``REVORA_PAYLOAD_ENCRYPTION_KEYS``, and versioned for the
+same reason webhook secrets are a list: R29.C14 requires a presented token to verify against
+**every** configured active secret, so a rotation adds a higher version while the previous one
+is still needed by tokens minted under it. Retiring a version is done by removing it, and the
+consequence is deliberate — a token signed by a retired secret matches nothing and takes the
+same 404 path as a token that never existed."""
 ENV_LLM_CREDENTIAL: Final[str] = "REVORA_LLM_CREDENTIAL"
 ENV_WEBHOOK_SECRETS_PREFIX: Final[str] = "REVORA_WEBHOOK_SECRETS_"
 """Suffixed with the merchant slug, upper-cased, non-alphanumerics as underscores.
@@ -354,6 +364,34 @@ class SecretStore:
         value = self._require(ENV_CUSTOMER_KEY_SECRET, "customer_key_secret")
         return _decode_key(value.reveal(), "customer_key_secret", minimum_length=32)
 
+    def customer_token_signing_secrets(self) -> Mapping[int, bytes]:
+        """Versioned HMAC secrets for the Customer_Access_Token, newest version highest.
+
+        Format ``1:<base64>,2:<base64>``, the same as :meth:`payload_encryption_keys`, and at
+        least 32 bytes decoded per entry like every other HMAC secret here. More than one entry
+        is normal rather than exceptional: minting always uses the highest version and
+        verification tries all of them, so a token keeps working across a rotation until it
+        expires (R29.C14).
+
+        Separate from every other secret in this store, and the separation is the point.
+        Rotating this one invalidates nothing but the ability to verify tokens minted under the
+        retired version — no stored ``customer_key``, no live dashboard session, no historical
+        payload. A shared secret would couple "rotate the customer link signing key" to
+        "lose the opt-out index", which is how a rotation stops happening.
+
+        Raises:
+            CredentialUnavailableError: absent, malformed, or any entry shorter than 32 bytes.
+                The caller's response is R29.C13's: mint nothing, verify nothing, write a
+                ``CREDENTIAL_UNAVAILABLE`` record, answer 503. Malformed counts as unavailable
+                because that response is identical.
+        """
+        value = self._require(
+            ENV_CUSTOMER_TOKEN_SIGNING_SECRETS, "customer_token_signing_secret"
+        )
+        return _parse_versioned_keys(
+            value.reveal(), "customer_token_signing_secret", minimum_length=32
+        )
+
     def payload_encryption_keys(self) -> Mapping[int, bytes]:
         """Versioned AES-256 keys for the raw event store.
 
@@ -368,28 +406,9 @@ class SecretStore:
                 because the caller's correct response is identical.
         """
         value = self._require(ENV_PAYLOAD_ENCRYPTION_KEYS, "payload_encryption_keys")
-        keys: dict[int, bytes] = {}
-        for chunk in value.reveal().split(","):
-            entry = chunk.strip()
-            if not entry:
-                continue
-            version_text, separator, key_text = entry.partition(":")
-            if not separator:
-                raise CredentialUnavailableError(
-                    "payload_encryption_keys", "malformed entry, expected version:base64"
-                )
-            try:
-                version = int(version_text.strip())
-            except ValueError as exc:
-                raise CredentialUnavailableError(
-                    "payload_encryption_keys", "version is not an integer"
-                ) from exc
-            keys[version] = _decode_key(
-                key_text.strip(), "payload_encryption_keys", minimum_length=32, exact=True
-            )
-        if not keys:
-            raise CredentialUnavailableError("payload_encryption_keys", "no key entries")
-        return keys
+        return _parse_versioned_keys(
+            value.reveal(), "payload_encryption_keys", minimum_length=32, exact=True
+        )
 
     def webhook_signing_secrets(self, merchant_slug: str) -> tuple[SecretValue, ...]:
         """The ordered active signing secrets for one merchant, newest first.
@@ -451,6 +470,44 @@ class SecretStore:
 
 def _slug_to_env(merchant_slug: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in merchant_slug).upper()
+
+
+def _parse_versioned_keys(
+    raw: str,
+    credential: str,
+    *,
+    minimum_length: int,
+    exact: bool = False,
+) -> Mapping[int, bytes]:
+    """Parse ``version:base64,version:base64`` into a version-keyed mapping.
+
+    One parser for two credentials — the payload encryption keys and the customer-token
+    signing secrets — because the shape *is* the rotation contract and two copies of it
+    would be two chances for the two rotations to behave differently. Every failure is a
+    ``CredentialUnavailableError`` naming ``credential`` and a category, never a value.
+    """
+    keys: dict[int, bytes] = {}
+    for chunk in raw.split(","):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        version_text, separator, key_text = entry.partition(":")
+        if not separator:
+            raise CredentialUnavailableError(
+                credential, "malformed entry, expected version:base64"
+            )
+        try:
+            version = int(version_text.strip())
+        except ValueError as exc:
+            raise CredentialUnavailableError(
+                credential, "version is not an integer"
+            ) from exc
+        keys[version] = _decode_key(
+            key_text.strip(), credential, minimum_length=minimum_length, exact=exact
+        )
+    if not keys:
+        raise CredentialUnavailableError(credential, "no key entries")
+    return keys
 
 
 def _decode_key(

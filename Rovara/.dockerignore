@@ -25,7 +25,12 @@ docs/
 #                 whatever was last built on a developer's machine rather than what the
 #                 `web` stage produces from the committed source — which is exactly the
 #                 drift that building in the image is meant to eliminate.
+#
+# `web/dist-customer` is listed for the same reason as `web/dist`. The customer response page is
+# served by the frontend host rather than by this image, so the artifact has no business in the
+# context at all — but a stale copy of it is the same class of mistake either way.
 node_modules/
 web/node_modules/
 web/dist/
+web/dist-customer/
 web/coverage/

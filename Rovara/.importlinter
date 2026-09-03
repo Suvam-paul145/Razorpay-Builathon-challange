@@ -66,6 +66,10 @@ forbidden_modules =
     revora.providers
     revora.synthetic
 
+; revora.customer joined in the customer response loop. It is the one package reachable
+; without a session, so a synthetic ground truth being reachable from it would be reachable
+; from an unauthenticated request — a stricter version of the same argument that put the other
+; sixteen here.
 ; Widened in Phase 4. design.md's intent is "no Revora component imports synthetic except the
 ; generator entrypoint and the reporter", and the original eight sources left estimation,
 ; diagnosis, memory, metrics and outcome free to import it — which would have been enough to
@@ -82,6 +86,7 @@ source_modules =
     revora.execution
     revora.providers
     revora.cases
+    revora.customer
     revora.detection
     revora.ingestion
     revora.estimation
@@ -92,18 +97,55 @@ source_modules =
     revora.audit
     revora.persistence
     revora.platform
+    revora.reasoning
 forbidden_modules =
     revora.synthetic
+
+; R27.C11's structural half. The `layering` band above already forbids diagnosis,
+; estimation and memory from importing reasoning, and `policy-isolation` and
+; `optimizer-isolation` already forbid the two components that must never see AI output.
+; This contract is the other direction, and it is the one that carries the claim
+; "the adapter cannot read a case row": with every feature package and `revora.persistence`
+; forbidden, the only things `revora.reasoning` can import are `revora.platform` and
+; `revora.domain`. So there is no session to open, no repository to call and no ORM model
+; to load — the isolation is a property of what is reachable, not of what the adapter
+; happens to do today. `revora.experiment` is present here (unlike in
+; `synthetic-containment`, where its absence is deliberate) because nothing about the
+; reasoning path needs the experiment engine.
+[importlinter:contract:reasoning-containment]
+name = Reasoning adapter sees only platform and domain
+type = forbidden
+source_modules =
+    revora.reasoning
+forbidden_modules =
+    revora.persistence
+    revora.ingestion
+    revora.detection
+    revora.cases
+    revora.diagnosis
+    revora.estimation
+    revora.optimizer
+    revora.policy
+    revora.execution
+    revora.providers
+    revora.outcome
+    revora.experiment
+    revora.metrics
+    revora.audit
+    revora.memory
+    revora.synthetic
+    revora.jobs
+    revora.api
 
 [importlinter:contract:layering]
 name = Feature modules depend downward only
 type = layers
 layers =
     revora.api | revora.jobs
-    revora.experiment | revora.metrics | revora.outcome | revora.execution
+    revora.experiment | revora.metrics | revora.outcome | revora.execution | revora.timeline
     revora.optimizer | revora.policy
-    revora.estimation | revora.diagnosis | revora.memory
-    revora.detection | revora.ingestion
+    revora.estimation | revora.diagnosis | revora.memory | revora.reasoning
+    revora.customer | revora.detection | revora.ingestion
     revora.cases
     revora.audit
     revora.persistence
