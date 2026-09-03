@@ -16,24 +16,35 @@ __all__ = [
     "ActionAvailability",
     "CaseState",
     "CheckOutcome",
+    "CustomerSignalKind",
     "DecisionSource",
+    "DelayReason",
     "DetectionVerdict",
+    "DiagnosisEvidenceSource",
     "DiagnosisMethod",
     "EstimationMethod",
     "ExclusionReason",
+    "ExecutionEffectKind",
     "ExperimentGroup",
     "ExperimentLabel",
     "ExperimentState",
     "FieldKind",
+    "HardStopReason",
     "IntentState",
     "InterventionStatus",
     "OutcomeClass",
     "PolicyCheck",
     "PolicyVerdict",
+    "PromiseStatus",
     "Provenance",
+    "ReasoningCallKind",
+    "ReviewTrigger",
     "RiskCause",
     "SelectionReason",
     "TerminalReason",
+    "TimelineStage",
+    "TimelineStageStatus",
+    "TokenRevocationReason",
     "ValidationStatus",
 ]
 
@@ -146,18 +157,55 @@ class DiagnosisMethod(StrEnum):
 
 
 @unique
+class DiagnosisEvidenceSource(StrEnum):
+    """Which input the recorded cause was derived from.
+
+    ``DiagnosisMethod`` already says *how* a cause was arrived at — a table, a model, a
+    rejection, a fallback. It deliberately does not say *what was read*, and once two
+    different deterministic tables can each produce a ``DETERMINISTIC`` cause at a
+    configured confidence, "the provider told us" and "the customer told us" become
+    indistinguishable in the record unless the source is written down beside the method
+    (R20.C4).
+
+    The distinction is not cosmetic. A provider error code is an authoritative
+    observation of a failed charge; a stated reason is a stranger's account of their own
+    finances typed into a public page. Both may inform an estimate, neither authorizes
+    anything, and only one of them is evidence a reviewer should weigh at face value —
+    so a reviewer reading a recommendation has to be able to tell which one they are
+    looking at without joining back to the signal table.
+    """
+
+    PROVIDER_ERROR_CODE = "PROVIDER_ERROR_CODE"
+    """The canonical event's ``error_reason``, ``error_source``, ``error_step`` and
+    ``error_code``, through the failure taxonomy (R3.C1)."""
+
+    CUSTOMER_STATED_REASON = "CUSTOMER_STATED_REASON"
+    """A persisted ``Delay_Reason``, through the mapping table R20.C5 declares."""
+
+
+@unique
 class EstimationMethod(StrEnum):
     """How a probability or cost figure was produced.
 
     ``DEFINITIONAL`` is reserved for DO_NOTHING, whose figures are fixed by
     definition rather than estimated. ``UNCALIBRATED`` means no observation of that
     action exists for the segment yet, and it propagates to every surface.
+
+    ``COST_SPLIT_NOT_MEASURED`` is narrower than the other four and is the weakest
+    claim the enumeration can make. It marks the ``financial_cost`` and
+    ``communication_cost`` of a row that migration ``0008`` split out of a blended
+    ``action_cost``: the whole pre-split total went into ``financial_cost`` and the
+    communication term is zero because **nothing measured it and nothing guessed
+    it** (R31.C9). It is not produced by any estimator — a figure carrying it is a
+    historical row, and R31.C10 requires the marking be shown beside the two
+    figures so a migrated zero does not read as a measured zero.
     """
 
     DETERMINISTIC = "DETERMINISTIC"
     PRIOR_FALLBACK = "PRIOR_FALLBACK"
     UNCALIBRATED = "UNCALIBRATED"
     DEFINITIONAL = "DEFINITIONAL"
+    COST_SPLIT_NOT_MEASURED = "COST_SPLIT_NOT_MEASURED"
 
 
 @unique
@@ -254,16 +302,31 @@ class FieldKind(StrEnum):
     ``PROVIDER_SHORT_URL`` is sensitive because a payment link is a bearer
     capability — anyone holding the URL can pay. It is shown in the dashboard but
     must never reach a log line or an audit record unmasked.
+
+    ``CUSTOMER_ACCESS_TOKEN`` is sensitive **on exactly the same terms**, and that is
+    why it is a member of this enumeration rather than a check somewhere in the
+    customer package: the wire token ``rvc_<token_id>.<secret>`` is the second bearer
+    capability in the system, so whoever holds it can read one case's projection and
+    write signals against it. R18.C11 and R29.C4 permit a token to appear in an audit
+    field or a log record **only** as its ``token_id``, which is separately random and
+    discloses nothing about the secret. Adding the kind here means the masking
+    serializer already covers it, rather than every future call site remembering to.
     """
 
     CONTACT = "CONTACT"
     INSTRUMENT = "INSTRUMENT"
     PROVIDER_SHORT_URL = "PROVIDER_SHORT_URL"
+    CUSTOMER_ACCESS_TOKEN = "CUSTOMER_ACCESS_TOKEN"
     NON_SENSITIVE = "NON_SENSITIVE"
 
 
 SENSITIVE_FIELD_KINDS: frozenset[FieldKind] = frozenset(
-    {FieldKind.CONTACT, FieldKind.INSTRUMENT, FieldKind.PROVIDER_SHORT_URL}
+    {
+        FieldKind.CONTACT,
+        FieldKind.INSTRUMENT,
+        FieldKind.PROVIDER_SHORT_URL,
+        FieldKind.CUSTOMER_ACCESS_TOKEN,
+    }
 )
 """Kinds the masking serializer must never write in clear."""
 
@@ -315,7 +378,24 @@ dashboard shows both, because that divergence is the product's whole argument.""
 
 @unique
 class TerminalReason(StrEnum):
-    """Why a case ended. Drives the unresolved-revenue grouping on the dashboard."""
+    """Why a case ended. Drives the unresolved-revenue grouping on the dashboard.
+
+    ``recovery_case.terminal_reason`` carries ``enum_check`` generated from this enumeration, so
+    **a member added here is a migration**. Migration ``0001`` created that ``CHECK`` with the
+    twelve members above the divider; ``0015`` widened it with the four below, which are the
+    customer-stated endings the response loop introduced. The lesson is written down in
+    :class:`ReviewTrigger`'s docstring and it applies here in the other direction: that
+    enumeration declared its complete set up front *because* a persisted ``CHECK`` reads it, and
+    this one could not, because nobody knew in ``0001`` that a customer would one day be able to
+    say "I dispute this charge".
+
+    The four customer-stated reasons are grouped together deliberately. Every reason above them
+    is something *Revora* concluded — a bound was reached, a window closed, a read could not be
+    verified. Every one below is something a *person* said, arriving through the public customer
+    surface and recorded verbatim in the sense that matters: the case ends for the reason the
+    customer gave, not for a reason Revora inferred from it. That distinction is the whole point
+    of not collapsing them onto ``CUSTOMER_OPTED_OUT``, which would have needed no migration and
+    would have made "how many customers disputed a charge" unanswerable."""
 
     RECOVERED_VERIFIED = "RECOVERED_VERIFIED"
     RECOVERY_WINDOW_ELAPSED = "RECOVERY_WINDOW_ELAPSED"
@@ -329,6 +409,62 @@ class TerminalReason(StrEnum):
     POLICY_BLOCKED = "POLICY_BLOCKED"
     HUMAN_OWNERSHIP = "HUMAN_OWNERSHIP"
     COMMUNICATION_FAILED = "COMMUNICATION_FAILED"
+
+    # -- what the customer said (migration 0015) ------------------------------
+    CUSTOMER_DISPUTED_CHARGE = "CUSTOMER_DISPUTED_CHARGE"
+    """R21.C4. A Hard_Stop_Reason of ``DISPUTES_THE_CHARGE``, escalated to a person.
+
+    Distinct from ``CUSTOMER_OPTED_OUT`` and R21.C9 is why: an opt-out is a withdrawal of
+    consent to be contacted at all, a dispute is an objection to one debt. They also have
+    different consequences outside Revora — a dispute implies a possible chargeback — so a
+    merchant reading the ``ESCALATED`` grouping needs to see which of the two happened."""
+
+    CUSTOMER_CANCELLED_ORDER = "CUSTOMER_CANCELLED_ORDER"
+    """R21.C5. A Hard_Stop_Reason of ``NO_LONGER_WANTS_THE_ORDER``, escalated to a person.
+
+    Separate from a dispute even though both suppress contact identically, because what has to
+    happen next differs: a cancellation implies fulfilment and refund questions, a dispute
+    implies a chargeback. Both are a person's problem and they are not the same person's."""
+
+    CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT = "CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT"
+    """R22.C2. The customer asked to settle for less, or in instalments.
+
+    Declared in ``0015`` alongside the two hard stops rather than in a migration of its own,
+    because all four widen one ``CHECK`` on one column and rebuilding it four times is four
+    chances to write the member list wrong. Its writer arrives with task 43."""
+
+    PROMISE_BEYOND_RECOVERY_WINDOW = "PROMISE_BEYOND_RECOVERY_WINDOW"
+    """R23.C4. A Promise_Date at or past ``window_end_at``, which is never extended.
+
+    Declared in ``0015`` for the same reason as the member above; its writer arrives with task
+    44. The window's immutability is what makes this an escalation rather than a reschedule —
+    R2.C5 means the promise cannot be accommodated, so a person has to decide."""
+
+
+@unique
+class ReviewTrigger(StrEnum):
+    """What caused a case resting at ``POLICY_CHECK`` to be looked at again (R30.C11).
+
+    Recorded on the ``CASE_REVIEWED`` audit record and nowhere else. It is deliberately
+    *not* an input to anything the review then does: R30.C15 requires the policy
+    evaluation a review produces to take no input from the trigger and none from the
+    count of prior reviews, so a case reviewed because a second payment failed is
+    evaluated on exactly the twelve checks a case reviewed on a schedule is. The
+    distinction is worth recording and must not be worth deciding on — if the trigger
+    could change the outcome, "restraint was re-examined" would mean something different
+    depending on who asked, and the twelve ordered checks would no longer be the whole
+    story.
+
+    ``CUSTOMER_SIGNAL`` is declared here before anything produces it (its producer is the
+    customer response surface). Declaring it now rather than later is not speculative
+    scaffolding: all three members are values of one audit field, and adding a member to
+    a closed enumeration that a persisted ``CHECK`` constraint and a dashboard filter
+    already read is a migration, whereas declaring the complete set once is not.
+    """
+
+    SCHEDULED_REVIEW = "SCHEDULED_REVIEW"
+    EVENT_ATTACHED = "EVENT_ATTACHED"
+    CUSTOMER_SIGNAL = "CUSTOMER_SIGNAL"
 
 
 @unique
@@ -362,6 +498,204 @@ class ExperimentLabel(StrEnum):
     CONTAMINATED = "CONTAMINATED"
     EXPLORATORY = "EXPLORATORY"
     CAUSALITY_NOT_ESTABLISHED = "CAUSALITY_NOT_ESTABLISHED"
+
+
+@unique
+class CustomerSignalKind(StrEnum):
+    """What a customer said on the response page.
+
+    ``PAGE_VIEWED`` is a signal rather than a log line because "the customer opened
+    the link and said nothing" is evidence about the next decision, and it is the
+    only evidence available when nothing else is submitted.
+    """
+
+    PAGE_VIEWED = "PAGE_VIEWED"
+    DELAY_REASON = "DELAY_REASON"
+    PROMISE_TO_PAY = "PROMISE_TO_PAY"
+    PARTIAL_ARRANGEMENT_REQUEST = "PARTIAL_ARRANGEMENT_REQUEST"
+
+
+@unique
+class DelayReason(StrEnum):
+    """The reason a customer gives for a late payment (R20.C1).
+
+    A closed enumeration, not free text: the mapping to a ``RiskCause`` in R20.C5 is
+    declared per member, and a value outside the set has no mapping and no meaning.
+    ``OTHER`` exists so a customer with a reason we did not anticipate is not forced
+    into one that is wrong, and it deliberately maps to no cause.
+    """
+
+    SALARY_OR_CASHFLOW_TIMING = "SALARY_OR_CASHFLOW_TIMING"
+    BANK_OR_CARD_PROBLEM = "BANK_OR_CARD_PROBLEM"
+    AMOUNT_TOO_HIGH_RIGHT_NOW = "AMOUNT_TOO_HIGH_RIGHT_NOW"
+    DISPUTES_THE_CHARGE = "DISPUTES_THE_CHARGE"
+    NO_LONGER_WANTS_THE_ORDER = "NO_LONGER_WANTS_THE_ORDER"
+    OTHER = "OTHER"
+
+
+@unique
+class HardStopReason(StrEnum):
+    """The two ``DelayReason`` members that end contact permanently (R21.C1).
+
+    Neither is a payment problem. Both are objections to the debt itself, so both
+    write a ``Contact_Suppression`` and escalate to a person rather than scheduling
+    another message.
+
+    The values are taken from :class:`DelayReason` rather than restated, so the
+    subset relationship cannot drift: a rename there is a failure here at import
+    time instead of a suppression that silently stops matching.
+    """
+
+    DISPUTES_THE_CHARGE = DelayReason.DISPUTES_THE_CHARGE.value
+    NO_LONGER_WANTS_THE_ORDER = DelayReason.NO_LONGER_WANTS_THE_ORDER.value
+
+
+@unique
+class PromiseStatus(StrEnum):
+    """The state of a recorded Promise_To_Pay.
+
+    ``BEYOND_WINDOW_ESCALATED`` is terminal for the promise and schedules nothing: a
+    Promise_Date at or past the Recovery_Window end is a case for a person, because
+    the window is never extended (R2.C5) and stretching it would remove the
+    termination guarantee that immutability is what proves.
+    """
+
+    RECORDED = "RECORDED"
+    FOLLOW_UP_SCHEDULED = "FOLLOW_UP_SCHEDULED"
+    KEPT = "KEPT"
+    MISSED = "MISSED"
+    BEYOND_WINDOW_ESCALATED = "BEYOND_WINDOW_ESCALATED"
+    VOIDED = "VOIDED"
+
+
+@unique
+class TokenRevocationReason(StrEnum):
+    """Why a Customer_Access_Token was revoked.
+
+    Every revocation names one of these, which is what makes the revocation
+    auditable rather than an unexplained ``revoked_at``. ``EXPIRED_SUPERSEDED`` is
+    the one that is not a policy event: it is recorded when a replacement token is
+    minted for a case whose previous token has expired, because expiry cannot live
+    in an index predicate — it needs ``now()`` — so the supersession is written down
+    instead of inferred (R18.C14).
+    """
+
+    CASE_TERMINAL = "CASE_TERMINAL"
+    CONTACT_SUPPRESSED = "CONTACT_SUPPRESSED"
+    EXPIRED_SUPERSEDED = "EXPIRED_SUPERSEDED"
+    KEY_RETIRED = "KEY_RETIRED"
+
+
+@unique
+class ExecutionEffectKind(StrEnum):
+    """Which external effect an Execution_Intent attempted.
+
+    The distinction exists because **the two effects are not equally observable**, and
+    that asymmetry is a fact about the provider, not a preference.
+
+    A link creation returns a ``plink_…`` identifier and the created object is re-readable
+    by ``reference_id``, which is what reconciliation uses after a crash to establish
+    whether the effect exists. A resend response carries **only a success boolean** — no
+    notification identifier, and there is no endpoint that reports whether a notification
+    was sent. **A resend is therefore re-readable by nothing**, and an ``UNCERTAIN`` resend
+    intent is not slow to resolve or resolvable with more attempts: it is *permanently
+    unresolvable by provider read*, because no observation answers the question. Such an
+    intent escalates once with ``EXECUTION_RESULT_UNVERIFIABLE`` and is never retried.
+
+    This column is what keeps a resend row **out of the reconciliation sweep's scanned
+    set**. ``ix_execution_intent_unresolved`` carries
+    ``effect_kind = 'PAYMENT_LINK_CREATE'`` in its predicate, so ``reconcile_intents`` and
+    ``promote_stale_intents`` never see a resend — it is not skipped by a branch someone
+    can delete, it is absent from the set being read. The same predicate keeps
+    ``unresolved_intent_count`` counting only intents that *can* be resolved, instead of
+    ringing forever on one that cannot.
+    """
+
+    PAYMENT_LINK_CREATE = "PAYMENT_LINK_CREATE"
+    PAYMENT_LINK_RESEND = "PAYMENT_LINK_RESEND"
+
+
+@unique
+class ReasoningCallKind(StrEnum):
+    """The complete permitted surface of the reasoning layer.
+
+    Three bounded advisory calls, and **nothing else is permitted to exist**. Each is
+    optional, each has a deterministic result when it is absent, rejected or slow, and
+    none of them can be the reason an external effect happened — that authority belongs
+    to ``policy_decision``. A fourth kind is not an extension of this enumeration; it is
+    a change to the AI boundary and needs the argument that goes with one.
+
+    Recorded as its own column rather than encoded into ``prompt_contract_id`` because
+    both facts are queried independently: "how many ``CAUSE_HYPOTHESIS`` calls fell back
+    this week" should be a ``WHERE``, not a ``LIKE`` over a version string.
+    """
+
+    CAUSE_HYPOTHESIS = "CAUSE_HYPOTHESIS"
+    DECISION_EXPLANATION = "DECISION_EXPLANATION"
+    LINK_DESCRIPTION = "LINK_DESCRIPTION"
+
+
+@unique
+class TimelineStage(StrEnum):
+    """The nine stages of a Case_Timeline, as a closed vocabulary (R26.C1).
+
+    Here rather than in ``revora.timeline`` for the reason every other enumeration is here: two
+    modules need the same spelling and neither may reach the other. ``revora.timeline.stages``
+    declares which Audit_Record completes each stage and ``revora.timeline.templates`` declares how
+    each one reads, and the second must not import the first — a template is a sentence, not a
+    conclusion, and the dependency has to run one way so it can be read without knowing how the
+    stage was decided. A vocabulary each side defined for itself would give two spellings of one
+    stage and let a template silently exist for a stage no rule can reach.
+
+    **The order is not declared here**, and the omission is deliberate. Declaration order in a
+    ``StrEnum`` is easy to reorder by accident in a merge, and R26.C1 makes the order a presented
+    fact rather than an incidental one — so ``revora.timeline.stages.STAGE_ORDER`` states it as a
+    tuple and asserts at import that the tuple covers this enumeration exactly. Two things have to
+    agree, and the disagreement is a startup failure rather than a reordered page.
+
+    Nothing here is a Recovery_Case state. A stage is a *presentation* of what the audit trail
+    shows happened; ``CaseState`` is what the case is. They overlap in wording and not in meaning:
+    a case sitting in ``RECOVERED`` has all nine stages, most of them ``DONE``, and a case in
+    ``BLOCKED`` has nine stages too — several of them ``SKIPPED`` with a recorded reason.
+    """
+
+    DETECTED = "DETECTED"
+    DIAGNOSED = "DIAGNOSED"
+    BASELINE_ESTIMATED = "BASELINE_ESTIMATED"
+    ALTERNATIVES_PRICED = "ALTERNATIVES_PRICED"
+    DECIDED = "DECIDED"
+    POLICY_CHECKED = "POLICY_CHECKED"
+    EXECUTED = "EXECUTED"
+    CUSTOMER_RESPONDED = "CUSTOMER_RESPONDED"
+    OUTCOME_VERIFIED = "OUTCOME_VERIFIED"
+
+
+@unique
+class TimelineStageStatus(StrEnum):
+    """Exactly one of these is assigned to every Timeline_Stage (R26.C2).
+
+    Four members, and the distinction between the last three is the entire honesty claim of the
+    timeline. ``DONE`` may be assigned **only** where a persisted Audit_Record satisfies the
+    declared completion rule for that stage — never on the strength of an absent record, and never
+    inferred from a later stage having completed (R26.C2, R26.C11, P57).
+
+    ``SKIPPED`` and ``UPCOMING`` are both "there is no completing record", and they are not
+    interchangeable: ``SKIPPED`` means the lifecycle went past this stage without producing one and
+    the timeline names the reason from the audit trail, while ``UPCOMING`` means the case has not
+    reached it yet. A reader shown one where the other holds draws the opposite conclusion about
+    whether anything further will happen — which is the same failure R14.C15 exists to prevent for
+    figures, restated for stages.
+
+    There is deliberately no ``FAILED`` and no ``UNKNOWN``. A stage whose evidence could not be
+    read is not a stage with a status; it is a projection that did not complete, and R26.C10
+    answers that with a data-unavailable marker naming the case rather than with a substituted
+    status.
+    """
+
+    DONE = "DONE"
+    IN_PROGRESS = "IN_PROGRESS"
+    UPCOMING = "UPCOMING"
+    SKIPPED = "SKIPPED"
 
 
 NOT_ESTABLISHED = "NOT_ESTABLISHED"

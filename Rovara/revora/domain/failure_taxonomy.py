@@ -66,7 +66,7 @@ from enum import StrEnum, unique
 from types import MappingProxyType
 from typing import Final
 
-from revora.domain.enums import RiskCause
+from revora.domain.enums import DiagnosisEvidenceSource, RiskCause
 
 __all__ = [
     "ALREADY_PAID_REASONS",
@@ -84,6 +84,7 @@ __all__ = [
     "EVIDENCE_OPERATIONAL_ALERT",
     "EVIDENCE_OUTCOME",
     "EVIDENCE_RULE_ID",
+    "EVIDENCE_SOURCE",
     "MERCHANT_INTEGRATION_FAULT_REASONS",
     "REASON_TO_CAUSE",
     "SOURCE_STEP_TO_CAUSE",
@@ -583,6 +584,14 @@ def _normalize_code(value: str | None) -> str | None:
 # Evidence
 # ---------------------------------------------------------------------------
 
+EVIDENCE_SOURCE: Final[str] = "evidence_source"
+"""Which input the cause was read off, as a :class:`DiagnosisEvidenceSource` value.
+
+Declared here with the other evidence keys even though the *second* source lives above
+the domain layer, because the key is the interface and one name for it is the point. A
+row without this key predates R20.C4 and its source is the provider's error fields by
+construction — there was no other one."""
+
 EVIDENCE_OUTCOME: Final[str] = "taxonomy_outcome"
 EVIDENCE_MATCH_KEY: Final[str] = "matched_key"
 EVIDENCE_RULE_ID: Final[str] = "rule_id"
@@ -626,6 +635,11 @@ def match_evidence(
     power.
     """
     evidence: dict[str, str | bool] = {
+        # Stated rather than implied. Until R20.C4 the provider's error fields were the
+        # only source there was, so naming them looked redundant; now that a stated
+        # reason can produce a DETERMINISTIC cause too, a row that names no source is
+        # ambiguous rather than obvious.
+        EVIDENCE_SOURCE: DiagnosisEvidenceSource.PROVIDER_ERROR_CODE.value,
         EVIDENCE_OUTCOME: match.outcome.value,
         EVIDENCE_RULE_ID: match.rule_id,
         EVIDENCE_MATCHED: match.is_deterministic_hit,

@@ -18,7 +18,10 @@ opted-out customer was contacted:
 3. ``DUPLICATE_ACTION`` — an unresolved intent already exists.
 4. ``FRAUD_OR_RISK`` — a human decides, not us.
 5. ``CUSTOMER_OPTED_OUT`` — **before every bound**, deliberately. A bug in an attempt
-   counter must not be able to leak a message to somebody who asked us to stop.
+   counter must not be able to leak a message to somebody who asked us to stop. Reads two
+   inputs: the customer-wide opt-out of R17.C10 and the scoped Contact_Suppression of R21.
+   Requirement 21 adds no thirteenth check for exactly this reason — a hard stop is an absolute
+   prohibition, and this is the position absolute prohibitions occupy.
 6. ``CONSENT_MISSING``
 7. ``HUMAN_OWNERSHIP`` — a human owner suspends automation entirely.
 8. ``WINDOW_EXPIRED``
@@ -353,10 +356,34 @@ def _opted_out(order: int, candidate: PolicyInput) -> CheckResult:
 
     An unreadable consent record is ``UNAVAILABLE``. This is the single most important
     ``UNAVAILABLE`` in the engine.
+
+    **Two inputs, one check** (R21.C3). ``customer_opted_out`` is the customer-wide withdrawal
+    of consent of R17.C10; ``contact_suppressed`` is a Contact_Suppression covering this case's
+    Suppression_Scope, written because the customer disputed the charge or cancelled the order.
+    Both fail, and both fail *here* rather than in a check of their own, because both are
+    absolute prohibitions and this is the position absolute prohibitions occupy — before the
+    window and before all three counters. R21 states plainly that it adds no thirteenth check,
+    and this is the whole of that: one more named boolean on the input, evaluated fifth.
+
+    The suppression is checked **before** the opt-out flag, and the order is not arbitrary even
+    though both produce the same verdict. The recorded ``detail`` is what a merchant reads to
+    learn *what the customer said*, and "they disputed this charge" and "they withdrew consent
+    to be contacted at all" are different statements with different consequences outside Revora.
+    Where both hold, the scoped, more recent, more specific one is the more useful answer.
+
+    Both are also checked after the customer-visibility gate, for the same reason the opt-out
+    always was: a suppression ends automated *contact*, and escalating a suppressed case to a
+    person is the outcome R21 wants rather than one it forbids. A hard stop that blocked
+    ``HUMAN_ESCALATION`` would leave the case nobody is allowed to message also unreachable by
+    the person who has to deal with the dispute.
     """
     if not _is_customer_visible_for(candidate):
         return CheckResult(
             PolicyCheck.CUSTOMER_OPTED_OUT, order, CheckOutcome.PASS, "not_customer_visible"
+        )
+    if candidate.contact_suppressed:
+        return CheckResult(
+            PolicyCheck.CUSTOMER_OPTED_OUT, order, CheckOutcome.FAIL, "contact_suppressed"
         )
     if candidate.customer_opted_out is None and candidate.consent_recorded:
         return CheckResult(

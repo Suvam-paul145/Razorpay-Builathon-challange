@@ -11,6 +11,16 @@ non-positive check comes *first* and returns, and the ratio is computed only for
 candidates that got past it. ``cost_ratio`` stays ``None`` on the excluded ones, which is
 the recorded evidence that the division was skipped rather than performed and discarded.
 
+R31.C4 restates that ordering over the four-term cost and asks for it **unchanged**, and
+it is unchanged: the numerator moved from a three-term sum to a four-term one, and the
+``NON_POSITIVE_INCREMENTAL_VALUE`` return still happens before any division exists to be
+performed. Nothing in this module reads ``financial_cost`` or ``communication_cost``
+individually — every rule here reads ``total_cost``, which sums all four — so for any
+input whose two split terms add up to the pre-split blended figure, every exclusion
+reason, every rank and the selected action are identical to the three-term form. That is
+Property 67, and it is why the split is a presentation change rather than a decision
+change.
+
 **The pool that competes is not the same as the pool that survived exclusion (R7.C4, R7.C5).**
 The two null actions are deliberately never excluded, so "everything unexcluded" is never empty —
 and while the pool was defined that way, ``NO_POSITIVE_VALUE`` was unreachable code and a world
@@ -238,7 +248,7 @@ def _apply_exclusions(
     3. **Non-positive incremental value** — and this is where the ratio is *not*
        computed. Returns immediately, leaving ``cost_ratio`` as ``None``.
     4. **Cost ratio exceeded** — safe to compute only now that the denominator is known
-       positive.
+       positive. Its numerator is ``total_cost``, the four-term sum, per R31.C4.
     5. **Below the incremental-probability floor**, then **below the net-value floor** —
        the two configured thresholds a survivor must clear.
 
@@ -305,6 +315,10 @@ def _ranking_key(item: EvaluatedCandidate) -> tuple[int, int, int]:
     index ascending. Every component is an integer, so the comparison is exact and there
     is no tie the ordering cannot break — which is what makes the selection independent
     of input order.
+
+    The key is unchanged by the four-term split. Both of its first two components are
+    integer sums over the same cost terms, so a candidate whose blended total is unchanged
+    lands at exactly the same position — see the module docstring and Property 67.
 
     Probability magnitude appears nowhere in this key, and that is the point.
     """

@@ -2,8 +2,8 @@
 
 Requirement 6 calls this the ``Intervention_Simulator`` and the design's amendment list
 overrules the name: *"Describe and implement as a prior lookup, not a simulator."* The
-honest description of what this module does is that it reads four numbers per action out
-of a table of configured assumptions, sets two of them by definition where a requirement
+honest description of what this module does is that it reads five numbers per action out
+of a table of configured assumptions, sets some of them by definition where a requirement
 fixes them, derives one from the baseline posterior, and labels every remaining figure
 ``UNCALIBRATED``. There is no model, no sampling, no counterfactual, and nothing that
 would justify the word simulate.
@@ -28,14 +28,15 @@ label it and then measure it.
 
 ``DO_NOTHING`` is *definitional*, not estimated. Its probability **equals** the baseline
 exactly — the same ``Probability`` value, not a recomputation that agrees to four places
-— and all three costs are exactly zero, with method ``DEFINITIONAL`` on all four
-figures. That is what makes the arithmetic downstream come out at exactly zero
+— and all four costs are exactly zero, with method ``DEFINITIONAL`` on all five
+figures (R31.C6). That is what makes the arithmetic downstream come out at exactly zero
 incremental probability, exactly zero expected incremental revenue and exactly zero net
 value, which is Property 19. If ``DO_NOTHING`` were estimated like anything else, its
 incremental value would be noise around zero, and roughly half the time Revora would
 find a reason to act purely because the null action's estimate happened to land low.
 
-``WAIT`` has zero action cost and zero customer cost by requirement (R6.C10), and a
+``WAIT`` has zero financial, communication and customer cost by requirement (R6.C10,
+R31.C2 — it reaches nobody), and a
 probability derived from the no-intervention hazard over the time left in the window.
 See :func:`wait_probability` for the assumption that derivation rests on. ``WAIT`` is not
 free of consequence — it spends the recovery window — but it spends it in a way the
@@ -80,6 +81,7 @@ from revora.domain.actions import (
     UNAVAILABLE_IN_MVP,
     CandidateAction,
     candidate_set_for,
+    is_customer_visible,
 )
 from revora.domain.enums import (
     ActionAvailability,
@@ -99,14 +101,19 @@ from revora.persistence.repositories.estimates import (
     SegmentObservationRepository,
 )
 from revora.platform.clock import now
-from revora.platform.config import Configuration
+from revora.platform.config import Configuration, money_default
 from revora.platform.logging import get_logger
 
 __all__ = [
     "CANDIDATE_MODEL_VERSION",
     "COST_PRIORS",
     "FAILURE_NO_BASELINE",
+    "HUMAN_ESCALATION_FINANCIAL_COST",
+    "MESSAGE_COMMUNICATION_COST",
     "METHOD_WEAKNESS_ORDER",
+    "PAYMENT_LINK_FINANCIAL_COST",
+    "PROMISE_FOLLOW_UP_COMMUNICATION_COST",
+    "PROMISE_FOLLOW_UP_FINANCIAL_COST",
     "REJECTION_METHOD_NOT_RECORDED",
     "REJECTION_OUT_OF_RANGE",
     "UPLIFT_PRIORS",
@@ -118,6 +125,7 @@ __all__ = [
     "RejectedFigure",
     "build_candidate_set",
     "candidate_figures",
+    "cost_prior_for",
     "run_candidate_estimation",
     "validate_figures",
     "wait_probability",
@@ -141,57 +149,182 @@ name that overstates what produced a number is the cheapest possible way to misl
 
 @dataclass(frozen=True, slots=True)
 class CostPrior:
-    """The three costs of one action, in integer minor currency units.
+    """The four costs of one action, in integer minor currency units.
 
-    Three separate figures rather than a total, matching the schema, because they answer
-    different questions and are owned by different people. ``action_cost`` is what
-    performing the action costs the merchant; ``risk_cost`` prices the expected cost of
-    it going wrong; ``customer_cost`` prices the intrusion on the customer. A single
-    ``cost`` column would make the customer's interest invisible in the arithmetic, and
-    a value model that cannot see the customer's interest will spend it.
+    Four separate figures rather than a total, matching the schema, because they answer
+    different questions and are owned by different people. ``financial_cost`` is the
+    provider fee directly attributable to performing the action; ``communication_cost``
+    is what reaching the customer costs per message, and is zero for an action the
+    customer never perceives; ``risk_cost`` prices the expected cost of it going wrong;
+    ``customer_cost`` prices the intrusion on the customer. A single ``cost`` column
+    would make the customer's interest invisible in the arithmetic, and a value model
+    that cannot see the customer's interest will spend it.
+
+    The first two were one blended ``action_cost`` until R31.C1 split them, and the
+    reason for the split is attribution rather than accuracy: blended, a candidate
+    excluded under ``MAX_COST_TO_VALUE_RATIO`` because links are expensive and one
+    excluded because messages are expensive present identically, so a merchant cannot
+    tell a fee they could renegotiate from a channel they could change. Split, the two
+    are only ever *consumed* as a sum (see the optimizer), which is why the split
+    changes what a reader can attribute and nothing about what gets selected.
     """
 
-    action_cost: Minor
+    financial_cost: Minor
+    communication_cost: Minor
     risk_cost: Minor
     customer_cost: Minor
 
 
+PAYMENT_LINK_FINANCIAL_COST: Final[Minor] = money_default("PAYMENT_LINK_FINANCIAL_COST")
+"""The provider fee attributable to creating one payment link. **[ASSUMPTION]**.
+
+**Not a constant in this module.** R31.C11 makes it a versioned ``app_config`` row, so
+the number itself lives in ``platform.config``'s catalogue as that bound's default,
+migration ``0009`` seeds the row from the same declaration, and this name binds to the
+default rather than restating it. Writing ``300`` here as well is the specific failure
+the arrangement rules out: two places to edit, one of which silently wins.
+
+What this name *is*, therefore, is the fallback — the value the prior table carries when
+no row has been read. :func:`cost_prior_for` is what the estimator actually prices
+through, and it reads the row off the ``Configuration`` rather than this name."""
+
+MESSAGE_COMMUNICATION_COST: Final[Minor] = money_default("MESSAGE_COMMUNICATION_COST")
+"""Per-message delivery cost of one customer-visible action. **[ASSUMPTION]**.
+
+Also an R31.C11 configuration row, bound from the catalogue's default for the same
+reason, and the fallback on the same terms."""
+
+PROMISE_FOLLOW_UP_FINANCIAL_COST: Final[Minor] = ZERO
+"""Provider fee of following up on a promise: **zero, and verified rather than assumed**.
+
+The endpoint is ``POST /v1/payment_links/:id/notify_by/:medium``, which re-notifies
+against the payment link already recorded for the case and **creates no second link**.
+No new link means no new link fee, so this zero is a fact about the provider's API
+rather than a placeholder — the only figure in this table that is not an
+**[ASSUMPTION]**. If that endpoint ever stopped existing, a follow-up would have to
+mint a fresh link and this figure would become ``PAYMENT_LINK_FINANCIAL_COST``."""
+
+PROMISE_FOLLOW_UP_COMMUNICATION_COST: Final[Minor] = Minor(50)
+"""Per-message delivery cost of a promise follow-up. **[ASSUMPTION]**.
+
+Higher than ``MESSAGE_COMMUNICATION_COST`` because a follow-up is priced against the
+provider's re-notification rather than against the notification bundled with a new
+link. Nothing has measured either, so the ordering between them is a guess too."""
+
+HUMAN_ESCALATION_FINANCIAL_COST: Final[Minor] = Minor(25_000)
+"""Staff time for one escalation. **[ASSUMPTION]**.
+
+Not a provider fee, and the one figure here whose cost is genuinely internal — which
+also makes it the one most likely to be replaced by a real merchant-supplied number."""
+
+
 COST_PRIORS: Final[Mapping[CandidateAction, CostPrior]] = {
-    CandidateAction.DO_NOTHING: CostPrior(ZERO, ZERO, ZERO),
-    CandidateAction.WAIT: CostPrior(ZERO, ZERO, ZERO),
-    # A payment link costs nothing to create — the provider charges on success, which is
-    # a cost of the recovered revenue rather than of the attempt. The customer cost is
-    # the notification it carries. [ASSUMPTION] on the customer figure.
-    CandidateAction.PAYMENT_LINK: CostPrior(ZERO, ZERO, Minor(1_000)),
-    # A link with provider notification enabled: the same mechanism, priced higher on
-    # the customer side because it reaches out unprompted. [ASSUMPTION].
-    CandidateAction.CUSTOMER_MESSAGE: CostPrior(ZERO, ZERO, Minor(2_000)),
-    # Staff time. The one action whose cost is genuinely an internal one, and the one
-    # most likely to be replaced by a real merchant-supplied number. [ASSUMPTION].
-    CandidateAction.HUMAN_ESCALATION: CostPrior(Minor(25_000), ZERO, ZERO),
+    CandidateAction.DO_NOTHING: CostPrior(ZERO, ZERO, ZERO, ZERO),
+    CandidateAction.WAIT: CostPrior(ZERO, ZERO, ZERO, ZERO),
+    # A payment link carries a creation fee and the notification it sends. The customer
+    # cost prices the intrusion of that notification. [ASSUMPTION] on all three
+    # non-zero figures.
+    CandidateAction.PAYMENT_LINK: CostPrior(
+        PAYMENT_LINK_FINANCIAL_COST, MESSAGE_COMMUNICATION_COST, ZERO, Minor(1_000)
+    ),
+    # A link with provider notification enabled: the same mechanism and therefore the
+    # same two cost figures, priced higher on the customer side because it reaches out
+    # unprompted. [ASSUMPTION].
+    CandidateAction.CUSTOMER_MESSAGE: CostPrior(
+        PAYMENT_LINK_FINANCIAL_COST, MESSAGE_COMMUNICATION_COST, ZERO, Minor(2_000)
+    ),
+    # The one action with a verified-zero financial term. See
+    # PROMISE_FOLLOW_UP_FINANCIAL_COST: the resend creates no second link.
+    CandidateAction.PROMISE_TO_PAY_FOLLOW_UP: CostPrior(
+        PROMISE_FOLLOW_UP_FINANCIAL_COST,
+        PROMISE_FOLLOW_UP_COMMUNICATION_COST,
+        ZERO,
+        Minor(2_000),
+    ),
+    # Staff time, and zero communication cost because an escalation is not
+    # customer-visible — R31.C2 fixes that term at zero rather than leaving it guessed.
+    CandidateAction.HUMAN_ESCALATION: CostPrior(
+        HUMAN_ESCALATION_FINANCIAL_COST, ZERO, ZERO, ZERO
+    ),
     # The three MVP-unavailable actions. Zero across the board because an action that
     # cannot be performed costs nothing; the reason they are not simply omitted is
     # R6.C9, which retains them in the recorded set so the dashboard can show they were
     # considered.
-    CandidateAction.RETRY: CostPrior(ZERO, ZERO, ZERO),
-    CandidateAction.DELAYED_RETRY: CostPrior(ZERO, ZERO, ZERO),
-    CandidateAction.PAYMENT_METHOD_UPDATE: CostPrior(ZERO, ZERO, ZERO),
-    CandidateAction.PROMISE_TO_PAY_FOLLOW_UP: CostPrior(ZERO, ZERO, ZERO),
+    CandidateAction.RETRY: CostPrior(ZERO, ZERO, ZERO, ZERO),
+    CandidateAction.DELAYED_RETRY: CostPrior(ZERO, ZERO, ZERO, ZERO),
+    CandidateAction.PAYMENT_METHOD_UPDATE: CostPrior(ZERO, ZERO, ZERO, ZERO),
 }
 """Configured cost priors per action, in minor units.
 
-**Every figure is an [ASSUMPTION] placeholder that no measurement supports**, exactly
-like the bounds in ``platform.config``, and for the same reason: they were chosen to
-make the requirements testable, not because anything measured them. They are constants
-here rather than configuration rows only because the configuration catalogue has no
-bound for them yet; when it gains one, this mapping becomes its default.
+**Every figure here is an [ASSUMPTION] placeholder that no measurement supports** —
+with the single exception of ``PROMISE_TO_PAY_FOLLOW_UP``'s financial term, which is a
+verified zero and says so at its own declaration. Otherwise these are exactly like the
+bounds in ``platform.config``, and two of them now literally are: under R31.C11
+``PAYMENT_LINK_FINANCIAL_COST`` and ``MESSAGE_COMMUNICATION_COST`` are versioned
+``app_config`` rows, declared in that catalogue, seeded from it by migration ``0009``,
+and read back here through ``money_default``. So this mapping is what those rows *default
+to* — the fallback — and not a second source of truth: the two numbers appear once, in
+the catalogue.
+
+**Nothing prices an action from this mapping directly.** :func:`cost_prior_for` is the
+only reader, and for the two R31.C11 actions it takes the financial and communication
+terms off the ``Configuration`` — so changing the row changes what gets priced, which is
+what makes the recorded configuration change naming an approving user have a consequence.
+The entries below are what those two terms fall back to when no row has been read, and
+the sole source of the other seven actions' figures.
 
 The design's Weak Assumptions list names the customer-annoyance cost as a **RESEARCH
 MORE** item specifically because every cost-ratio exclusion in the optimizer depends on
-it. That is the honest status of the two customer figures above: they decide real
+it. That is the honest status of the three customer figures above: they decide real
 exclusions and nobody has measured them. ``risk_cost`` is zero throughout rather than
 guessed, because a fabricated risk figure would silently suppress actions and a zero one
 at least fails visibly in the direction of acting."""
+
+_CONFIGURED_COST_ACTIONS: Final[frozenset[CandidateAction]] = frozenset(
+    {CandidateAction.PAYMENT_LINK, CandidateAction.CUSTOMER_MESSAGE}
+)
+"""The actions whose financial and communication terms come from a configuration row.
+
+Exactly the two R31.C11 names, and no more. ``PROMISE_TO_PAY_FOLLOW_UP``'s financial term
+is a *verified* zero rather than a tunable figure — see
+:data:`PROMISE_FOLLOW_UP_FINANCIAL_COST` — so exposing it as a row would invite somebody
+to tune away a fact about the provider's API. The other three non-zero figures
+(``PROMISE_FOLLOW_UP_COMMUNICATION_COST``, ``HUMAN_ESCALATION_FINANCIAL_COST``, and the
+customer costs) stay in the table because no requirement has asked for them to be
+changeable, and a bound nobody needs is still a bound somebody can get wrong."""
+
+
+def cost_prior_for(action: CandidateAction, config: Configuration) -> CostPrior:
+    """The four cost priors of one action, with the configured rows taking precedence.
+
+    R31.C11 requires ``PAYMENT_LINK_FINANCIAL_COST`` and ``MESSAGE_COMMUNICATION_COST`` to
+    be versioned configuration rows changeable only through a recorded change naming an
+    approving user. Seeding the rows is not enough on its own: an estimator that read the
+    module constant would price identically whatever the row said, and the recorded change
+    would have no consequence. So the two terms are read from ``config`` here, and this is
+    the only function that reads :data:`COST_PRIORS`.
+
+    Only the two named terms are overridden, and only for the two actions R31.C11 names.
+    ``risk_cost`` and ``customer_cost`` come from the table unchanged even for those
+    actions, because those figures are not configured and substituting a configured one
+    would make a cost-ratio exclusion attributable to a row nobody set.
+
+    The value is not re-validated here. A negative or otherwise impossible configured cost
+    reaches :func:`validate_figures` like any other figure and is rejected there, naming
+    the term — which is where R6.C12's "outside its declared valid range" check belongs,
+    and means a misconfigured row produces an ``INVALID_ESTIMATE`` record rather than a
+    silently clamped price.
+    """
+    prior = COST_PRIORS.get(action, CostPrior(ZERO, ZERO, ZERO, ZERO))
+    if action not in _CONFIGURED_COST_ACTIONS:
+        return prior
+    return CostPrior(
+        financial_cost=config.PAYMENT_LINK_FINANCIAL_COST,
+        communication_cost=config.MESSAGE_COMMUNICATION_COST,
+        risk_cost=prior.risk_cost,
+        customer_cost=prior.customer_cost,
+    )
+
 
 UPLIFT_PRIORS: Final[Mapping[CandidateAction, Decimal]] = {
     CandidateAction.PAYMENT_LINK: Decimal("0.0800"),
@@ -218,6 +351,7 @@ probability would be claiming an effect from an act that cannot occur."""
 # ---------------------------------------------------------------------------
 
 METHOD_WEAKNESS_ORDER: Final[tuple[EstimationMethod, ...]] = (
+    EstimationMethod.COST_SPLIT_NOT_MEASURED,
     EstimationMethod.UNCALIBRATED,
     EstimationMethod.PRIOR_FALLBACK,
     EstimationMethod.DETERMINISTIC,
@@ -225,10 +359,24 @@ METHOD_WEAKNESS_ORDER: Final[tuple[EstimationMethod, ...]] = (
 )
 """Weakest claim first.
 
-``UNCALIBRATED`` is the weakest: nothing has checked it. ``PRIOR_FALLBACK`` is next: it
-is a stated prior applied deliberately. ``DETERMINISTIC`` means fitted from data.
+``COST_SPLIT_NOT_MEASURED`` is the weakest, ahead of ``UNCALIBRATED``, and the position
+is the whole point of adding it. ``UNCALIBRATED`` means somebody stated a prior that
+nothing has checked; ``COST_SPLIT_NOT_MEASURED`` means **nothing measured the figure and
+nothing guessed it either** — migration ``0008`` put a blended total into
+``financial_cost`` and left ``communication_cost`` at zero. That is strictly less of a
+claim than an unchecked guess, so it has to sort first: put it anywhere above
+``UNCALIBRATED`` and a migrated row's summary method would make a genuinely estimated
+probability look more checked than it is.
+
+``UNCALIBRATED`` is next: nothing has checked it. ``PRIOR_FALLBACK`` follows: it is a
+stated prior applied deliberately. ``DETERMINISTIC`` means fitted from data.
 ``DEFINITIONAL`` is strongest because it cannot be wrong — a figure fixed at zero by a
-requirement is not an estimate at all."""
+requirement is not an estimate at all.
+
+No estimator produces ``COST_SPLIT_NOT_MEASURED``, so nothing this module writes will
+ever select it. It is here because :func:`weakest_method` is also the summary applied to
+rows read back out of the database, and an ordering that omitted a persisted label would
+raise on a historical row rather than rank it."""
 
 
 def weakest_method(*methods: EstimationMethod) -> EstimationMethod:
@@ -236,12 +384,15 @@ def weakest_method(*methods: EstimationMethod) -> EstimationMethod:
 
     R6.C5 wants a method recorded per figure, and ``candidate_estimate`` has one
     ``method`` column. Rather than change a frozen schema, the row records the weakest
-    of its four figures and the audit record carries all four individually. The weakest
+    of its five figures and the audit record carries all five individually. The weakest
     is the right summary because a candidate is consumed as a unit: the optimizer
-    multiplies the probability by an amount and subtracts all three costs, so the
+    multiplies the probability by an amount and subtracts all four costs, so the
     resulting net value is only as trustworthy as its least trustworthy input. Recording
     the strongest, or the modal one, would let a ``DEFINITIONAL`` zero cost make an
     ``UNCALIBRATED`` probability look checked.
+
+    Splitting the action term into two (R31.C1) adds a fifth figure and changes nothing
+    here in principle: a fifth input to a minimum is still a minimum.
     """
     for method in METHOD_WEAKNESS_ORDER:
         if method in methods:
@@ -331,7 +482,7 @@ REJECTION_METHOD_NOT_RECORDED: Final[str] = "METHOD_NOT_RECORDED"
 
 @dataclass(frozen=True, slots=True)
 class RawFigures:
-    """One action's four figures before they are validated into typed values.
+    """One action's five figures before they are validated into typed values.
 
     This intermediate exists so R6.C12 is a real check rather than a formality.
     ``Probability`` refuses an out-of-range value at construction and ``Minor`` is an
@@ -343,11 +494,13 @@ class RawFigures:
 
     action: CandidateAction
     intervention_probability: Decimal
-    action_cost: int
+    financial_cost: int
+    communication_cost: int
     risk_cost: int
     customer_cost: int
     probability_method: EstimationMethod | None
-    action_cost_method: EstimationMethod | None
+    financial_cost_method: EstimationMethod | None
+    communication_cost_method: EstimationMethod | None
     risk_cost_method: EstimationMethod | None
     customer_cost_method: EstimationMethod | None
     availability: ActionAvailability = ActionAvailability.AVAILABLE
@@ -375,18 +528,23 @@ class CandidateFigures:
     """One action's validated estimate, with a method per figure.
 
     Immutable, and every field lands either in a ``candidate_estimate`` column or in the
-    audit record. The four per-figure methods are kept separately here even though the
+    audit record. The five per-figure methods are kept separately here even though the
     row stores one summary, so the audit trail can carry what R6.C5 asks for — see
-    :func:`weakest_method`.
+    :func:`weakest_method`. Two of the five now have columns of their own
+    (``financial_cost_method``, ``communication_cost_method``) because R31.C10 needs the
+    split's provenance readable beside the split's figures, which a row-level summary
+    cannot express.
     """
 
     action: CandidateAction
     intervention_probability: Probability
-    action_cost: Minor
+    financial_cost: Minor
+    communication_cost: Minor
     risk_cost: Minor
     customer_cost: Minor
     probability_method: EstimationMethod
-    action_cost_method: EstimationMethod
+    financial_cost_method: EstimationMethod
+    communication_cost_method: EstimationMethod
     risk_cost_method: EstimationMethod
     customer_cost_method: EstimationMethod
     availability: ActionAvailability
@@ -394,31 +552,43 @@ class CandidateFigures:
 
     @property
     def recorded_method(self) -> EstimationMethod:
-        """The single method the row stores: the weakest of the four."""
+        """The single method the row stores: the weakest of the five.
+
+        Still the weakest over *all* of them rather than over the four that are not the
+        split, because a candidate is consumed as a unit — the optimizer subtracts every
+        cost term from one net value, so a weak term weakens the whole row.
+        """
         return weakest_method(
             self.probability_method,
-            self.action_cost_method,
+            self.financial_cost_method,
+            self.communication_cost_method,
             self.risk_cost_method,
             self.customer_cost_method,
         )
 
     @property
     def total_cost(self) -> Minor:
-        """The three costs summed. Integer addition, so exact."""
-        return Minor(int(self.action_cost) + int(self.risk_cost) + int(self.customer_cost))
+        """The four costs summed. Integer addition, so exact."""
+        return Minor(
+            int(self.financial_cost)
+            + int(self.communication_cost)
+            + int(self.risk_cost)
+            + int(self.customer_cost)
+        )
 
     def method_document(self) -> dict[str, str]:
         """The per-figure methods, for the audit record."""
         return {
             "intervention_probability": self.probability_method.value,
-            "action_cost": self.action_cost_method.value,
+            "financial_cost": self.financial_cost_method.value,
+            "communication_cost": self.communication_cost_method.value,
             "risk_cost": self.risk_cost_method.value,
             "customer_cost": self.customer_cost_method.value,
         }
 
 
 def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
-    """Check one action's four figures against their declared ranges and methods.
+    """Check one action's five figures against their declared ranges and methods.
 
     R6.C12: a figure outside its declared valid range, or carrying no recorded
     estimation method, marks the candidate ``UNAVAILABLE``, excludes it from selection,
@@ -426,7 +596,7 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
 
     Returns the first failure rather than all of them. One is enough to reject the
     candidate, and a caller that fixes the first will re-run and find the second — while
-    a list would invite somebody to render four rejection records for one broken row.
+    a list would invite somebody to render five rejection records for one broken row.
 
     The probability range is ``[0, 1]`` (R6.C3) and each cost must be a non-negative
     integer in the same minor units as ``payment_amount`` (R6.C7). Booleans are refused
@@ -444,7 +614,8 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
             REJECTION_OUT_OF_RANGE,
         )
     costs = (
-        ("action_cost", raw.action_cost, raw.action_cost_method),
+        ("financial_cost", raw.financial_cost, raw.financial_cost_method),
+        ("communication_cost", raw.communication_cost, raw.communication_cost_method),
         ("risk_cost", raw.risk_cost, raw.risk_cost_method),
         ("customer_cost", raw.customer_cost, raw.customer_cost_method),
     )
@@ -463,11 +634,13 @@ def validate_figures(raw: RawFigures) -> CandidateFigures | RejectedFigure:
     return CandidateFigures(
         action=raw.action,
         intervention_probability=Probability(raw.intervention_probability),
-        action_cost=Minor(raw.action_cost),
+        financial_cost=Minor(raw.financial_cost),
+        communication_cost=Minor(raw.communication_cost),
         risk_cost=Minor(raw.risk_cost),
         customer_cost=Minor(raw.customer_cost),
         probability_method=raw.probability_method,
-        action_cost_method=checked["action_cost"],
+        financial_cost_method=checked["financial_cost"],
+        communication_cost_method=checked["communication_cost"],
         risk_cost_method=checked["risk_cost"],
         customer_cost_method=checked["customer_cost"],
         availability=raw.availability,
@@ -481,57 +654,74 @@ def candidate_figures(
     baseline: Probability,
     remaining: timedelta,
     window: timedelta,
+    config: Configuration,
     memory_available: bool = True,
 ) -> RawFigures:
-    """Produce one action's four raw figures.
+    """Produce one action's five raw figures.
 
     Three shapes, and the differences between them are the substance of Requirement 6.
 
-    ``DO_NOTHING`` is definitional: the probability is the baseline **object**, all three
-    costs are zero, and all four methods are ``DEFINITIONAL``. Passing the baseline value
-    through unchanged rather than recomputing it is what makes the incremental
-    subtraction downstream come out at exactly zero rather than at a rounding artefact.
+    ``DO_NOTHING`` is definitional: the probability is the baseline **object**, all four
+    costs are zero, and all five methods are ``DEFINITIONAL`` (R31.C6). Passing the
+    baseline value through unchanged rather than recomputing it is what makes the
+    incremental subtraction downstream come out at exactly zero rather than at a
+    rounding artefact.
 
-    ``WAIT`` gets zero action and customer cost by requirement — those two are
-    ``DEFINITIONAL`` — and a probability from :func:`wait_probability`, which is derived
-    from the baseline posterior and so is ``PRIOR_FALLBACK``, or ``UNCALIBRATED`` when
-    the segment could not be read at all.
+    ``WAIT`` gets zero financial, communication and customer cost by requirement — those
+    three are ``DEFINITIONAL`` — and a probability from :func:`wait_probability`, which
+    is derived from the baseline posterior and so is ``PRIOR_FALLBACK``, or
+    ``UNCALIBRATED`` when the segment could not be read at all.
 
     Everything else gets its uplift and its costs from the tables above. The probability
     is ``UNCALIBRATED`` because nothing has ever checked the uplift. The costs split:
-    ``action_cost`` is ``PRIOR_FALLBACK`` because it is a stated figure a merchant can
-    own, while ``risk_cost`` and ``customer_cost`` are ``UNCALIBRATED`` because nothing
-    has measured what going wrong costs or what an unsolicited message costs a customer.
-    A configured zero is still ``PRIOR_FALLBACK`` and not ``DEFINITIONAL``: zero because
-    a table says so is a very different claim from zero because a requirement fixes it.
+    ``financial_cost`` is ``PRIOR_FALLBACK`` because it is a stated provider fee a
+    merchant can own, and ``communication_cost`` is ``PRIOR_FALLBACK`` for the same
+    reason **when the action reaches the customer at all** — while ``risk_cost`` and
+    ``customer_cost`` are ``UNCALIBRATED`` because nothing has measured what going wrong
+    costs or what an unsolicited message costs a customer. A configured zero is still
+    ``PRIOR_FALLBACK`` and not ``DEFINITIONAL``: zero because a table says so is a very
+    different claim from zero because a requirement fixes it.
+
+    The one exception to that last rule is the communication term of an action the
+    customer never perceives. R31.C2 *fixes* it at zero rather than configuring it, so
+    it is ``DEFINITIONAL`` — an escalation's zero messaging cost cannot be wrong, and
+    labelling it ``PRIOR_FALLBACK`` would invite somebody to tune it.
 
     Actions in ``UNAVAILABLE_IN_MVP`` are marked ``UNAVAILABLE`` with
     ``PROVIDER_CAPABILITY_UNVERIFIED`` and **retained**. Their probability is set to the
-    baseline and their costs to zero, because the truthful statement about an act that
-    cannot be performed is that it changes nothing and costs nothing — but the method
-    stays ``UNCALIBRATED`` so nothing reads those figures as measured.
+    baseline, because the truthful statement about an act that cannot be performed is
+    that it changes nothing — but the method stays ``UNCALIBRATED`` so nothing reads
+    those figures as measured.
+
+    ``config`` is required rather than defaulted, and that is R31.C11 rather than style:
+    the two configured cost rows are resolved through :func:`cost_prior_for`, and a
+    default here would be a second silent source of the two figures that a caller could
+    reach by forgetting an argument.
     """
     if action is CandidateAction.DO_NOTHING:
         return RawFigures(
             action=action,
             intervention_probability=baseline.value,
-            action_cost=int(ZERO),
+            financial_cost=int(ZERO),
+            communication_cost=int(ZERO),
             risk_cost=int(ZERO),
             customer_cost=int(ZERO),
             probability_method=EstimationMethod.DEFINITIONAL,
-            action_cost_method=EstimationMethod.DEFINITIONAL,
+            financial_cost_method=EstimationMethod.DEFINITIONAL,
+            communication_cost_method=EstimationMethod.DEFINITIONAL,
             risk_cost_method=EstimationMethod.DEFINITIONAL,
             customer_cost_method=EstimationMethod.DEFINITIONAL,
         )
 
-    costs = COST_PRIORS.get(action, CostPrior(ZERO, ZERO, ZERO))
+    costs = cost_prior_for(action, config)
 
     if action is CandidateAction.WAIT:
         derived = wait_probability(baseline, remaining=remaining, window=window)
         return RawFigures(
             action=action,
             intervention_probability=derived.value,
-            action_cost=int(ZERO),
+            financial_cost=int(ZERO),
+            communication_cost=int(ZERO),
             risk_cost=int(costs.risk_cost),
             customer_cost=int(ZERO),
             probability_method=(
@@ -539,7 +729,8 @@ def candidate_figures(
                 if memory_available
                 else EstimationMethod.UNCALIBRATED
             ),
-            action_cost_method=EstimationMethod.DEFINITIONAL,
+            financial_cost_method=EstimationMethod.DEFINITIONAL,
+            communication_cost_method=EstimationMethod.DEFINITIONAL,
             risk_cost_method=EstimationMethod.PRIOR_FALLBACK,
             customer_cost_method=EstimationMethod.DEFINITIONAL,
         )
@@ -557,11 +748,17 @@ def candidate_figures(
     return RawFigures(
         action=action,
         intervention_probability=probability,
-        action_cost=int(costs.action_cost),
+        financial_cost=int(costs.financial_cost),
+        communication_cost=int(costs.communication_cost),
         risk_cost=int(costs.risk_cost),
         customer_cost=int(costs.customer_cost),
         probability_method=EstimationMethod.UNCALIBRATED,
-        action_cost_method=cost_method,
+        financial_cost_method=cost_method,
+        communication_cost_method=(
+            cost_method
+            if is_customer_visible(action)
+            else EstimationMethod.DEFINITIONAL
+        ),
         risk_cost_method=EstimationMethod.UNCALIBRATED,
         customer_cost_method=EstimationMethod.UNCALIBRATED,
         availability=(
@@ -605,6 +802,7 @@ def build_candidate_set(
     baseline: Probability,
     remaining: timedelta,
     window: timedelta,
+    config: Configuration,
     memory_available: bool = True,
 ) -> CandidateSet:
     """Build the whole candidate set for one case. Pure.
@@ -625,6 +823,11 @@ def build_candidate_set(
     the record too would erase the evidence that a broken estimate existed. The
     substitute claims nothing — probability equal to the baseline, all costs zero — so
     it cannot be selected on its merits either.
+
+    Still pure, and ``config`` does not change that: it is a frozen value the caller
+    already holds, read for the two R31.C11 cost rows and for nothing else. Two calls
+    with equal arguments still return equal sets, which is what the neutrality
+    properties rest on.
     """
     members = candidate_set_for(cause)
     ordered = [action for action in ACTION_PRECEDENCE if action in members]
@@ -637,6 +840,7 @@ def build_candidate_set(
             baseline=baseline,
             remaining=remaining,
             window=window,
+            config=config,
             memory_available=memory_available,
         )
         validated = validate_figures(raw)
@@ -667,17 +871,24 @@ def _neutral_unavailable(
     Every figure is the neutral one — the baseline probability and zero costs — and the
     availability is ``UNAVAILABLE`` with ``INVALID_ESTIMATE_INPUT``. Constructed rather
     than validated, because it is built from a value that has already passed validation
-    (the baseline) and three literal zeros, so re-checking it would only add a path on
+    (the baseline) and four literal zeros, so re-checking it would only add a path on
     which the stand-in itself could be rejected and leave the set incomplete.
+
+    Every method is ``UNCALIBRATED`` and none is ``COST_SPLIT_NOT_MEASURED``, even though
+    the two split terms here were genuinely never measured. That label means one specific
+    thing — a row migration ``0008`` rewrote — and reusing it for a live rejection would
+    make a configuration bug indistinguishable from a historical row.
     """
     return CandidateFigures(
         action=action,
         intervention_probability=baseline,
-        action_cost=ZERO,
+        financial_cost=ZERO,
+        communication_cost=ZERO,
         risk_cost=ZERO,
         customer_cost=ZERO,
         probability_method=EstimationMethod.UNCALIBRATED,
-        action_cost_method=EstimationMethod.UNCALIBRATED,
+        financial_cost_method=EstimationMethod.UNCALIBRATED,
+        communication_cost_method=EstimationMethod.UNCALIBRATED,
         risk_cost_method=EstimationMethod.UNCALIBRATED,
         customer_cost_method=EstimationMethod.UNCALIBRATED,
         availability=ActionAvailability.UNAVAILABLE,
@@ -807,6 +1018,7 @@ def run_candidate_estimation(
         baseline=Probability(baseline.probability),
         remaining=case.window_end_at - moment,
         window=config.RECOVERY_WINDOW_DURATION,
+        config=config,
         memory_available=memory_available,
     )
 
@@ -819,9 +1031,15 @@ def run_candidate_estimation(
                 "baseline_estimate_id": baseline.id,
                 "action": figure.action.value,
                 "intervention_probability": figure.intervention_probability.value,
-                "action_cost": int(figure.action_cost),
+                "financial_cost": int(figure.financial_cost),
+                "communication_cost": int(figure.communication_cost),
                 "risk_cost": int(figure.risk_cost),
                 "customer_cost": int(figure.customer_cost),
+                # R31.C5 leaves neither label unset. The columns are nullable because
+                # migration 0008 had no correct value to guess for historical rows, not
+                # because a new estimate may omit them.
+                "financial_cost_method": figure.financial_cost_method.value,
+                "communication_cost_method": figure.communication_cost_method.value,
                 "method": figure.recorded_method.value,
                 "provenance": provenance.value,
                 "availability": figure.availability.value,
@@ -971,7 +1189,8 @@ def _write_candidate_audit(
                     {
                         "action": figure.action.value,
                         "intervention_probability": str(figure.intervention_probability),
-                        "action_cost": int(figure.action_cost),
+                        "financial_cost": int(figure.financial_cost),
+                        "communication_cost": int(figure.communication_cost),
                         "risk_cost": int(figure.risk_cost),
                         "customer_cost": int(figure.customer_cost),
                         "availability": figure.availability.value,

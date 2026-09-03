@@ -124,7 +124,34 @@ class PolicyInput:
 
     # -- consent (checks 5 and 6) --------------------------------------------
     customer_opted_out: bool | None
-    """``None`` means the consent record could not be read. Blocks."""
+    """``None`` means the consent record could not be read. Blocks.
+
+    The customer-wide status of R17.C10: this person asked not to be contacted at all, about
+    anything. Distinct from :attr:`contact_suppressed` below, and R21.C9 turns on keeping the
+    two distinct — a suppression is applied *without* setting this, so an objection to one debt
+    stays legible as one."""
+
+    contact_suppressed: bool
+    """Whether a live Contact_Suppression covers this case's Suppression_Scope (R21.C3).
+
+    The second input to check 5, and the reason R21 adds no thirteenth check. A hard stop is an
+    absolute prohibition, and check 5 is where absolute prohibitions already sit — fifth of
+    twelve, ahead of the window and all three counters. A check of its own would have had to be
+    ordered somewhere, and every position left is after a bound, which is the one place a
+    prohibition must not be.
+
+    Resolved by the caller, like every other field here. ``revora.policy`` may not import
+    ``revora.persistence`` — the ``policy-isolation`` contract forbids it, which is what makes
+    the engine's purity structural — so the lookup happens in
+    ``revora.execution.authorization`` and arrives as this boolean.
+    ``revora.customer.suppression.suppression_in_force`` is the one function that performs it.
+
+    A plain ``bool`` with no ``None``, unlike :attr:`customer_opted_out`, and the asymmetry is
+    deliberate rather than an oversight. "The consent record could not be read" is a real state
+    with its own answer, because a consent row can exist and be unreadable. A suppression lookup
+    has no equivalent: it either found a row in force or there is none, and a read that fails
+    raises and takes the transaction with it. There is no third value to represent, and adding
+    one would create a branch that no caller can ever produce."""
 
     consent_expires_at: datetime | None
     consent_recorded: bool
@@ -194,6 +221,7 @@ class PolicyInput:
         verified_captured: bool | None,
         verified_status: str | None,
         diagnosed_cause: RiskCause | None,
+        contact_suppressed: bool,
         open_intent_exists: bool,
         intent_exists_for_key: bool,
         selected_action: CandidateAction,
@@ -220,6 +248,12 @@ class PolicyInput:
                 where no read exists.
             diagnosed_cause: the recorded cause from the active diagnosis, post
                 substitution. ``None`` where no diagnosis exists, which blocks.
+            contact_suppressed: whether a live ``contact_suppression`` row covers this case's
+                Suppression_Scope. Required rather than defaulted to ``False``, and that is the
+                point: a caller that has not performed the lookup is a type error here instead
+                of a decision made against a suppression nobody read. Defaulting it would make
+                the safe value the one you get by forgetting, which is the shape of every
+                control that has ever silently stopped applying.
             selected_action: the action being authorized.
             evaluated_at: the instant to evaluate against.
         """
@@ -242,6 +276,7 @@ class PolicyInput:
             verified_payment_captured=verified_captured,
             verified_payment_status=verified_status,
             customer_opted_out=opted_out,
+            contact_suppressed=contact_suppressed,
             consent_expires_at=expires_at,
             consent_recorded=recorded,
             risk_flagged=bool(case.risk_flagged),

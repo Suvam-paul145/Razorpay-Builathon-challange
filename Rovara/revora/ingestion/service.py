@@ -29,10 +29,9 @@ mechanically, a persisted row.
 
 from __future__ import annotations
 
-import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum, unique
 
 from revora.audit.events import (
@@ -61,6 +60,7 @@ from revora.platform.clock import now
 from revora.platform.config import Configuration
 from revora.platform.crypto import payload_cipher
 from revora.platform.logging import get_logger
+from revora.platform.ratelimit import shared_limiter, source_key
 from revora.platform.secrets import CredentialUnavailableError
 
 try:  # pragma: no cover - typing convenience only
@@ -127,36 +127,15 @@ class IngestionResult:
         return _HTTP_STATUS[self.outcome]
 
 
-class _RateLimiter:
-    """A process-local per-source fixed-window counter.
-
-    Approximate on purpose: a per-process counter over a one-minute window is enough
-    to shed a flood without a shared store, and a shared limiter is a scaling problem
-    the MVP does not have. The window resets rather than sliding, which can admit up
-    to twice the limit across a boundary — acceptable for a coarse abuse guard, and
-    documented so it is not mistaken for a precise quota.
-    """
-
-    __slots__ = ("_counts", "_lock", "_window")
-
-    def __init__(self) -> None:
-        self._counts: dict[str, tuple[datetime, int]] = {}
-        self._window = timedelta(minutes=1)
-        self._lock = threading.Lock()
-
-    def allow(self, key: str, limit_per_minute: int, moment: datetime) -> bool:
-        with self._lock:
-            start, count = self._counts.get(key, (moment, 0))
-            if moment - start >= self._window:
-                start, count = moment, 0
-            if count >= limit_per_minute:
-                self._counts[key] = (start, count)
-                return False
-            self._counts[key] = (start, count + 1)
-            return True
-
-
-_rate_limiter = _RateLimiter()
+# The limiter used to be defined here. It now lives in ``revora.platform.ratelimit``,
+# unchanged, because the customer response surface needs the same one (R29.C1) and two
+# implementations of one guarantee is two sets of window semantics. That module also carries
+# the honest account of what a process-local fixed-window counter is not — see it before
+# treating ``INGEST_RATE_LIMIT`` as a quota.
+#
+# The key is namespaced through ``source_key`` rather than being the bare slug it was, because
+# the limiter is now shared: a merchant slug and a customer token handle drawn from one
+# dictionary could otherwise pool their allowances. Same behaviour, one fewer coincidence.
 
 
 def ingest_webhook(
@@ -180,7 +159,9 @@ def ingest_webhook(
     slug = merchant_slug
     moment = now()
 
-    if not _rate_limiter.allow(slug, config.INGEST_RATE_LIMIT, moment):
+    if not shared_limiter().allow(
+        source_key(slug), config.INGEST_RATE_LIMIT, moment
+    ):
         _audit_unattached(
             merchant_id,
             AuditEntry(event_type=RATE_LIMIT_APPLIED, actor=_INGESTION_ACTOR),

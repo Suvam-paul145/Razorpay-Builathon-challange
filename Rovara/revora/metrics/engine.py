@@ -60,6 +60,8 @@ from revora.persistence.models import (
     Diagnosis,
     ExecutionIntent,
     MemoryObservation,
+    PolicyDecision,
+    RecommendationCandidate,
     RecoveryCase,
     RecoveryOutcome,
 )
@@ -243,6 +245,18 @@ class CohortMetrics:
     total_recovery_cost: int
     unresolved_revenue: int
 
+    financial_cost: int
+    communication_cost: int
+    risk_cost: int
+    customer_cost: int
+    """The four cost terms of every confirmed executed Candidate_Action in the period (R31.C12).
+
+    Four fields rather than one, and that is the whole of R31.C12: a merchant looking at a
+    recovery cost needs to know whether it was provider fees, message delivery, expected loss or
+    customer friction, because the first is a contract they could renegotiate and the last is a
+    choice they made. Summed into one figure the four are indistinguishable, which is the same
+    failure R31.C1 fixed one layer down."""
+
     blocked_case_count: int
     escalated_case_count: int
     unnecessary_action_count: int
@@ -262,8 +276,28 @@ class CohortMetrics:
 
     @property
     def net_recovered_revenue(self) -> int:
-        """Observed recovery less the cost of recovering it (R12.C6). Integer arithmetic."""
+        """Observed recovery less the cost of recovering it (R12.C6). Integer arithmetic.
+
+        Reads ``total_recovery_cost`` — the *realized* cost — and deliberately not
+        :attr:`total_action_cost`, which is a sum of estimates. See :func:`_realized_cost`:
+        subtracting a prediction from revenue is how a net revenue figure stops meaning anything.
+        The two sit side by side in the report so the difference is visible rather than resolved
+        by whoever reads it.
+        """
         return self.observed_recovered_revenue - self.total_recovery_cost
+
+    @property
+    def total_action_cost(self) -> int:
+        """The four cost terms summed (R31.C12). Integer addition, so exact.
+
+        Reported *alongside* the four terms and never in place of them. A reader given only this
+        can tell that recovery cost something and nothing about what."""
+        return (
+            self.financial_cost
+            + self.communication_cost
+            + self.risk_cost
+            + self.customer_cost
+        )
 
     @property
     def is_synthetic(self) -> bool:
@@ -293,6 +327,11 @@ class CohortMetrics:
             "total_recovery_cost": self.total_recovery_cost,
             "net_recovered_revenue": self.net_recovered_revenue,
             "unresolved_revenue": self.unresolved_revenue,
+            "financial_cost": self.financial_cost,
+            "communication_cost": self.communication_cost,
+            "risk_cost": self.risk_cost,
+            "customer_cost": self.customer_cost,
+            "total_action_cost": self.total_action_cost,
             "recovery_rate": _render(self.recovery_rate),
             "intervention_rate": _render(self.intervention_rate),
             "action_success_rate": _render(self.action_success_rate),
@@ -363,6 +402,7 @@ def compute_metrics(
     outcomes = _outcome_figures(session, merchant_id, case_ids)
     actions = _action_figures(session, merchant_id, case_ids)
     cost = _realized_cost(session, merchant_id, case_ids)
+    split = _estimated_action_cost(session, merchant_id, case_ids)
 
     finding = (
         incremental if incremental is not None else _incremental_finding(session, merchant_id)
@@ -385,6 +425,10 @@ def compute_metrics(
         natural_recovered_revenue=outcomes.natural_revenue,
         total_recovery_cost=cost,
         unresolved_revenue=counters.unresolved_revenue,
+        financial_cost=split.financial,
+        communication_cost=split.communication,
+        risk_cost=split.risk,
+        customer_cost=split.customer,
         blocked_case_count=counters.blocked,
         escalated_case_count=counters.escalated,
         unnecessary_action_count=actions.post_payment_actions,
@@ -688,6 +732,81 @@ def _realized_cost(
                 MemoryObservation.case_id.in_(list(case_ids)),
             )
         ).scalar_one()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CostSplit:
+    """The four estimated cost terms of the confirmed executed actions in a cohort."""
+
+    financial: int
+    communication: int
+    risk: int
+    customer: int
+
+
+def _estimated_action_cost(
+    session: Session, merchant_id: uuid.UUID, case_ids: Sequence[uuid.UUID]
+) -> _CostSplit:
+    """The four cost terms of every confirmed executed Candidate_Action, summed (R31.C12).
+
+    Reached by joining each ``CONFIRMED`` ``execution_intent`` through the
+    ``policy_decision`` that authorized it to the ``recommendation_candidate`` for the same
+    action. That path rather than a join on the case, because a case can hold several decision
+    cycles and several priced candidate sets — joining on the case would sum the cost of actions
+    that were considered and never taken. ``uq_recommendation_candidate_recommendation_action``
+    makes the (recommendation, action) pair unique, so the join cannot duplicate a term.
+
+    ``CONFIRMED`` and not merely attempted: R31.C12 says *confirmed executed*, and an intent left
+    ``UNCERTAIN`` by a provider timeout has no established effect to price. Counting one would
+    charge a merchant for a link that may not exist.
+
+    **These are estimates, and the report keeps them separate from the realized figure.** The four
+    terms come from the estimation layer's prior table, mostly ``UNCALIBRATED``; they are reported
+    beside :func:`_realized_cost`'s number rather than replacing it, and
+    :attr:`CohortMetrics.net_recovered_revenue` still subtracts the realized one. Folding an
+    estimate into a net revenue figure is the specific thing :func:`_realized_cost` refuses to do.
+    """
+    if not case_ids:
+        return _CostSplit(0, 0, 0, 0)
+
+    row = session.execute(
+        select(
+            func.coalesce(func.sum(RecommendationCandidate.financial_cost), 0).label(
+                "financial"
+            ),
+            func.coalesce(func.sum(RecommendationCandidate.communication_cost), 0).label(
+                "communication"
+            ),
+            func.coalesce(func.sum(RecommendationCandidate.risk_cost), 0).label("risk"),
+            func.coalesce(func.sum(RecommendationCandidate.customer_cost), 0).label(
+                "customer"
+            ),
+        )
+        .select_from(ExecutionIntent)
+        .join(
+            PolicyDecision,
+            (PolicyDecision.id == ExecutionIntent.policy_decision_id)
+            & (PolicyDecision.merchant_id == merchant_id),
+        )
+        .join(
+            RecommendationCandidate,
+            (RecommendationCandidate.recommendation_id == PolicyDecision.recommendation_id)
+            & (RecommendationCandidate.action == ExecutionIntent.action)
+            & (RecommendationCandidate.merchant_id == merchant_id),
+        )
+        .where(
+            ExecutionIntent.merchant_id == merchant_id,
+            ExecutionIntent.case_id.in_(list(case_ids)),
+            ExecutionIntent.state == IntentState.CONFIRMED.value,
+        )
+    ).one()
+
+    return _CostSplit(
+        financial=int(row.financial),
+        communication=int(row.communication),
+        risk=int(row.risk),
+        customer=int(row.customer),
     )
 
 

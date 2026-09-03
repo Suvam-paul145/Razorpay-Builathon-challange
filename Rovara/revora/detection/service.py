@@ -10,7 +10,10 @@ verdict the service issues ``INSERT ... ON CONFLICT DO NOTHING`` against the
 failed payment reach that insert together and exactly one wins. The loser gets
 ``None`` back, finds the open case, and attaches its event to it — leaving the
 existing ``payment_amount`` and detection timestamp untouched (R1.C10), because the
-first detection's figures are the case's figures.
+first detection's figures are the case's figures. An attach to a case resting at
+``POLICY_CHECK`` also enqueues one decision cycle for it, in the same transaction (R30.C7):
+a second failure on a payment Revora decided to wait on is evidence about that decision, and
+before this the attach recorded the event and changed nothing.
 
 Detection is idempotent under job retry. Every persisted event carries exactly one
 verdict (R1.C14, enforced by ``uq_detection_verdict_webhook_event_id``), so the
@@ -36,8 +39,9 @@ from revora.audit.events import (
     EVENT_ATTACHED_TO_CASE,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
+from revora.cases.review import enqueue_case_review
 from revora.detection.rules import DetectionResult, classify
-from revora.domain.enums import CaseState, DetectionVerdict, Provenance
+from revora.domain.enums import CaseState, DetectionVerdict, Provenance, ReviewTrigger
 from revora.domain.payment_event import (
     RECOVERY_SIGNAL_EVENTS,
     SUPPORTED_CURRENCIES,
@@ -302,4 +306,31 @@ def _open_or_attach(
         correlation_id=correlation_id,
         occurred_at=moment,
     )
+
+    # R30.C7. A second failure on a payment Revora decided to wait on is new evidence about
+    # the decision to wait, and until this enqueue existed the attach changed literally
+    # nothing: the record was written, the case stayed where it was, and the customer failed
+    # again while a case sat open doing nothing about it.
+    #
+    # In *this* transaction — the one carrying the attach and the audit record — because those
+    # three facts have to reach disk together. A commit between them would leave either an
+    # attached event with no cycle to consider it, or a queued cycle for an attach that rolled
+    # back. The queue being a table is what makes the choice available.
+    #
+    # Only from ``POLICY_CHECK``. A case anywhere else is already mid-cycle and its own step
+    # will see the attached event; the sweep and the two other triggers cover the rest. And the
+    # enqueue is idempotent through ``case_review:{case_id}`` on the job table's partial unique
+    # index, so a burst of retries on one payment produces one decision cycle (R30.C9).
+    #
+    # Nothing above touched ``payment_amount`` or ``detected_at``, and no second case was
+    # created — the first detection's figures stay the case's figures (R1.C10), and this branch
+    # is reached precisely because ``insert_if_absent`` refused to make another one.
+    if CaseState(open_case.state) is CaseState.POLICY_CHECK:
+        enqueue_case_review(
+            cases.session,
+            merchant_id,
+            open_case.id,
+            trigger=ReviewTrigger.EVENT_ATTACHED,
+            correlation_id=correlation_id,
+        )
     return open_case.id, False

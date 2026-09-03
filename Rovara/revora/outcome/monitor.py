@@ -41,10 +41,11 @@ Guessing would put a wrong number in the one table the metrics are summed from.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, unique
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from revora.audit.events import (
     ACTION_CANCELLED_PAYMENT_RECEIVED,
@@ -56,6 +57,7 @@ from revora.audit.events import (
     PAYMENT_STATE_READ_UNAVAILABLE,
     PAYMENT_STATE_UNVERIFIABLE,
     POST_PAYMENT_ACTION,
+    POST_SUPPRESSION_ACTION,
     RECOVERY_RECORDED,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
@@ -90,6 +92,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "DEFAULT_OUTCOME_SWEEP_LIMIT",
+    "IN_FLIGHT_INTENT_STATES",
     "OutcomeAssessment",
     "OutcomeVerdict",
     "observe_payment_outcome",
@@ -103,6 +106,24 @@ across passes rather than in one long run holding a connection."""
 _logger = get_logger(__name__)
 
 _ACTOR = "outcome_monitor"
+
+IN_FLIGHT_INTENT_STATES: Final[frozenset[IntentState]] = frozenset(
+    {IntentState.ATTEMPTED, IntentState.CONFIRMED, IntentState.UNCERTAIN}
+)
+"""The three intent states R21.C7 names: something went out, or may have.
+
+``IntentState`` minus ``FAILED``, and stated as the three members rather than as the
+subtraction, because the requirement names three and a reader checking this against R21.C7
+should be able to do it by looking. ``FAILED`` is excluded because it means the call was made
+and demonstrably did not land — there is no action a customer could have received, and recording
+one as post-suppression would overstate the harm in the audit log a merchant reads to decide how
+apologetic to be.
+
+Wider than ``UNRESOLVED_INTENT_STATES`` in ``persistence.repositories.policy``, which is
+``ATTEMPTED`` and ``UNCERTAIN`` only, and the difference is the difference between the two
+questions. That set answers *may a second call be authorized* — a ``CONFIRMED`` intent is
+resolved, so it does not block one. This set answers *did something reach the customer* — and a
+``CONFIRMED`` intent is the case where something certainly did."""
 
 
 @unique
@@ -772,6 +793,63 @@ def _settle_action_race(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def record_post_suppression_actions(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    writer: AuditWriter,
+    intents: Sequence[ExecutionIntent],
+    *,
+    correlation_id: uuid.UUID | None = None,
+) -> int:
+    """One ``POST_SUPPRESSION_ACTION`` per intent that was already in flight (R21.C7).
+
+    The Outcome_Monitor's half of a suppression's arrival. It lives here rather than in the
+    suppression handler because R21.C7 names this component, and because its twin — the
+    ``POST_PAYMENT_ACTION`` branch of :func:`_settle_action_race` — is a few lines below. The two
+    answer the same question, *something went out and the timing turned out to be wrong*, for two
+    different causes. Splitting them across modules would mean the next person changing how an
+    in-flight action is recorded finding one of them.
+
+    **No further external call is issued, and nothing in this function is what stops one.** The
+    stopping is the terminal transition the caller applies in the same transaction: every queued
+    execution job re-evaluates policy against reloaded state and refuses on ``ALREADY_TERMINAL``,
+    and an ``UNCERTAIN`` intent resolves through the reconciliation path of R9.C15 — which is a
+    *read*, not a message. This function only records, and it deliberately does not touch
+    ``intent.state``: a customer's objection is not evidence about whether the provider did the
+    thing, and rewriting the state on the strength of it would destroy the only record of what the
+    provider actually said.
+
+    Takes an already-loaded ``intents`` sequence and a writer rather than opening its own
+    transaction, so the records land in the caller's — the same transaction as the escalation. A
+    suppression whose escalation committed without these records would leave a case that looks
+    like nothing had gone out.
+
+    Returns how many records were written.
+    """
+    written = 0
+    for intent in intents:
+        if IntentState(str(intent.state)) not in IN_FLIGHT_INTENT_STATES:
+            continue
+        written += 1
+        writer.write_for_case(
+            merchant_id,
+            case_id,
+            AuditEntry(
+                event_type=POST_SUPPRESSION_ACTION,
+                actor=_ACTOR,
+                action=str(intent.action),
+                idempotency_key=intent.idempotency_key,
+                decision={
+                    "intent_state": str(intent.state),
+                    "detail": "action was in flight when contact suppression was recorded; "
+                    "no further external call, resolving through reconciliation",
+                },
+            ),
+            correlation_id=correlation_id,
+        )
+    return written
 
 
 def _consecutive_unavailable_reads(

@@ -26,6 +26,7 @@ from revora.persistence.repositories.audit import AUDIT_MUTATION_REJECTED
 from revora.platform.secrets import CREDENTIAL_UNAVAILABLE
 
 __all__ = [
+    "ACTION_CANCELLED_CONTACT_SUPPRESSED",
     "ACTION_CANCELLED_PAYMENT_RECEIVED",
     "ALL_EVENT_TYPES",
     "AUDIT_MUTATION_REJECTED",
@@ -42,12 +43,22 @@ __all__ = [
     "CASE_DETECTED",
     "CASE_ESCALATED",
     "CASE_EXPIRED",
+    "CASE_REVIEWED",
     "CONCURRENT_EXECUTION_PREVENTED",
     "CONSENT_RECORDED",
     "CONTROL_ACTION_SUPPRESSED",
     "CONTROL_CONTAMINATED",
     "CREDENTIAL_UNAVAILABLE",
     "CUSTOMER_DATA_REDACTED",
+    "CUSTOMER_SIGNAL_LIMIT_REACHED",
+    "CUSTOMER_SIGNAL_RECORDED",
+    "CUSTOMER_SIGNAL_REJECTED",
+    "CUSTOMER_SUBMISSION_LIMIT_REACHED",
+    "CUSTOMER_TOKEN_EXPIRED",
+    "CUSTOMER_TOKEN_ISSUED",
+    "CUSTOMER_TOKEN_ISSUE_FAILED",
+    "CUSTOMER_TOKEN_KEY_RETIRED",
+    "CUSTOMER_TOKEN_REJECTED",
     "DECISION_CYCLE_LIMIT_REACHED",
     "DELAYED_RECOVERY_RECONCILED",
     "DETECTION_VERDICT_RECORDED",
@@ -87,6 +98,7 @@ __all__ = [
     "PAYMENT_STATE_UNVERIFIABLE",
     "POLICY_DECISION_RECORDED",
     "POST_PAYMENT_ACTION",
+    "POST_SUPPRESSION_ACTION",
     "RATE_LIMIT_APPLIED",
     "RECOMMENDATION_RECORDED",
     "RECONCILED_TO_RECOVERED",
@@ -303,12 +315,44 @@ CASE_EXPIRED: Final = "CASE_EXPIRED"
 unresolved amount."""
 
 CASE_ESCALATED: Final = "CASE_ESCALATED"
-"""Attempt exhaustion at or above ``ESCALATION_AMOUNT_THRESHOLD`` moved the case to
-``ESCALATED`` rather than stopping it."""
+"""The case was routed to a person rather than stopped, and the reason it was.
+
+Two producers, and they share a type because they are one occurrence from the reader's side —
+*this case now needs a human* — carrying the same field, ``unresolved_amount``, which is what a
+merchant triages the ``ESCALATED`` grouping by.
+
+- Attempt exhaustion at or above ``ESCALATION_AMOUNT_THRESHOLD``: enough money that giving up
+  quietly is the wrong answer.
+- A Hard_Stop_Reason (R21.C4, R21.C5): the customer disputed the charge or cancelled the order.
+  Carries the ``hard_stop_reason``, the Suppression_Scope key and the ``terminal_reason``, so the
+  record answers "why is this case in front of me" without a join.
+
+The ``STATE_TRANSITION`` record ``apply_transition`` writes is the authority on the edge itself.
+This one carries what that record has no field for, which is why it is a second record and not a
+duplicate: a transition record answers *what moved*, and the amount still owed is not part of the
+edge."""
 
 DECISION_CYCLE_LIMIT_REACHED: Final = "DECISION_CYCLE_LIMIT_REACHED"
 """The decision-cycle counter reached its bound; the case terminates rather than
 looping."""
+
+CASE_REVIEWED: Final = "CASE_REVIEWED"
+"""A case that had chosen restraint was looked at again (R30.C11).
+
+Carries the ``ReviewTrigger``, the previously selected action, the newly selected action,
+the decision-cycle counter *after* the review, and the newly persisted ``next_review_at``
+where one exists.
+
+**Written whether or not the selection changed**, and the unchanged case is the one this
+record exists for. A review that re-selected ``WAIT`` produces no state visible anywhere
+else — same state, same selected action, one more decision cycle spent — so without this
+record "we re-examined and still think waiting is right" and "we forgot about it" are the
+same row. One of those is the product working and the other is the defect R30 exists to
+fix, and they must not be indistinguishable.
+
+Also written on the terminating path, when a review finds the counter already at
+``MAX_RECOVERY_ATTEMPTS`` and stops the case instead: the review happened, it reached a
+conclusion, and the conclusion was that there are no cycles left to spend."""
 
 WITHHELD_ACTION_DISCARDED: Final = "WITHHELD_ACTION_DISCARDED"
 """On restart, a withheld action whose bounds no longer permit execution was
@@ -510,6 +554,28 @@ nothing changes, and the amount is not counted again (R10.C13).
 Verified at-least-once delivery makes duplicate success signals ordinary, not exceptional.
 The record exists so the discard is visible rather than silent."""
 
+ACTION_CANCELLED_CONTACT_SUPPRESSED: Final = "ACTION_CANCELLED_CONTACT_SUPPRESSED"
+"""A Contact_Suppression was persisted while an action was scheduled or queued and **no**
+execution-intent record existed for it, so the action was cancelled before any external call
+(R21.C6).
+
+**One record per cancelled action**, keyed on the approved-but-unconsumed Policy_Decision that
+authorized it — ``consumed_by_intent_id IS NULL`` is precisely R21.C6's "for which no
+execution-intent record exists", and ``one_intent_per_decision`` makes the correspondence
+one-to-one rather than approximate. So the count of these records for a case equals the count of
+authorizations the hard stop invalidated, which is the number a merchant asking "what were you
+about to send me" needs.
+
+Both counters are unchanged, and that is structural rather than asserted here: the
+executed-action and customer-message counters move only on the edge into ``EXECUTING``, and a
+cancelled action never reaches it. No Payment_Provider request and no Communication_Provider
+request is issued, for the same reason — the terminal transition this record accompanies makes
+every queued execution job refuse on its own re-evaluation against reloaded state.
+
+Its counterpart is ``ACTION_CANCELLED_PAYMENT_RECEIVED``, which is the same shape for a happier
+cause. Two types rather than one with a reason field, because "the customer paid" and "the
+customer objected" are the two endings a merchant most needs to be able to count separately."""
+
 ACTION_CANCELLED_PAYMENT_RECEIVED: Final = "ACTION_CANCELLED_PAYMENT_RECEIVED"
 """A confirmed payment arrived while an action was scheduled and **no** intent existed, so
 the action was cancelled before any external call. Counters unchanged (R10.C4).
@@ -569,6 +635,124 @@ evaluation beginning after its ``effective_at`` — across the cases that alread
 ones that do not yet (R17.C10). Recorded unattached, because it is a statement about a person
 and not about any one payment."""
 
+# ---------------------------------------------------------------------------
+# Customer_Access_Token — R18, R29
+# ---------------------------------------------------------------------------
+
+CUSTOMER_TOKEN_ISSUED: Final = "CUSTOMER_TOKEN_ISSUED"
+"""A Customer_Access_Token was minted (R18.C12).
+
+Carries the case id, the ``token_id``, the issuance and expiry instants, and the approved
+candidate action whose execution the token accompanies. **No part of the secret**, on any
+field: the secret has no reversible representation anywhere in the system, and this record is
+the one most likely to be written by somebody who has the wire token in a local variable.
+
+Written inside ``execute_approved_action``'s first transaction, alongside the intent insert and
+before the provider call, so a token that exists is a token some message could have carried."""
+
+CUSTOMER_TOKEN_ISSUE_FAILED: Final = "CUSTOMER_TOKEN_ISSUE_FAILED"
+"""A token could not be minted for an approved customer-visible action (R18.C13).
+
+Names the failure reason. The important part is what the record accompanies: the execution
+attempt was abandoned, no provider request was issued, no counter moved and the case state is
+unchanged — because the mint shares the intent insert's transaction, so a failed mint rolls
+back the intent rather than requiring a compensating action.
+
+Written in its own transaction *after* that rollback, for the same reason
+``ILLEGAL_TRANSITION`` is: the record has to survive the rollback of the work it describes."""
+
+CUSTOMER_TOKEN_REJECTED: Final = "CUSTOMER_TOKEN_REJECTED"
+"""A presented token failed verification, or named no persisted record (R18.C6).
+
+One event type for both, because the caller gets one answer — 404 with an empty body — and
+R29.C6 requires the two to be indistinguishable in status and in body. The *record* names the
+rejection category, because an operator debugging a customer who cannot open their link needs
+the difference and an attacker never sees it.
+
+``CUSTOMER_TOKEN_KEY_RETIRED`` is the third category recorded under this type. Carries **no
+part of the presented token** — not a prefix, not a length, not the parsed handle when the
+handle was not a real one."""
+
+CUSTOMER_TOKEN_KEY_RETIRED: Final = "CUSTOMER_TOKEN_KEY_RETIRED"
+"""The rejection category recorded when a token verifies against no *active* signing secret.
+
+Its own constant rather than a bare string inside a ``CUSTOMER_TOKEN_REJECTED`` field, because
+"how many customers were locked out by that rotation" is a question the audit log has to be
+able to answer, and it cannot if the category is spelt differently by whoever wrote it.
+
+**The caller sees 404, not the 410 R29.C14 asks for.** That is deliberate and it is stronger
+than the requirement: distinguishing "signed by a retired key" from "not a real token" tells an
+attacker that their guess had the right shape. The rotation is recorded here; the response
+discloses nothing."""
+
+CUSTOMER_TOKEN_EXPIRED: Final = "CUSTOMER_TOKEN_EXPIRED"
+"""A token verified but the request arrived at or after its expiry instant (R18.C7).
+
+Answered 410 with ``{"expired": true}`` and no other case field. The 410 discloses that a
+token once existed; accepted, because ``CUSTOMER_TOKEN_ENTROPY_BITS`` makes enumeration
+infeasible and a customer holding a dead link needs to be told it is dead rather than shown a
+404 that reads as "wrong URL"."""
+
+CUSTOMER_SIGNAL_RECORDED: Final = "CUSTOMER_SIGNAL_RECORDED"
+"""A Customer_Signal was accepted and persisted (R19.C6, R29.C9).
+
+**The actor is the ``token_id``**, which is R29.C9 extending R17.C9 by admitting a credential as an
+actor where no Merchant_User initiated the operation. Nothing else in the audit log has a non-human
+actor that is also a bearer credential's handle, and the handle is the whole of what may appear —
+the secret has no reversible representation anywhere.
+
+Carries the Customer_Signal_Kind, the submitted values, the signal id, and the correlation id
+generated for the submission. Written inside the accepting transaction, alongside the signal insert,
+the submission-count increment and the enqueued review: all four or none. So this record existing is
+proof the other three did, and its absence is proof none of them did — which is what makes R29.C12's
+"nothing persisted" a transaction boundary rather than a compensating action.
+
+Exactly one per accepted write. The timeline's ``CUSTOMER_RESPONDED`` stage keys on the presence of
+any record of this type, so a second one for a single submission would not be a duplicate line in a
+log — it would be a case history claiming the customer said something twice."""
+
+CUSTOMER_SIGNAL_REJECTED: Final = "CUSTOMER_SIGNAL_REJECTED"
+"""A Customer_Signal write was refused for a reason that is not a bound being reached.
+
+Two conditions today, and they are answered differently because they are different statements. A
+field outside the declared request schema, or an enumeration member that does not exist, is 422 and
+the record names **the field only** — never the submitted value, which is attacker-supplied text on
+an endpoint reachable without a session (R19.C4, R20.C1). A case already holding a Terminal_State is
+409 and the record names the Terminal_State, because that is the one thing the customer is entitled
+to be told: the case ended, and nothing they write now will be read (R19.C8).
+
+No signal is persisted, no submission count moves, and the Recovery_Case state and every counter are
+left unchanged. The record is written in the same transaction as nothing else, which is why it
+commits: there is no work for it to be atomic with."""
+
+CUSTOMER_SIGNAL_LIMIT_REACHED: Final = "CUSTOMER_SIGNAL_LIMIT_REACHED"
+"""A Recovery_Case already holds ``MAX_CUSTOMER_SIGNALS_PER_CASE`` signals (R19.C7).
+
+Per **case**, and distinct from ``CUSTOMER_SUBMISSION_LIMIT_REACHED``, which is per
+**token**. The two are not redundant even though the configured numbers happen to agree
+today: a case can outlive a
+token — a terminal-state revocation followed by a further approved action mints a second one — so a
+customer could reach the per-case cap with submissions to spare on their current token, and reach
+the per-token cap with the case nowhere near its own. An operator reading "this customer's
+submission was refused" needs to know which of the two it was, because one is answered by raising a
+bound and the other by looking at the case.
+
+Answered 429 with every persisted signal unchanged."""
+
+CUSTOMER_SUBMISSION_LIMIT_REACHED: Final = "CUSTOMER_SUBMISSION_LIMIT_REACHED"
+"""A Customer_Access_Token reached ``CUSTOMER_TOKEN_MAX_SUBMISSIONS`` (R18.C9).
+
+The durable bound of the whole write path, and the reason this record is worth reading: it is
+written when the conditional ``UPDATE`` that increments ``accepted_submission_count``
+matched no row, which is the *only* way the cap can be observed. There is no read-then-compare
+above it that a
+concurrent request could interleave with, so this record cannot be written while a submission that
+exceeded the cap succeeded elsewhere.
+
+Answered 429, and **the read projection keeps being served until expiry**. R18.C9 is explicit about
+that asymmetry: a customer who has explained themselves five times must not lose the page telling
+them what they owe as a consequence."""
+
 CUSTOMER_DATA_REDACTED: Final = "CUSTOMER_DATA_REDACTED"
 """Contact data was deleted or irreversibly masked after ``CUSTOMER_DATA_RETENTION`` elapsed.
 
@@ -577,6 +761,25 @@ is a claim about the bound that was in force, and the bound is configurable. The
 fields metrics depend on are retained — a retention sweep that also destroyed the amount would
 make every historical figure irreproducible, which is a different failure from a privacy one and
 just as real."""
+
+
+POST_SUPPRESSION_ACTION: Final = "POST_SUPPRESSION_ACTION"
+"""An execution intent was already ``ATTEMPTED``, ``CONFIRMED`` or ``UNCERTAIN`` when a
+Contact_Suppression was persisted (R21.C7).
+
+The unhappy half of the suppression's arrival, and the honest one: something had already gone out,
+or may have. There is no undoing it, so the record exists to say so rather than to pretend the
+suppression arrived in time. **No further external call is issued** for the case, and the intent
+resolves through the existing reconciliation path of R9.C15 rather than through anything this
+requirement adds — a suppressed case still has to find out whether its payment link exists, and
+that question is answered by a read, not by a message.
+
+Written by the Outcome_Monitor, beside ``POST_PAYMENT_ACTION``, which is the same shape for the
+same reason: an action whose timing turned out to be wrong, counted where a person is looking.
+Unlike that one it carries no ``is_post_payment``-style flag on the intent row, because there is
+no column for it and none is needed — the suppression handler is deduped by
+``contact_suppression:{case_id}`` and returns early on an already-terminal case, so a retried job
+does not write a second record."""
 
 
 ALL_EVENT_TYPES: frozenset[str] = frozenset(
@@ -613,6 +816,7 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         SCHEDULE_REJECTED,
         CASE_EXPIRED,
         CASE_ESCALATED,
+        CASE_REVIEWED,
         DECISION_CYCLE_LIMIT_REACHED,
         WITHHELD_ACTION_DISCARDED,
         RECONCILED_TO_RECOVERED,
@@ -631,7 +835,9 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         PARTIAL_PAYMENT_OBSERVED,
         DUPLICATE_RECOVERY_EVENT_DISCARDED,
         ACTION_CANCELLED_PAYMENT_RECEIVED,
+        ACTION_CANCELLED_CONTACT_SUPPRESSED,
         POST_PAYMENT_ACTION,
+        POST_SUPPRESSION_ACTION,
         DELAYED_RECOVERY_RECONCILED,
         RECOVERY_OBSERVATION_RECORDED,
         EXPERIMENT_ASSIGNMENT_RECORDED,
@@ -653,6 +859,15 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         HUMAN_OWNER_RELEASED,
         CONSENT_RECORDED,
         CUSTOMER_DATA_REDACTED,
+        CUSTOMER_SIGNAL_RECORDED,
+        CUSTOMER_SIGNAL_REJECTED,
+        CUSTOMER_SIGNAL_LIMIT_REACHED,
+        CUSTOMER_SUBMISSION_LIMIT_REACHED,
+        CUSTOMER_TOKEN_ISSUED,
+        CUSTOMER_TOKEN_ISSUE_FAILED,
+        CUSTOMER_TOKEN_REJECTED,
+        CUSTOMER_TOKEN_KEY_RETIRED,
+        CUSTOMER_TOKEN_EXPIRED,
     }
 )
 """Every event type declared in this phase. A test asserts a writer's type is a

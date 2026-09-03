@@ -1,13 +1,49 @@
 """The legal recovery-case transition table, derived rather than hand-listed.
 
-The table is generated from four declarations — forward edges, the single re-entry
-edge, the terminal states, and the reconciliation edge. That matters because the
-property test that checks the case manager reads *this* declaration. If the table
+The table is generated from five declarations — the forward edges, the re-entry edge,
+the review edge, the terminal states, and the reconciliation edge. That matters because
+the property test that checks the case manager reads *this* declaration. If the table
 were hand-written, the test would be checking the table against itself.
 
-Termination is guaranteed by construction. The only cycle in the graph is
-``WAITING_FOR_OUTCOME -> DECISION_PENDING``, and it is guarded by a decision-cycle
-counter that only ever increases and is capped. See Requirement 2.
+Termination — the proof
+=======================
+
+Termination is guaranteed by construction, and the guarantee does not rest on the graph
+having one cycle. It has two: ``WAITING_FOR_OUTCOME -> DECISION_PENDING`` (*we acted, and
+now we are deciding again*) and ``POLICY_CHECK -> DECISION_PENDING`` (*we chose not to
+act, and now we are looking again*). What the proof rests on is an invariant that holds
+of both, and of any cycle a later edge could create:
+
+    Every cycle in the transition graph contains an edge whose target is
+    ``DECISION_PENDING``, and all three such edges carry ``decision_cycle_delta = 1``.
+
+The three edges into ``DECISION_PENDING`` are ``DIAGNOSED ->``, ``WAITING_FOR_OUTCOME ->``
+and ``POLICY_CHECK ->``; the first is not itself on a cycle, and carries the delta anyway,
+which is what makes the invariant a property of the *target state* rather than of a list
+of edges. The chain:
+
+1. Any path of unbounded length must traverse a cycle, because the graph is finite.
+2. Every cycle contains an edge into ``DECISION_PENDING``, and every edge into
+   ``DECISION_PENDING`` increments ``decision_cycle_count`` by exactly one. So one cycle
+   traversal costs at least one decision cycle.
+3. ``decision_cycle_count`` never decreases. ``apply_locked_transition`` only ever *adds*
+   a delta, :meth:`CounterEffects.__post_init__` refuses a negative one, and the
+   ``counters_nonnegative`` and ``counters_within_bounds`` constraints on
+   ``recovery_case`` back it below the application.
+4. Entry to ``DECISION_PENDING`` is refused once the counter has reached
+   ``MAX_RECOVERY_ATTEMPTS`` — R30.C10 for a review, and the ``MAX_ATTEMPTS_REACHED``
+   policy check for the forward path — and the case is transitioned to a terminal state
+   instead.
+
+Therefore cycle traversals per case are at most ``MAX_RECOVERY_ATTEMPTS``, every path is
+of bounded length, and every case reaches a terminal state. See Requirement 2 and
+Requirement 30.
+
+**The review edge does not touch ``window_end_at``.** No transition in this table writes
+that column at all, and R2.C5 makes it immutable once the case is opened, so the base
+spec's wall-clock termination bound — ``RECOVERY_WINDOW_DURATION + OUTCOME_WAIT_TIMEOUT +
+LIFECYCLE_EVALUATION_INTERVAL`` (P6) — is preserved verbatim rather than widened by the
+review loop (R30.C2). P63 is P6 restated under review, and it is the same number.
 """
 
 from __future__ import annotations
@@ -39,6 +75,7 @@ class TransitionKind(StrEnum):
 
     FORWARD = "FORWARD"
     REENTRY = "REENTRY"
+    REVIEW = "REVIEW"
     TERMINATION = "TERMINATION"
     RECONCILIATION = "RECONCILIATION"
 
@@ -141,6 +178,33 @@ _REENTRY: tuple[tuple[CaseState, CaseState, CounterEffects], ...] = (
     ),
 )
 
+_REVIEW: tuple[tuple[CaseState, CaseState, CounterEffects], ...] = (
+    (
+        CaseState.POLICY_CHECK,
+        CaseState.DECISION_PENDING,
+        CounterEffects(decision_cycle_delta=1),
+    ),
+)
+"""The edge a case takes when it chose restraint and is being looked at again (R30.C1).
+
+Without it, a case that selected ``DO_NOTHING`` or ``WAIT`` sat at ``POLICY_CHECK`` until
+its window closed: correctly non-terminal, and unreachable by any second decision cycle.
+Since ``WAITING_FOR_OUTCOME`` is reachable only through a confirmed executed action, the
+only re-entry loop that existed was reachable only *after* an intervention — so Revora
+re-decided exactly the cases it had already acted on, and never the ones where it had
+been right to wait.
+
+The effects are ``decision_cycle_delta=1`` and nothing else, deliberately.
+``executed_action_delta``, ``customer_message_delta_if_visible`` and
+``sets_last_outbound_at`` stay at their defaults, so a review moves no outbound counter
+and does not reset the cooldown clock — looking at a case again is not contacting anyone.
+
+A distinct kind rather than a second ``REENTRY`` member. The two edges answer different
+questions — "we acted and are deciding again" against "we chose not to act and are
+looking again" — and one kind covering both would make *how often does restraint get
+revisited* unanswerable from the record, which is the question Requirement 30 exists to
+make askable."""
+
 _RECONCILIATION_TARGETS: frozenset[CaseState] = frozenset(
     TERMINAL_STATES - {CaseState.RECOVERED}
 )
@@ -160,6 +224,11 @@ def _build_table() -> Mapping[tuple[CaseState, CaseState], TransitionRule]:
     for source, target, effects in _REENTRY:
         table[(source, target)] = TransitionRule(
             source=source, target=target, kind=TransitionKind.REENTRY, effects=effects
+        )
+
+    for source, target, effects in _REVIEW:
+        table[(source, target)] = TransitionRule(
+            source=source, target=target, kind=TransitionKind.REVIEW, effects=effects
         )
 
     # One edge from every non-terminal state to every terminal state except

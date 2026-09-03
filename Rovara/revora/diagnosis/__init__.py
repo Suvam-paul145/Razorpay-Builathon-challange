@@ -12,6 +12,10 @@ Public surface:
 * :func:`~revora.diagnosis.service.resolve_recorded_diagnosis` — R3.C8's substitution
   rule, pure. Shared with the optional reasoning path so the rule has one
   implementation rather than one per caller.
+* :func:`~revora.diagnosis.service.resolve_stated_reason_diagnosis` — R20.C4's second
+  deterministic mapping, pure. A persisted ``Delay_Reason`` refines the cause for the
+  next decision cycle at ``CUSTOMER_STATED_CAUSE_CONFIDENCE``, and the three reasons
+  that name no cause leave the recorded one untouched.
 * :class:`~revora.diagnosis.service.DiagnosisOutcome` — what the run did, plus the two
   things the caller must act on: the transition to ``DIAGNOSED`` and, for a
   merchant-side integration fault, the operational alert.
@@ -33,6 +37,7 @@ from revora.diagnosis.service import (
     DiagnosisOutcome,
     RecordedDiagnosis,
     resolve_recorded_diagnosis,
+    resolve_stated_reason_diagnosis,
     run_diagnosis,
 )
 
@@ -45,5 +50,6 @@ __all__ = [
     "DiagnosisOutcome",
     "RecordedDiagnosis",
     "resolve_recorded_diagnosis",
+    "resolve_stated_reason_diagnosis",
     "run_diagnosis",
 ]

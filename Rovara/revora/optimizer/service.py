@@ -1,8 +1,10 @@
 """Persist the recommendation and every rejected alternative.
 
 R7.C8 and R11.C6 together say something stronger than "record the decision": record every
-candidate that was considered, with all six of its figures, its exclusion reason and its
+candidate that was considered, with every one of its figures, its exclusion reason and its
 rank, so that the single audit query that explains a case carries the whole comparison.
+Since R31.C1 that means four separate cost terms rather than three, because "which cost
+made this not worth doing" is a question a blended figure cannot answer.
 A merchant explaining to a customer why they were sent a payment link should be able to
 see what else was on the table and what each alternative was worth — and should not need
 a second query to find out.
@@ -192,7 +194,11 @@ def run_optimizer(
         thresholds=thresholds_from_config(config),
     )
 
-    estimate_ids = {CandidateAction(row.action): row.id for row in rows}
+    # The whole estimate row rather than just its id, because the two per-figure method
+    # labels have to be copied onto the ranked candidate. They deliberately do not travel
+    # through ``_to_input``: the optimizer must not be able to read a provenance label, or
+    # a ranking could come to depend on one.
+    estimates = {CandidateAction(row.action): row for row in rows}
     substitution = _substitution(session, merchant_id, case_id, decision_cycle)
 
     recommendation = recommendations.insert(
@@ -216,13 +222,22 @@ def run_optimizer(
         rows=[
             {
                 "recommendation_id": recommendation.id,
-                "candidate_estimate_id": estimate_ids[item.action],
+                "candidate_estimate_id": estimates[item.action].id,
                 "action": item.action.value,
                 "incremental_probability": item.incremental_probability.value,
                 "expected_incremental_revenue": int(item.expected_incremental_revenue),
-                "action_cost": int(item.action_cost),
+                "financial_cost": int(item.financial_cost),
+                "communication_cost": int(item.communication_cost),
                 "risk_cost": int(item.risk_cost),
                 "customer_cost": int(item.customer_cost),
+                # Copied from the estimate, not re-derived (R31.C10). The dashboard renders
+                # the comparison from these rows, so the marking that says a split was never
+                # measured has to sit on the same row as the two figures it qualifies —
+                # otherwise a migrated zero reads as a measured zero for want of a join.
+                "financial_cost_method": estimates[item.action].financial_cost_method,
+                "communication_cost_method": (
+                    estimates[item.action].communication_cost_method
+                ),
                 "net_recovery_value": int(item.net_recovery_value),
                 "excluded": item.excluded,
                 "exclusion_reason": _reason_value(item.exclusion_reason),
@@ -271,11 +286,19 @@ def _to_input(row: CandidateEstimate) -> CandidateInput:
     named columns the value chain needs cross this boundary, which is what keeps
     ``arithmetic`` and ``selection`` free of ``persistence`` — and means a column added
     to the table later cannot silently become an input to the ranking.
+
+    The two cost columns migration ``0008`` produced from the blended ``action_cost``
+    cross as two arguments and are summed downstream, never here. A row migrated under
+    R31.C9 carries its whole pre-split total in ``financial_cost`` and zero in
+    ``communication_cost``, so it sums to the same figure the pre-split optimizer read and
+    reaches exactly the same decision — the P67 claim, applied to history rather than to a
+    generator.
     """
     return CandidateInput(
         action=CandidateAction(row.action),
         intervention_probability=Probability(row.intervention_probability),
-        action_cost=Minor(int(row.action_cost)),
+        financial_cost=Minor(int(row.financial_cost)),
+        communication_cost=Minor(int(row.communication_cost)),
         risk_cost=Minor(int(row.risk_cost)),
         customer_cost=Minor(int(row.customer_cost)),
         availability=ActionAvailability(row.availability),
@@ -337,7 +360,8 @@ def _write_audit(
 ) -> None:
     """One audit record carrying the whole comparison.
 
-    The ``decision`` field holds every candidate with its six figures, its exclusion
+    The ``decision`` field holds every candidate with all of its figures — the four cost
+    terms and their sum among them — its exclusion
     reason and its rank, which is what R11.C6 asks for and what makes the single-query
     explanation complete. It is one record rather than one per candidate because the
     comparison is a single decision — splitting it would make the explanation a join.
@@ -372,9 +396,15 @@ def _write_audit(
                         "expected_incremental_revenue": int(
                             item.expected_incremental_revenue
                         ),
-                        "action_cost": int(item.action_cost),
+                        # Four separate terms plus their sum, never the sum instead of
+                        # them (R31.C7). The audit record is the one place besides
+                        # presentation that reads a split term on its own, and it reads
+                        # both so a cost-grounds exclusion can be attributed afterwards.
+                        "financial_cost": int(item.financial_cost),
+                        "communication_cost": int(item.communication_cost),
                         "risk_cost": int(item.risk_cost),
                         "customer_cost": int(item.customer_cost),
+                        "total_action_cost": int(item.total_cost),
                         "net_recovery_value": int(item.net_recovery_value),
                         "cost_ratio": (
                             None if item.cost_ratio is None else str(item.cost_ratio)

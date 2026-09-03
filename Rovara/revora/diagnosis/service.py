@@ -37,6 +37,25 @@ substitution happens here, once: the row stores ``UNKNOWN`` with
 optimizer reads the recorded cause and gets the right answer without knowing the rule;
 a reviewer reads the evidence and can see what was thrown away.
 
+**A second deterministic source, and it is not the provider** (R20.C4). A persisted
+``Delay_Reason`` refines the cause for the *next* decision cycle through the mapping table
+``revora.customer.signals`` declares. It is deterministic in the same sense the taxonomy is
+— a closed table, no model, no call — and different in the one sense that matters: the
+input is a stranger's account of their own finances typed into a public page, not the
+provider's own error field. So it is recorded at ``CUSTOMER_STATED_CAUSE_CONFIDENCE``
+rather than at 1.0, which stays reserved for "the provider told us" (R3.C10), and
+``evidence_source`` names which of the two produced the cause. The resolution is R4's: the
+input may inform an estimate and may not authorize anything — and structurally it cannot,
+because this module records a cause and schedules nothing.
+
+Three things survive a refinement rather than being overwritten, and each is a mistake that
+would be invisible if it were not deliberate. The taxonomy evidence keys stay exactly as the
+provider path wrote them, so the **coverage metric keeps measuring the provider table** and
+a stated reason cannot flatter it. The superseded cause is retained in ``evidence``, so a
+reviewer can see what the customer's words replaced. And R3.C6's fraud routing still reads
+the provider's cause, so "the provider declined this for risk" cannot be talked out of by a
+customer who says their salary is late.
+
 **Coverage is measured, not asserted.** design.md's claim that the deterministic table
 handles the large majority of real failures is marked ``[INFERENCE]``, and an inference
 in a document is not a fact about production. Every diagnosis persists the matched key
@@ -49,6 +68,7 @@ trail and not only in an aggregate somebody has to think to run.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -64,8 +84,15 @@ from revora.audit.events import (
     MERCHANT_INTEGRATION_FAULT,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
-from revora.domain.enums import DiagnosisMethod, RiskCause
+from revora.customer.signals import cause_for_delay_reason
+from revora.domain.enums import (
+    DelayReason,
+    DiagnosisEvidenceSource,
+    DiagnosisMethod,
+    RiskCause,
+)
 from revora.domain.failure_taxonomy import (
+    EVIDENCE_SOURCE,
     MatchKey,
     TaxonomyMatch,
     classify_failure,
@@ -77,6 +104,7 @@ from revora.persistence.repositories.cases import (
     RecoveryCaseRepository,
     WebhookEventRepository,
 )
+from revora.persistence.repositories.customer import CustomerSignalRepository
 from revora.persistence.repositories.diagnosis import DiagnosisRepository
 from revora.platform.clock import now
 from revora.platform.config import Configuration
@@ -84,10 +112,14 @@ from revora.platform.logging import get_logger
 
 __all__ = [
     "DETERMINISTIC_CONFIDENCE",
+    "EVIDENCE_CAUSE_REFINED",
+    "EVIDENCE_CUSTOMER_SIGNAL_ID",
     "EVIDENCE_ORIGINAL_CAUSE",
     "EVIDENCE_REASONING_INVOKED",
+    "EVIDENCE_STATED_REASON",
     "EVIDENCE_SUBSTITUTED",
     "EVIDENCE_SUBSTITUTION_REASON",
+    "EVIDENCE_SUPERSEDED_CAUSE",
     "SUBSTITUTION_BELOW_FLOOR",
     "SUBSTITUTION_METHOD_UNTRUSTED",
     "UNKNOWN_CONFIDENCE",
@@ -95,6 +127,7 @@ __all__ = [
     "DiagnosisOutcome",
     "RecordedDiagnosis",
     "resolve_recorded_diagnosis",
+    "resolve_stated_reason_diagnosis",
     "run_diagnosis",
 ]
 
@@ -134,6 +167,24 @@ EVIDENCE_ORIGINAL_CAUSE: Final = "original_cause"
 EVIDENCE_SUBSTITUTION_REASON: Final = "substitution_reason"
 EVIDENCE_SUBSTITUTED: Final = "substituted_to_unknown"
 EVIDENCE_REASONING_INVOKED: Final = "reasoning_layer_invoked"
+
+EVIDENCE_CUSTOMER_SIGNAL_ID: Final = "customer_signal_id"
+EVIDENCE_STATED_REASON: Final = "delay_reason"
+EVIDENCE_CAUSE_REFINED: Final = "delay_reason_refined_cause"
+EVIDENCE_SUPERSEDED_CAUSE: Final = "superseded_cause"
+"""The four keys R20.C4 and R20.C6 add to the evidence document.
+
+:data:`EVIDENCE_CAUSE_REFINED` is present whenever a stated reason exists and is ``False``
+for the three members that name no cause — which is R20.C6's "record that the Delay_Reason
+produced no cause refinement" verbatim. Its **absence** means something different again: no
+reason was ever submitted. Three states, and collapsing "they said OTHER" into "they said
+nothing" would lose the one fact a merchant asking why the second contact repeated the
+first actually needs.
+
+:data:`EVIDENCE_SUPERSEDED_CAUSE` appears only when the refinement changed the cause. It is
+the provider table's answer, kept because a cause a customer's words replaced is a review
+item, and because R3.C6's fraud routing is computed from it — see
+:func:`_requires_policy_evaluation`."""
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +271,52 @@ def resolve_recorded_diagnosis(
     )
 
 
+def resolve_stated_reason_diagnosis(
+    *,
+    reason: DelayReason,
+    provider: RecordedDiagnosis,
+    stated_confidence: Decimal,
+    confidence_floor: Decimal,
+) -> RecordedDiagnosis:
+    """Apply R20.C4's mapping to a provider-derived diagnosis. Pure, no I/O.
+
+    Returns ``provider`` unchanged where the stated reason names no cause (R20.C6): ``OTHER``
+    and the two Hard_Stop_Reasons leave the recorded cause exactly as the provider path left
+    it. Returning the same object rather than a rebuilt equal one is deliberate — the caller
+    tests identity to decide whether a refinement happened, and an equal-but-distinct value
+    would make "unchanged" a comparison somebody could get subtly wrong.
+
+    Where the reason does name a cause, the result goes through
+    :func:`resolve_recorded_diagnosis` like every other path, so R3.C8's substitution rule
+    keeps exactly one implementation. That matters more here than elsewhere: R20.C7 requires
+    ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` to sit at or above the floor, and if a deployment
+    ever violates it the honest outcome is a recorded substitution to ``UNKNOWN`` naming
+    ``CONFIDENCE_BELOW_FLOOR`` — not a cause that quietly outranks the gate every other
+    source passes through.
+
+    Args:
+        reason: the persisted ``Delay_Reason``.
+        provider: what the failure taxonomy produced for this cycle.
+        stated_confidence: ``Configuration.CUSTOMER_STATED_CAUSE_CONFIDENCE``. ``Decimal``
+            and never a float, for the reason :func:`resolve_recorded_diagnosis` gives.
+        confidence_floor: ``Configuration.DIAGNOSIS_CONFIDENCE_FLOOR``.
+
+    Returns:
+        The diagnosis to record. ``method`` is ``DETERMINISTIC`` on a refinement, because a
+        closed mapping table is what produced it and no model was invoked — the *source*, not
+        the method, is what distinguishes this from a provider-derived cause.
+    """
+    cause = cause_for_delay_reason(reason)
+    if cause is None:
+        return provider
+    return resolve_recorded_diagnosis(
+        cause=cause,
+        confidence=stated_confidence,
+        method=DiagnosisMethod.DETERMINISTIC,
+        confidence_floor=confidence_floor,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The service
 # ---------------------------------------------------------------------------
@@ -262,6 +359,20 @@ class DiagnosisOutcome:
     is an invocation that a naive "did AI contribute" reading would report as none. The
     only component that knows whether a request left the process is the one that sent
     it, so it says so explicitly."""
+
+    evidence_source: DiagnosisEvidenceSource = DiagnosisEvidenceSource.PROVIDER_ERROR_CODE
+    """Which input the recorded cause was read off (R20.C4).
+
+    Defaulted to the provider because that is the source every caller predating the customer
+    surface had, and a default of ``None`` would push an ``is None`` check into every reader
+    for a case that cannot occur — a recorded cause always came from somewhere."""
+
+    customer_signal_id: uuid.UUID | None = None
+    """The Customer_Signal the stated reason came from, where one informed this diagnosis.
+
+    Set whenever a stated reason was *read*, including when it named no cause. A merchant
+    asking "did the customer's answer change anything" needs the signal identified either
+    way; ``evidence_source`` is what says whether it changed the cause."""
 
 
 def run_diagnosis(
@@ -313,7 +424,7 @@ def run_diagnosis(
         error_code=canonical.error_code,
         risk_reason_codes=config.RISK_REASON_CODES,
     )
-    recorded = _resolve_from_match(match, config.DIAGNOSIS_CONFIDENCE_FLOOR)
+    provider_recorded = _resolve_from_match(match, config.DIAGNOSIS_CONFIDENCE_FLOOR)
 
     evidence = match_evidence(
         match,
@@ -324,6 +435,28 @@ def run_diagnosis(
         payment_method=canonical.method,
     )
     evidence[EVIDENCE_REASONING_INVOKED] = False
+
+    # R20.C4. Read after the taxonomy rather than instead of it, so the provider's answer is
+    # computed and recorded even when the customer's words supersede it.
+    signal = CustomerSignalRepository(session).latest_delay_reason(merchant_id, case_id)
+    recorded = provider_recorded
+    signal_id: uuid.UUID | None = None
+    if signal is not None:
+        signal_id = signal.id
+        recorded = resolve_stated_reason_diagnosis(
+            reason=DelayReason(str(signal.delay_reason)),
+            provider=provider_recorded,
+            stated_confidence=config.CUSTOMER_STATED_CAUSE_CONFIDENCE,
+            confidence_floor=config.DIAGNOSIS_CONFIDENCE_FLOOR,
+        )
+        refined = recorded is not provider_recorded
+        evidence[EVIDENCE_CUSTOMER_SIGNAL_ID] = str(signal.id)
+        evidence[EVIDENCE_STATED_REASON] = str(signal.delay_reason)
+        evidence[EVIDENCE_CAUSE_REFINED] = refined
+        if refined:
+            evidence[EVIDENCE_SOURCE] = DiagnosisEvidenceSource.CUSTOMER_STATED_REASON.value
+            evidence[EVIDENCE_SUPERSEDED_CAUSE] = provider_recorded.cause.value
+
     if recorded.substituted_to_unknown:
         evidence[EVIDENCE_SUBSTITUTED] = True
         evidence[EVIDENCE_ORIGINAL_CAUSE] = recorded.original_cause.value
@@ -378,13 +511,20 @@ def run_diagnosis(
         method=recorded.method,
         substituted_to_unknown=recorded.substituted_to_unknown,
         substitution_reason=recorded.substitution_reason,
+        # The three taxonomy facts describe the *provider table*, refinement or not. A stated
+        # reason resolving a cause the table missed leaves the gap a gap, which is what keeps
+        # the coverage metric a measurement of the table rather than of the loop around it.
         match_key=match.match_key,
         rule_id=match.rule_id,
         deterministic_hit=match.is_deterministic_hit,
         coverage_gap=match.is_coverage_gap,
         needs_operational_alert=match.needs_operational_alert,
-        requires_policy_evaluation=_requires_policy_evaluation(recorded),
+        requires_policy_evaluation=_requires_policy_evaluation(
+            recorded, superseded=provider_recorded.cause
+        ),
         case_version=case.version,
+        evidence_source=_evidence_source(evidence),
+        customer_signal_id=signal_id,
     )
 
 
@@ -423,7 +563,9 @@ def _resolve_from_match(match: TaxonomyMatch, confidence_floor: Decimal) -> Reco
     )
 
 
-def _requires_policy_evaluation(recorded: RecordedDiagnosis) -> bool:
+def _requires_policy_evaluation(
+    recorded: RecordedDiagnosis, *, superseded: RiskCause | None = None
+) -> bool:
     """Whether R3.C6's fraud routing applies.
 
     Checked against the original cause as well as the recorded one. A risk signal that
@@ -431,8 +573,31 @@ def _requires_policy_evaluation(recorded: RecordedDiagnosis) -> bool:
     substitution says "do not build an action set from this cause", not "the provider's
     risk decline did not happen". Reading only the recorded cause would let a
     low-confidence fraud answer skip the gate the requirement exists to force.
+
+    ``superseded`` extends the same argument to R20.C4. A customer whose card was declined
+    for risk and who then says their salary is late has told us something true and something
+    that does not undo the decline, and a refinement that dropped the routing would let an
+    untrusted input switch off a gate no trusted input can. So the provider's cause is read
+    here whether or not it is the one that got recorded.
     """
-    return RiskCause.FRAUD_OR_RISK_SIGNAL in (recorded.cause, recorded.original_cause)
+    return RiskCause.FRAUD_OR_RISK_SIGNAL in (
+        recorded.cause,
+        recorded.original_cause,
+        superseded,
+    )
+
+
+def _evidence_source(evidence: Mapping[str, str | bool]) -> DiagnosisEvidenceSource:
+    """The recorded source, read back off the evidence document it was written into.
+
+    Read back rather than tracked in a second variable, so the reported source and the stored
+    one cannot disagree — the evidence column is what a reviewer sees, and a return value that
+    described something else would be the more convincing of the two and the wrong one.
+    """
+    stored = evidence.get(EVIDENCE_SOURCE)
+    if isinstance(stored, str):
+        return DiagnosisEvidenceSource(stored)
+    return DiagnosisEvidenceSource.PROVIDER_ERROR_CODE  # pragma: no cover - always set
 
 
 def _canonical_for_case(
@@ -480,6 +645,10 @@ def _write_audit(
         "method": recorded.method.value,
         "decision_cycle": decision_cycle,
         EVIDENCE_REASONING_INVOKED: False,
+        # Beside the method rather than only inside ``evidence``, because this field is what
+        # the dashboard reads to say why a cause was chosen, and "DETERMINISTIC" alone no
+        # longer answers that question (R20.C4).
+        EVIDENCE_SOURCE: _evidence_source(evidence).value,
     }
     writer.write_for_case(
         merchant_id,
@@ -584,6 +753,13 @@ def _already_recorded(
         substituted_to_unknown=bool(existing.substituted_to_unknown),
         substitution_reason=reason if isinstance(reason, str) else None,
     )
+    # Read back rather than recomputed, so a retried job routes a fraud case the same way the
+    # first run did even though the recorded cause is a customer's and the risk signal is the
+    # provider's. Recomputing would need the canonical event this branch deliberately does not
+    # load.
+    superseded = stored.get(EVIDENCE_SUPERSEDED_CAUSE)
+    signal_id = stored.get(EVIDENCE_CUSTOMER_SIGNAL_ID)
+    source = stored.get(EVIDENCE_SOURCE)
     return DiagnosisOutcome(
         diagnosis_id=existing.id,
         cause=recorded.cause,
@@ -597,9 +773,18 @@ def _already_recorded(
         deterministic_hit=method is DiagnosisMethod.DETERMINISTIC,
         coverage_gap=False,
         needs_operational_alert=False,
-        requires_policy_evaluation=_requires_policy_evaluation(recorded),
+        requires_policy_evaluation=_requires_policy_evaluation(
+            recorded,
+            superseded=RiskCause(superseded) if isinstance(superseded, str) else None,
+        ),
         case_version=None,
         already_recorded=True,
+        evidence_source=(
+            DiagnosisEvidenceSource(source)
+            if isinstance(source, str)
+            else DiagnosisEvidenceSource.PROVIDER_ERROR_CODE
+        ),
+        customer_signal_id=uuid.UUID(signal_id) if isinstance(signal_id, str) else None,
     )
 
 

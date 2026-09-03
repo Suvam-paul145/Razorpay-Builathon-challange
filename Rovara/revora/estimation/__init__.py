@@ -74,6 +74,7 @@ from revora.estimation.candidates import (
     CandidateSet,
     build_candidate_set,
     candidate_figures,
+    cost_prior_for,
     run_candidate_estimation,
     wait_probability,
 )
@@ -107,6 +108,7 @@ __all__ = [
     "build_candidate_set",
     "candidate_figures",
     "central_interval",
+    "cost_prior_for",
     "estimate_baseline",
     "posterior_mean",
     "run_baseline_estimation",

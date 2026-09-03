@@ -15,8 +15,16 @@ So there are two transactions with a gap:
 **tx-A, under an advisory lock.** Reload the case ``FOR UPDATE``, discarding everything the
 job payload claimed. Re-request policy evaluation against what was actually loaded. Verify
 the approval is present, matching, unexpired and unconsumed. Insert the ``ATTEMPTED``
-intent, move the case to ``EXECUTING`` with its counter effects, consume the decision, audit
-``EXECUTION_STARTED``. **Commit.** The lock is released here, on purpose.
+intent, move the case to ``EXECUTING`` with its counter effects, consume the decision, mint
+the Customer_Access_Token for a customer-visible action, audit ``EXECUTION_STARTED``.
+**Commit.** The lock is released here, on purpose.
+
+The mint is inside tx-A because the token URL is what the message carries: a token minted at
+confirmation would arrive after the only message that could have delivered it. It adds no
+commit and does not widen the gap between the commit and the call — it is work done on the
+side of the boundary where a crash costs nothing, because the intent it authorizes does not
+exist yet. A failed mint rolls tx-A back, so no intent exists, no counter moved and no call
+went out, which is R18.C13 satisfied by the boundary rather than by a compensating action.
 
 **The call**, holding nothing.
 
@@ -35,9 +43,9 @@ payload state is acting on the past. Every value is reloaded and policy is asked
 
 **Zero external calls on every refusal path.** Lock contention, a non-``APPROVED``
 re-evaluation, an absent or expired or already-consumed approval, an audit-write block, an
-existing intent in any state — each of these returns before the provider is touched. The
-enumeration is deliberate: it is easier to review "which paths can reach the call" when the
-answer is one.
+existing intent in any state, a token that could not be minted — each of these returns before
+the provider is touched. The enumeration is deliberate: it is easier to review "which paths
+can reach the call" when the answer is one.
 """
 
 from __future__ import annotations
@@ -49,10 +57,12 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from revora.audit.events import (
     CONCURRENT_EXECUTION_PREVENTED,
     CONTROL_ACTION_SUPPRESSED,
+    CUSTOMER_TOKEN_ISSUE_FAILED,
     EXECUTION_ABANDONED_POLICY,
     EXECUTION_REFUSED,
     EXECUTION_RESULT_UNKNOWN,
@@ -60,7 +70,8 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter, is_case_blocked
 from revora.cases.manager import apply_locked_transition
-from revora.domain.actions import CandidateAction
+from revora.customer.tokens import TokenService
+from revora.domain.actions import CandidateAction, is_customer_visible
 from revora.domain.enums import (
     SUPPRESSED_BY_CONTROL_ARM,
     CaseState,
@@ -189,6 +200,15 @@ class ExecutionOutcome(StrEnum):
     """The request failed validation before send — a description over the length bound, a
     non-positive amount. Rejected, never truncated or coerced."""
 
+    TOKEN_ISSUE_FAILED = "TOKEN_ISSUE_FAILED"
+    """A Customer_Access_Token could not be minted for an approved customer-visible action
+    (R18.C13). Zero external calls, no intent, no counter movement.
+
+    Above ``CALL_ISSUED`` in this enumeration's ordering, and that placement is the whole of
+    R18.C13: the mint shares the intent insert's transaction, so a failed mint rolls the
+    intent back rather than needing a compensating action to undo it. There is no window in
+    which an intent exists for a message that could not have carried its token."""
+
     LOST_RESERVATION = "LOST_RESERVATION"
     """Another transaction committed the intent for this key first. No call."""
 
@@ -253,6 +273,21 @@ def execute_approved_action(
         correlation_id=correlation_id,
     )
     if reservation.attempt is not None:
+        if reservation.attempt.outcome is ExecutionOutcome.TOKEN_ISSUE_FAILED:
+            # R18.C13's record, in its own transaction because the one that discovered the
+            # failure was rolled back — along with the intent, the counter movement and the
+            # consumed decision, which is the point. Same two-phase shape
+            # ``apply_transition`` uses for a rejected transition, and for the same reason: a
+            # refusal has to be durable even though the work it refused is not.
+            _audit_token_issue_failure(
+                merchant_id,
+                case_id,
+                factory=factory,
+                config=configuration,
+                correlation_id=correlation_id,
+                reason=reservation.attempt.detail,
+                idempotency_key=reservation.attempt.idempotency_key,
+            )
         return reservation.attempt
 
     # tx-A has committed. A durable ATTEMPTED intent exists and the lock is gone. From
@@ -549,6 +584,62 @@ def _reserve_under_lock(
                 case_id, ExecutionOutcome.REQUEST_INVALID, key=key, detail=exc.rule
             )
 
+        # The Customer_Access_Token, minted here (R18.C1). Three things about the placement.
+        #
+        # **Inside this transaction, before the commit.** The token URL is what the message
+        # carries, so a token minted at confirmation would arrive after the only message that
+        # could have delivered it. Sharing the transaction is also the whole of R18.C13: a
+        # failed mint rolls back the intent, the counter movement and the consumed decision
+        # together, so the requirement is satisfied by the transaction boundary rather than by
+        # a compensating action that could itself fail.
+        #
+        # **It does not widen the window between the intent commit and the provider call.**
+        # That window is the gap between tx-A's commit and the single provider request issued
+        # by the entry point, and it is unchanged: there is still nothing between them. The
+        # mint is work done *before* the commit, on the side of the boundary where a crash
+        # costs nothing, because the intent it would have authorized does not exist yet.
+        # Property 3 is untouched.
+        #
+        # Note for a reader tempted to name the provider method in a comment here: a `pure`
+        # test asserts that the *source* of this function does not contain it, which is how
+        # "the reservation phase cannot reach the provider" is checked regardless of how the
+        # two phases are ordered in the file.
+        #
+        # **Last in tx-A, after every cheaper refusal.** Lock contention, an absent or stale
+        # approval, a policy abandonment, an existing intent, a failed transition, an
+        # unreachable contact and an invalid request all return above this line, so none of
+        # them costs a mint — and none of them can be reached by a path on which a token was
+        # already written.
+        #
+        # ``is_customer_visible`` rather than an unconditional mint: R18.C1 is scoped to
+        # customer-visible actions, and a token accompanying an action the customer never
+        # perceives would be a credential nobody was sent.
+        if is_customer_visible(action):
+            outcome = TokenService.on_session(session, config).mint(
+                merchant_id,
+                case_id=case_id,
+                window_end_at=case.window_end_at,
+                approved_action=action,
+                moment=moment,
+                correlation_id=correlation_id,
+            )
+            if not outcome.issued:
+                reason = (
+                    outcome.failure.value if outcome.failure is not None else "UNKNOWN"
+                )
+                _logger.warning(
+                    "customer access token could not be minted; execution abandoned",
+                    case_id=str(case_id),
+                    reason=reason,
+                )
+                session.rollback()
+                return _refused(
+                    case_id,
+                    ExecutionOutcome.TOKEN_ISSUE_FAILED,
+                    key=key,
+                    detail=reason,
+                )
+
         _audit_case(
             session,
             merchant_id,
@@ -707,6 +798,55 @@ def _refused(
         ),
         idempotency_key=key or "",
     )
+
+
+def _audit_token_issue_failure(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    factory: sessionmaker[Session] | None,
+    config: Configuration,
+    correlation_id: uuid.UUID | None,
+    reason: str | None,
+    idempotency_key: str | None,
+) -> None:
+    """Record R18.C13's refusal, in its own transaction after tx-A rolled back.
+
+    A separate transaction because the one that discovered the failure was rolled back on
+    purpose — that rollback *is* the requirement, since it takes the intent, the counter
+    movement and the consumed decision with it. An audit record written before the rollback
+    would have gone with them, and one written by re-using the failed session would not
+    commit at all.
+
+    The case row is re-locked here, because a case-attached record allocates its gap-free
+    sequence number from a counter on that row. Safe now: tx-A has committed nothing and
+    released everything, so this cannot deadlock against the transaction that just ended.
+
+    Failure to write this record is logged and swallowed. Nothing external happened and
+    nothing is pending, so raising here would replace "we refused, and here is why" with a
+    traceback out of the execution engine on a path that already made no call.
+    """
+    try:
+        with tenant_transaction(merchant_id, factory) as session:
+            case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+            if case is None:  # pragma: no cover - the case was loaded moments ago
+                return
+            _audit_case(
+                session,
+                merchant_id,
+                case_id,
+                config,
+                event_type=CUSTOMER_TOKEN_ISSUE_FAILED,
+                detail=reason or "UNKNOWN",
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+            )
+    except SQLAlchemyError:  # pragma: no cover - depends on the database
+        _logger.error(
+            "could not record a customer token issue failure",
+            case_id=str(case_id),
+            reason=reason or "UNKNOWN",
+        )
 
 
 def _is_control_arm(session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID) -> bool:

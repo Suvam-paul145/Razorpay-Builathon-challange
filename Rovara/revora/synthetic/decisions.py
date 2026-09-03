@@ -52,7 +52,7 @@ from revora.domain.actions import (
 )
 from revora.domain.enums import ActionAvailability, ExclusionReason, SelectionReason
 from revora.domain.probability import Probability
-from revora.estimation.candidates import COST_PRIORS
+from revora.estimation.candidates import cost_prior_for
 from revora.optimizer.arithmetic import CandidateInput
 from revora.optimizer.selection import SelectionResult, Thresholds, select
 from revora.optimizer.service import thresholds_from_config
@@ -108,7 +108,7 @@ def decide(case: GeneratedCase, *, config: Configuration) -> SelectionResult:
     candidates: list[CandidateInput] = []
 
     for action in sorted(candidate_set_for(case.cause), key=lambda item: item.value):
-        costs = COST_PRIORS[action]
+        costs = cost_prior_for(action, config)
         unavailable = action in UNAVAILABLE_IN_MVP
         candidates.append(
             CandidateInput(
@@ -121,7 +121,13 @@ def decide(case: GeneratedCase, *, config: Configuration) -> SelectionResult:
                     if action is CandidateAction.DO_NOTHING
                     else true_probability(case.p_treated.get(action, case.p_natural))
                 ),
-                action_cost=costs.action_cost,
+                # All four cost terms pass through untouched, and they come from the same
+                # accessor the estimator uses — so the two R31.C11 configured rows apply
+                # here too. Nothing here blends, splits or re-derives a term, so a scenario
+                # prices an action exactly as the real estimation layer would, including
+                # under a merchant's changed cost row.
+                financial_cost=costs.financial_cost,
+                communication_cost=costs.communication_cost,
                 risk_cost=costs.risk_cost,
                 customer_cost=costs.customer_cost,
                 availability=(

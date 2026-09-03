@@ -20,6 +20,14 @@ the pipeline's earlier evaluation is a pre-check that has to agree with it. Nami
 authoritative asker as the owner is better than putting it in a neutral module and leaving
 the reader to guess which of the two callers is definitive.
 
+**Why the Contact_Suppression lookup lives here** (R21.C3). ``revora.policy`` may not import
+``revora.persistence`` — the ``policy-isolation`` contract forbids it, and that prohibition is
+what makes the engine's purity a structural fact rather than a habit — so check 5's suppression
+input has to be resolved by whoever assembles the input. That is this function, which is
+already the single place every other persisted fact is read. The alternative, a repository call
+from inside the engine, fails ``lint-imports``, and the failure would be the contract working
+rather than an obstacle to route around.
+
 Nothing here writes. Assembly and evaluation only, so a caller can ask the question inside
 a transaction it is about to roll back.
 """
@@ -31,6 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
+from revora.customer.suppression import SuppressionScopeFacts, suppression_in_force
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import RiskCause
 from revora.persistence.repositories.consent import CustomerConsentRepository
@@ -96,10 +105,17 @@ def assemble_policy_input(
     """Load every fact policy is entitled to see, and nothing else.
 
     The reads are deliberately narrow. Policy sees the case row, the consent row, the
-    active diagnosis's cause, and two booleans about existing intents — no payload, no
+    active diagnosis's cause, whether a Contact_Suppression covers this case's scope, and two
+    booleans about existing intents — no payload, no
     recommendation body, no model output. That narrowness is the mechanism behind
     Property 2: an input built only from named columns of persisted rows cannot be
     influenced by anything a language model produced, whatever else is in the database.
+
+    The suppression lookup is keyed on the Suppression_Scope rather than on the case id, which
+    is what makes R21.C8 hold without anything extra: a case opened later for the same customer
+    and the same order derives the same ``scope_key`` and finds the existing suppression on its
+    very first decision cycle. No flag is copied onto a new case at creation, so there is no
+    creation path that could be written without copying it.
 
     Args:
         case: the case row. The engine passes one it is holding ``FOR UPDATE``; the
@@ -134,6 +150,9 @@ def assemble_policy_input(
         verified_captured=verified_captured_from(case.verified_payment_status),
         verified_status=case.verified_payment_status,
         diagnosed_cause=RiskCause(diagnosis.cause) if diagnosis is not None else None,
+        contact_suppressed=suppression_in_force(
+            session, merchant_id, cast("SuppressionScopeFacts", case)
+        ),
         open_intent_exists=decisions.open_intent_exists(merchant_id, case.id),
         intent_exists_for_key=decisions.intent_exists_for_key(merchant_id, prospective_key),
         selected_action=action,
