@@ -16,8 +16,15 @@
  * customer who disputed a charge or cancelled an order ends the case `ESCALATED`, so its money is
  * already in that row — a sixth group would split one grouping across two places and the total
  * would stop being the sum of the rows above it. The list is a breakdown of a row that is already
- * there, and it is the only place on this screen that names individual cases, because it is the
- * only group whose next action is *per case* rather than about a threshold.
+ * there.
+ *
+ * **Partial arrangement requests are the second breakdown of that same row** (R22.C9), and for the
+ * same reason rather than a different one: a customer asking to pay less or in instalments ends the
+ * case `ESCALATED` too, so its full `payment_amount` is already counted there. Two lists rather
+ * than one, because the next action differs — a suppressed case needs somebody to decide whether
+ * contact may resume, and an arrangement request needs somebody to answer a question. These are the
+ * only places on this screen that name individual cases, because they are the only groups whose
+ * next action is *per case* rather than about a threshold.
  */
 
 import { Link } from 'react-router-dom'
@@ -99,6 +106,7 @@ export function Unresolved() {
               </table>
             </div>
             <SuppressedCases cases={query.data.suppressed} />
+            <ArrangementRequests cases={query.data.partial_arrangements} />
             <p className="footnote">
               {query.data.reporting_period.start} to {query.data.reporting_period.end} · computed{' '}
               {query.data.computed_at}. These figures move: a delayed capture reconciles an expired
@@ -185,6 +193,124 @@ function SuppressedCases({ cases }) {
         </tbody>
       </table>
     </div>
+  )
+}
+
+/**
+ * R22.C9. Every case that ended because the customer asked to pay differently.
+ *
+ * Three columns because the requirement names three things: the request instant, the accompanying
+ * note, and the unresolved amount. The note carries more weight here than a note usually would —
+ * the request itself has no amount, no instalment count and no schedule, because
+ * `PartialArrangementSubmission` declares none and `customer_signal` has no column for any of them
+ * (R22.C1). So what the customer wrote is the *only* content of the ask, and a row without it says
+ * a negotiation was requested and nothing about what was proposed.
+ *
+ * **The amount is the full `payment_amount` and it is not an offer.** R22.C7 leaves the amount, the
+ * currency and the recovery window unchanged, so this figure is the same integer that sits inside
+ * the escalated total above. It is labelled *Unresolved* and not *Requested* for exactly that
+ * reason: a column of numbers next to the words "asked to pay in parts" is the one place on this
+ * dashboard a reader could take a figure for a settlement Revora had agreed to, and Revora agreed
+ * to nothing.
+ *
+ * **Any live payment link is still live** (R22.C8), which is why the caption says so. A merchant
+ * looking at this queue is deciding whether to phone somebody, and the fact that the customer can
+ * still pay in full — and that doing so reconciles the case to recovered under R10.C14 — changes
+ * that decision.
+ *
+ * The note comes through the server's note document and is rendered as a text child. React escapes
+ * a text child, so `note.text` is what appears; `note.text_escaped` exists for a surface that
+ * builds markup and using it here would double-escape, so a customer who typed `I <3 this` would
+ * read back `I &lt;3 this`. `dangerouslySetInnerHTML` appears nowhere in `web/src` and a test
+ * asserts its absence across the whole tree, which is what makes R29.C11 a property of the source
+ * rather than of this comment.
+ *
+ * Renders nothing when the list is empty, like `SuppressedCases` and unlike the five aggregate rows
+ * above. A zero in an aggregate says "we looked and it is zero"; an empty table of named cases says
+ * only that there are none, and the escalated row already carries that number.
+ *
+ * @param {{ cases: Array<Record<string, any>> | undefined }} props
+ */
+function ArrangementRequests({ cases }) {
+  if (!cases || cases.length === 0) return null
+  return (
+    <div className="table-scroll">
+      <table className="grid">
+        <caption>
+          Escalated because the customer asked to pay differently — {cases.length}{' '}
+          {cases.length === 1 ? 'case' : 'cases'}. Revora accepted no amount, no instalment count
+          and no schedule; any payment link already sent is still live, so paying in full still
+          resolves these.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Case</th>
+            <th scope="col">Asked</th>
+            <th scope="col">What the customer wrote</th>
+            <th scope="col" className="num">
+              Unresolved
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {cases.map((entry) => (
+            <tr key={entry.case_id}>
+              <td>
+                <Link to={`/cases/${entry.case_id}`}>
+                  <code>{entry.case_id.slice(0, 8)}</code>
+                </Link>
+              </td>
+              <td>
+                {entry.requested_at === null ? (
+                  <span className="muted">not recorded</span>
+                ) : (
+                  <When iso={entry.requested_at} />
+                )}
+              </td>
+              <td className="cell--prose">
+                <ArrangementNote note={entry.note} />
+              </td>
+              <td className="num">
+                <Money value={entry.unresolved_amount} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/**
+ * The accompanying note, or the reason there is not one.
+ *
+ * Three states and they are three different histories: the customer wrote nothing, the customer
+ * wrote something, and the customer wrote something the retention sweep has since removed
+ * (R29.C10). Collapsing the third into the first would make a compliance action look like silence,
+ * which is the one reading that would let a merchant conclude nothing was ever said.
+ *
+ * The label is the server's, rendered verbatim. R20.C12 asks for the note presented *marked as*
+ * customer-supplied unverified text, and that mark is a fact about the data rather than a styling
+ * choice, so `revora/api/rendering.py` chooses the words.
+ *
+ * @param {{ note: Record<string, any> | null | undefined }} props
+ */
+function ArrangementNote({ note }) {
+  if (note == null) return <span className="muted">no note</span>
+  if (note.status === 'REDACTED') return <span className="muted">{note.detail}</span>
+  return (
+    <>
+      <span className="label label--caution">{note.label}</span>{' '}
+      {/* A text child. React escapes it; see this component's sibling above on why
+          `text_escaped` is deliberately not used on this surface. */}
+      <q>{note.text}</q>
+      {note.truncated && (
+        <span className="fact__note">
+          {' '}
+          truncated at the stored length — the customer may have written more
+        </span>
+      )}
+    </>
   )
 }
 

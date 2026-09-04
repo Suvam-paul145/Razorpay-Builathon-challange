@@ -36,6 +36,14 @@ import { Timeline } from '../components/Timeline'
 export function CaseDetail() {
   const { caseId = '' } = useParams()
   const query = useCaseDetail(caseId)
+  // Started here rather than inside `AuditPanel`, and the only reason is when it starts. Called from
+  // the panel it could not begin until the detail read had resolved, because the early returns below
+  // mean the panel is not mounted while the detail is pending — so the two reads ran nose-to-tail and
+  // the reader waited for their sum. Hoisted, they run alongside each other and the reader waits for
+  // the slower one. The panel's own pending and error rendering is unchanged; it reads this query
+  // instead of owning it, which is why the arrangement R11.C5 describes still holds — a failed trail
+  // is still a failed panel and not a failed page.
+  const auditQuery = useAuditTrail(caseId)
 
   if (query.isPending) return <Loading what="the case" />
   if (query.isError) return <Failure error={query.error} what="the case" />
@@ -55,12 +63,23 @@ export function CaseDetail() {
           should reach the answer before they reach the ten sections that also contain it. */}
       <Timeline caseId={caseId} />
       <CaseHeader detail={detail} caseId={caseId} />
+      {/* R20.C12. Above the diagnosis rather than below it, because the diagnosis may name
+          CUSTOMER_STATED_REASON as its evidence source — a reader who meets that claim before
+          they have seen the statement behind it has to scroll back to interpret it. */}
+      <CustomerSignalsPanel detail={detail} />
+      {/* R23.C14. Immediately after the signals, because a promise *is* one of them and this panel
+          is what became of it: the reader has just seen "Promise to pay, 12 March" in the list and
+          this says where it stands and when Revora will act. Above the diagnosis for the same
+          reason the signals are — a promise changes when the next cycle happens, so a reader
+          meeting the decision first would have to scroll back to find out why it is scheduled
+          where it is. */}
+      <PromisePanel detail={detail} />
       <DiagnosisPanel detail={detail} />
       <DecisionPanel detail={detail} />
       <PolicyPanel detail={detail} />
       <ExecutionPanel detail={detail} />
       <OutcomePanel detail={detail} />
-      <AuditPanel caseId={caseId} />
+      <AuditPanel query={auditQuery} />
     </div>
   )
 }
@@ -196,6 +215,241 @@ function CaseHeader({ detail, caseId }) {
     </Panel>
   )
 }
+
+// ---------------------------------------------------------------------------
+// What the customer said (R20.C12, R29.C11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every persisted Customer_Signal, with the note marked as customer-supplied unverified text.
+ *
+ * **Nothing in this file renders a note as markup, and that is checked rather than intended.**
+ * `dangerouslySetInnerHTML` appears nowhere in `web/`, and a test asserts its absence across the
+ * whole source tree — because R29.C11 is a claim about *any* presentation surface, so a second
+ * component added later must inherit it rather than be trusted to repeat it. React escapes a text
+ * child by default, which is why `note.text` is interpolated directly: the server ships
+ * `note.text_escaped` for surfaces that build markup, and using it here would double-escape, so a
+ * customer who typed `I <3 this` would read back `I &lt;3 this`.
+ *
+ * **The label is the server's, rendered verbatim.** R20.C12 requires the note *presented marked
+ * as* customer-supplied unverified text, and that mark is a fact about the data rather than a
+ * styling decision — so `revora/api/rendering.py` chooses the words and this renders them. A
+ * client that composed the phrase would be a second vocabulary free to soften it, and the
+ * direction it would drift is towards reading a stranger's assertion as a finding.
+ *
+ * **A hard stop is flagged here as well as in the header.** The header shows the suppression,
+ * which is the consequence; this shows the statement that caused it. A reader who has just seen
+ * "Disputes the charge" beside Contact suppression comes here to find out what the customer
+ * actually wrote, and the two being visibly the same event is the point of showing both.
+ *
+ * **An empty list says so in words.** Most customers never open the page, so no signals is the
+ * ordinary case and not a gap — but an omitted panel would read as "we did not look", which on
+ * the record of what a customer told us is the wrong thing for it to read as.
+ *
+ * @param {{ detail: any }} props
+ */
+function CustomerSignalsPanel({ detail }) {
+  const signals = detail.customer_signals ?? []
+  return (
+    <Panel
+      title="What the customer said"
+      subtitle="Evidence, never authority. A submission on the customer page changes what Revora estimates next and nothing it is permitted to do."
+    >
+      {signals.length === 0 && <Empty>Nothing submitted on the customer page.</Empty>}
+      {signals.length > 0 && (
+        <ul className="trail">
+          {signals.map((signal) => (
+            <li className="trail__item" key={signal.signal_id}>
+              <div className="trail__body">
+                <div className="trail__head">
+                  <strong>{humanise(signal.kind)}</strong>
+                  <When iso={signal.submitted_at} />
+                  {signal.provenance !== 'REAL' && <Label text={signal.provenance} />}
+                </div>
+                {signal.delay_reason !== null && (
+                  <dl className="facts facts--tight">
+                    <Fact label="Stated reason">
+                      <Enum value={signal.delay_reason} />
+                      {signal.hard_stop_label !== null && (
+                        <span className="fact__note">
+                          <span className="flag flag--stop">{signal.hard_stop_label}</span> — an
+                          objection to the debt rather than a payment problem, so it names no
+                          Risk_Cause and ends contact
+                        </span>
+                      )}
+                    </Fact>
+                  </dl>
+                )}
+                <NoteBlock note={signal.note} version={signal.retention_config_version} />
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="footnote">
+        A stated reason refines the recorded Risk_Cause for the next decision cycle at a configured
+        confidence below the 1.0 reserved for the provider&apos;s own error fields. It moves no
+        bound, no policy check and no counter.
+      </p>
+    </Panel>
+  )
+}
+
+/**
+ * The recorded Promise_To_Pay, with the window end beside the promised date (R23.C14).
+ *
+ * **The window end is adjacent to the promise date, and that adjacency is the requirement.** R23.C14
+ * asks for it "so that a clamped Follow_Up_Instant is visible as a clamp" — and a clamped follow-up
+ * is otherwise an arbitrary-looking time. "The customer said the 12th, we will follow up on the
+ * 13th" reads as a plan; "the customer said the 12th, we will follow up on the 8th at 23:00" reads
+ * as a bug, unless the reader can see on the same line that the window closes on the 9th at 00:00.
+ * So the two dates are the first two facts, in that order, and the follow-up comes after both.
+ *
+ * **The clamp is shown by adjacency, and the sentence about it is deliberately narrow.** The panel
+ * adds "earlier than the promised date because the window closes first" for the one clamp that is
+ * *derivable from the three instants alone* — a follow-up at or before the date the customer gave,
+ * which can happen for no other reason. It does **not** attempt to detect the milder clamp, where
+ * the follow-up is after the promised date but was pulled back from `promise_date +
+ * PROMISE_FOLLOW_UP_OFFSET`. Detecting that would mean recomputing the offset, which is a
+ * configured bound: applying today's value to a promise recorded under a different one would be
+ * wrong precisely when a reader was investigating a bound change. So the milder clamp is shown the
+ * way R23.C14 asks for it to be shown — the window end next to the promised date, and the reader
+ * does the comparison — and the flag is reserved for the case where no comparison is needed.
+ * `clamped` *is* computed at write time and recorded on the `PROMISE_RECORDED` audit record, which
+ * is where a reader who needs the milder case answered exactly should look.
+ *
+ * **A date past the window is presented as an escalation, not as a missing follow-up.** The
+ * `BEYOND_WINDOW_ESCALATED` status has no follow-up instant by construction, and rendering that as
+ * an empty cell would read as "we have not scheduled it yet". It is not pending; the window is
+ * never extended, so there is nothing to schedule and a person has the case.
+ *
+ * **An absent promise says so in words**, on the same terms the signals panel does. Most customers
+ * never name a date, so no promise is the ordinary case and not a gap — but an omitted panel would
+ * read as "we did not look".
+ *
+ * @param {{ detail: any }} props
+ */
+function PromisePanel({ detail }) {
+  const promise = detail.promise ?? null
+  return (
+    <Panel
+      title="What the customer promised"
+      subtitle="A promise changes when Revora acts and never how long. The recovery window is set when the case opens and is never extended."
+    >
+      {promise === null && <Empty>No payment date recorded.</Empty>}
+      {promise !== null && (
+        <>
+          <dl className="facts" data-field="promise">
+            {/* The two instants R23.C14 requires adjacent, in this order. Nothing goes between
+                them, and a fact added later belongs after the follow-up rather than here. */}
+            <Fact label="Promised date">
+              <When iso={promise.promise_date} />
+            </Fact>
+            <Fact label="Recovery window closes">
+              <When iso={promise.window_end_at} />
+              <span className="fact__note">
+                the value the follow-up was computed against, and the value the case opened with —
+                a promise moves neither
+              </span>
+            </Fact>
+            <Fact label="Follow-up">
+              {promise.follow_up_at === null ? (
+                <span className="muted">
+                  none scheduled — the promised date is at or past the window end, so the case is
+                  with a person rather than waiting for a nudge nobody could act on
+                </span>
+              ) : (
+                <>
+                  <When iso={promise.follow_up_at} />
+                  {promise.follow_up_at <= promise.promise_date && (
+                    <span className="fact__note">
+                      earlier than the promised date because the window closes first
+                    </span>
+                  )}
+                </>
+              )}
+            </Fact>
+            <Fact label="Status">
+              <Enum value={promise.status} />
+              {promise.voided_by_terminal_state !== null && (
+                <span className="fact__note">
+                  voided when the case reached {humanise(promise.voided_by_terminal_state)}
+                </span>
+              )}
+            </Fact>
+            <Fact label="Recorded">
+              <When iso={promise.recorded_at} />
+            </Fact>
+          </dl>
+          {promise.kept_at !== null && (
+            <p className="footnote">
+              Kept. An authoritative read reported the payment{' '}
+              {promise.seconds_promise_to_payment !== null && (
+                <>
+                  {promise.seconds_promise_to_payment < 0
+                    ? `${-promise.seconds_promise_to_payment} seconds before`
+                    : `${promise.seconds_promise_to_payment} seconds after`}{' '}
+                  the promised date
+                </>
+              )}
+              . Paying early is normal, so the recorded interval is signed.
+            </p>
+          )}
+          {promise.missed_at !== null && (
+            <p className="footnote">
+              Missed. A promise follow-up was confirmed as sent and a later authoritative read still
+              reported the payment outstanding. A promise is not missed merely because its date
+              passed.
+            </p>
+          )}
+        </>
+      )}
+      <p className="footnote">
+        The recovery window is what every termination bound is measured against, so it is never
+        extended by anything a customer submits. A promised date the window cannot reach escalates
+        to a person instead of stretching it.
+      </p>
+    </Panel>
+  )
+}
+
+/**
+ * One Delay_Reason_Note, or the reason there is not one.
+ *
+ * Three states and they are three different histories: no note, a note, and a note the retention
+ * sweep removed. Collapsing the third into the first would make a compliance action look like a
+ * customer who stayed silent, which is the one reading that would let a merchant conclude the note
+ * was never written.
+ *
+ * @param {{ note: any, version: string | null }} props
+ */
+function NoteBlock({ note, version }) {
+  if (note == null) return null
+  if (note.status === 'REDACTED') {
+    return (
+      <p className="trail__transition">
+        <span className="muted">{note.detail}</span>
+        {version !== null && <span className="fact__note">under configuration {version}</span>}
+      </p>
+    )
+  }
+  return (
+    <figure className="note">
+      <figcaption>
+        <span className="label label--caution">{note.label}</span>
+        {note.truncated && (
+          <span className="fact__note">
+            truncated at the stored length — the customer may have written more
+          </span>
+        )}
+      </figcaption>
+      {/* A text child. React escapes it, and `note.text_escaped` is deliberately not used here:
+          it is for a surface that interpolates into markup, and using both would double-escape. */}
+      <blockquote>{note.text}</blockquote>
+    </figure>
+  )
+}
+
 
 // ---------------------------------------------------------------------------
 // Diagnosis and baseline (R14.C3)
@@ -698,8 +952,13 @@ function OutcomePanel({ detail }) {
 // The trail (R11.C5)
 // ---------------------------------------------------------------------------
 
-function AuditPanel({ caseId }) {
-  const query = useAuditTrail(caseId)
+/**
+ * @param {object} props
+ * @param {object} props.query the `useAuditTrail` result, owned by `CaseDetail` so the read starts in
+ *   parallel with the detail read rather than behind it. Every branch below is the same branch this
+ *   panel rendered when it called the hook itself.
+ */
+function AuditPanel({ query }) {
   return (
     <Panel
       title="Full history"
