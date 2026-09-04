@@ -22,3 +22,4 @@ docs/provider-findings.local.md
 local_credentials.txt
 credentials.txt
 credentials.local.txt
+*.log
