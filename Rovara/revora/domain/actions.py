@@ -8,9 +8,15 @@ on this account".
 
 Three actions have no verified provider capability for one-off payments, so they
 are marked unavailable at estimation time rather than removed from the vocabulary.
-``PROMISE_TO_PAY_FOLLOW_UP`` is absent from every eligibility row, so it never
-generates an estimate at all: it has no detection trigger in scope and no verified
-capability. See the design's amendment list.
+
+``PROMISE_TO_PAY_FOLLOW_UP`` used to be the fourth, and R24 moved it out. The design's
+verification closed the one item it was waiting on: ``POST
+/v1/payment_links/:id/notify_by/:medium`` re-notifies the link already recorded for the
+case and creates no second link, so the capability is verified and
+``PROVIDER_CAPABILITY_UNVERIFIED`` stopped being an honest thing to say about it. It is
+now executable, needs a provider call, and was already customer-visible — so it already
+consumed ``MAX_CUSTOMER_MESSAGES`` and nothing about the cap changes. See the design's
+Fact 1 and Fact 2.
 """
 
 from __future__ import annotations
@@ -65,28 +71,45 @@ EXECUTABLE_ACTIONS: frozenset[CandidateAction] = frozenset(
         CandidateAction.WAIT,
         CandidateAction.PAYMENT_LINK,
         CandidateAction.CUSTOMER_MESSAGE,
+        CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
         CandidateAction.HUMAN_ESCALATION,
     }
 )
 """What the MVP can actually carry out. ``CUSTOMER_MESSAGE`` is a payment link with
-provider notification enabled — there is no separate messaging vendor."""
+provider notification enabled — there is no separate messaging vendor.
+
+``PROMISE_TO_PAY_FOLLOW_UP`` joined under R24.C1 and it is carried out by *re-notifying* the
+link the case already has, which is a different mechanism from the other two rather than a
+third copy of the same one: a resend creates no payment link, so the follow-up is the one
+executable customer-visible action that mints no new payable object. Where the case holds no
+live link the follow-up falls back to creating one (R24.C11), which is why it is in this set
+rather than conditional on a link existing."""
 
 UNAVAILABLE_IN_MVP: frozenset[CandidateAction] = frozenset(
     {
         CandidateAction.RETRY,
         CandidateAction.DELAYED_RETRY,
         CandidateAction.PAYMENT_METHOD_UPDATE,
-        CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
     }
 )
 """No verified provider capability for one-off payments. A failed payment is
 terminal at the provider; a new attempt is a new payment the customer starts.
 Automatic retry exists in the provider's subscriptions product, which is a
 different object and out of scope. If the retry-capability spike comes back
-positive, this set shrinks and the eligibility rows below gain real actions."""
+positive, this set shrinks and the eligibility rows below gain real actions.
+
+``RETRY`` and ``DELAYED_RETRY`` stay here, and stay visible in the recorded candidate set with
+their exclusion reason (R6.C9, R26.C15). Three of these four became executable and one did
+not, so the set is now three members rather than four — the interesting part being that it can
+shrink at all: ``PROMISE_TO_PAY_FOLLOW_UP`` left it because a capability was *verified*, not
+because anybody decided to be optimistic about it."""
 
 PROVIDER_ACTIONS: frozenset[CandidateAction] = frozenset(
-    {CandidateAction.PAYMENT_LINK, CandidateAction.CUSTOMER_MESSAGE}
+    {
+        CandidateAction.PAYMENT_LINK,
+        CandidateAction.CUSTOMER_MESSAGE,
+        CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
+    }
 )
 """The actions the execution engine performs by calling the provider.
 
@@ -137,6 +160,7 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
             CandidateAction.PAYMENT_LINK,
             CandidateAction.CUSTOMER_MESSAGE,
             CandidateAction.DELAYED_RETRY,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
@@ -147,6 +171,7 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
             CandidateAction.PAYMENT_LINK,
             CandidateAction.CUSTOMER_MESSAGE,
             CandidateAction.PAYMENT_METHOD_UPDATE,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
@@ -156,6 +181,7 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
             CandidateAction.RETRY,
             CandidateAction.DELAYED_RETRY,
             CandidateAction.PAYMENT_LINK,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
@@ -165,6 +191,7 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
         {
             CandidateAction.RETRY,
             CandidateAction.PAYMENT_LINK,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
@@ -173,6 +200,7 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
         {
             CandidateAction.PAYMENT_LINK,
             CandidateAction.CUSTOMER_MESSAGE,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
@@ -181,15 +209,27 @@ _ELIGIBILITY: dict[RiskCause, frozenset[CandidateAction]] = {
         {
             CandidateAction.PAYMENT_LINK,
             CandidateAction.CUSTOMER_MESSAGE,
+            CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
             CandidateAction.HUMAN_ESCALATION,
         }
     ),
     # A human decides. Policy escalates this before any automated action is
     # scheduled, so the eligibility row only exists for completeness.
+    #
+    # R24.C3 keeps PROMISE_TO_PAY_FOLLOW_UP out of this row and the next one, and the
+    # reason is not that a promise is unlikely on a flagged case — it is that a promise
+    # must not be a way *around* the flag. A customer under a fraud signal who submits
+    # "I will pay on Friday" would otherwise have supplied Revora with a fresh reason to
+    # message them, on a case whose whole disposition is that a person should look at it.
     RiskCause.FRAUD_OR_RISK_SIGNAL: frozenset({CandidateAction.HUMAN_ESCALATION}),
     # The narrowest set. A rejected or low-confidence diagnosis is substituted to
     # UNKNOWN, so a bad guess makes Revora more conservative, not less. Nothing
-    # customer-visible is eligible here.
+    # customer-visible is eligible here — the promise follow-up included, which is the
+    # other half of R24.C3: a promise is evidence about the customer's intent and not
+    # about the failure's cause, so it cannot be allowed to rescue a diagnosis Revora
+    # does not have. R3.C8's substitution to UNKNOWN is what routes a rejected or
+    # low-confidence hypothesis here, and this row is what makes that substitution cost
+    # something.
     RiskCause.UNKNOWN: frozenset({CandidateAction.HUMAN_ESCALATION}),
 }
 

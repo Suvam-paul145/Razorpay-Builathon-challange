@@ -360,7 +360,23 @@ class SelectionReason(StrEnum):
 
 @unique
 class ExclusionReason(StrEnum):
-    """Why a candidate action was excluded from selection."""
+    """Why a candidate action was excluded from selection.
+
+    ``recommendation_candidate.exclusion_reason`` carries ``enum_check`` generated from this
+    enumeration, so **a member added here is a migration** — the same arrangement
+    :class:`TerminalReason` documents, and the same trap. Migration ``0008`` created that
+    ``CHECK`` with the seven members above the first divider; ``0017`` widened it with the two
+    promise-specific grounds R24 needs, and ``0018`` with the duplicate-link ground below them.
+
+    The two new reasons are *not* interchangeable and collapsing them onto one another, or onto
+    ``PROVIDER_CAPABILITY_UNVERIFIED``, would have needed no migration and would have made the
+    only question worth asking about a skipped follow-up unanswerable. "No promise was recorded"
+    means the customer never said they would pay, so there is nothing to follow up on. "The
+    promised date has not been reached" means they did, and Revora is waiting rather than
+    declining. ``PROVIDER_CAPABILITY_UNVERIFIED`` means the resend endpoint is gone. A merchant
+    asking "why did nobody chase this promise" is asking which of the three, and one value for
+    all three answers none of it.
+    """
 
     CAUSE_NOT_ELIGIBLE = "CAUSE_NOT_ELIGIBLE"
     PROVIDER_CAPABILITY_UNVERIFIED = "PROVIDER_CAPABILITY_UNVERIFIED"
@@ -369,6 +385,49 @@ class ExclusionReason(StrEnum):
     INVALID_ESTIMATE_INPUT = "INVALID_ESTIMATE_INPUT"
     BELOW_NET_VALUE_THRESHOLD = "BELOW_NET_VALUE_THRESHOLD"
     BELOW_INCREMENTAL_PROBABILITY = "BELOW_INCREMENTAL_PROBABILITY"
+
+    # -- the promise-specific grounds (migration 0017) -------------------------
+    NO_PROMISE_RECORDED = "NO_PROMISE_RECORDED"
+    """R24.C2. No Promise_To_Pay holding ``RECORDED`` or ``FOLLOW_UP_SCHEDULED`` exists for the
+    case, so ``PROMISE_TO_PAY_FOLLOW_UP`` has nothing to follow up on. The candidate is retained
+    in the recorded set marked ``UNAVAILABLE``, because "a follow-up was considered and there was
+    no promise" is a sentence the case detail view should be able to say.
+
+    Covers a ``BEYOND_WINDOW_ESCALATED`` promise too, which exists but is not pending: the
+    promise is the reason that case escalated, and scheduling a nudge against it would contradict
+    the escalation."""
+
+    PROMISE_DATE_NOT_REACHED = "PROMISE_DATE_NOT_REACHED"
+    """R23.C9. A promise is ``RECORDED`` and the current instant is earlier than its computed
+    Follow_Up_Instant, so following up now would arrive before the date the customer named.
+
+    Distinct from ``NO_PROMISE_RECORDED`` because it is temporary and the other is not: this one
+    resolves by itself when the promise sweep moves the row to ``FOLLOW_UP_SCHEDULED``. The
+    condition is :func:`revora.customer.promises.follow_up_reached`, inverted, and it is read
+    from there rather than recomputed here so the exclusion and the sweep's own "is this due"
+    question are one comparison."""
+
+    # -- the duplicate-link ground (migration 0018) ----------------------------
+    LIVE_PAYMENT_LINK_EXISTS = "LIVE_PAYMENT_LINK_EXISTS"
+    """R24.C10 at system scope. The Recovery_Case already holds a live payment link, so
+    ``PAYMENT_LINK`` would mint a **second** payable object for one debt — two live links, two
+    ``reference_id`` values, nothing cancelling the first, and a customer holding both able to
+    pay twice.
+
+    Named for what is true rather than for what is refused. ``PROVIDER_CAPABILITY_UNVERIFIED``
+    would have needed no migration and would have been a false statement about the provider,
+    which creates links perfectly well; the reason no link is being created is that one already
+    exists. A merchant asking "why did nobody send a link on this cycle" is owed that sentence,
+    so the candidate is retained in the recorded set carrying this reason (R6.C9, R26.C15)
+    rather than dropped.
+
+    **Conditioned on the link being live, and the condition is not restated here.**
+    :meth:`revora.persistence.repositories.execution.ExecutionIntentRepository.live_payment_link`
+    is the single definition — the newest ``CONFIRMED`` ``PAYMENT_LINK_CREATE`` intent the case
+    holds — and it is the same read :mod:`revora.execution.engine` routes R24.C10's resend branch
+    on. One definition on purpose: an exclusion built on a stricter notion of "live" would strand
+    a case whose link had gone, and one built on a looser notion would admit the duplicate on
+    exactly the cycle where it matters."""
 
 
 DIVERGENCE_HIGHER_PROBABILITY_LOWER_NET_VALUE = "HIGHER_PROBABILITY_LOWER_NET_VALUE"
@@ -719,6 +778,23 @@ template engines and as ``0`` in a few, and both lose the distinction. A caller 
 RECOVERY_GROSS_OF_REFUNDS = "RECOVERY_GROSS_OF_REFUNDS"
 """Label on MVP recovery figures. Refunds are captured on every authoritative
 read but not yet netted out of reported recovery."""
+
+DEMONSTRATION_ONLY = "DEMONSTRATION_ONLY"
+"""Label carried by ``demonstration_incremental_revenue`` and by nothing else (R28.C11).
+
+The figure it labels is a real number computed from a real control-versus-treatment
+comparison over a batch whose inputs were *generated*, so the comparison is sound and the
+world it describes is ours. ``DEMONSTRATION_ONLY`` is the sentence "this measures the
+measurement, not the market", attached to the figure rather than left in a caption.
+
+**Not an** :class:`ExperimentLabel` **member, and the distinction is load-bearing.** That
+enumeration is persisted on ``experiment.labels`` behind a ``CHECK`` generated from itself,
+and three of its members — ``SYNTHETIC``, ``EXPLORATORY``, ``INVALIDATED`` — are read by the
+attribution gate. Adding a member there would put a new value in front of a gate whose whole
+job is to refuse, and would need a migration to buy nothing: this label qualifies a *figure*
+the metrics engine reports, not an experiment's standing. It sits beside
+:data:`NOT_ESTABLISHED` and :data:`RECOVERY_GROSS_OF_REFUNDS` because those are the other two
+tokens that qualify a number rather than describing a row."""
 
 SUPPRESSED_BY_CONTROL_ARM = "SUPPRESSED_BY_CONTROL_ARM"
 """Reason recorded when an action is withheld because the case is in a control arm.
