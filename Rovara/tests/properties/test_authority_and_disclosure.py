@@ -265,13 +265,19 @@ def test_the_execution_engine_consults_the_block_before_anything_else() -> None:
 
     # The reservation phase itself must not be able to reach the provider — that is what makes
     # "checked before the call" true regardless of how the two phases are ordered in the file.
-    assert "create_payment_link" not in reserve, (
-        "the reservation phase can call the provider, so the audit block no longer precedes the "
-        "external effect"
-    )
+    # Both provider methods, because R24 gave the engine a second call to make: a promise
+    # follow-up against a live link goes out through ``notify_by``, and a reservation phase that
+    # could reach *that* one would be issuing an unauditable message rather than an unauditable
+    # link — which is worse, because a resend cannot be read back to find out whether it happened.
+    for method in ("create_payment_link", "notify_by"):
+        assert method not in reserve, (
+            f"the reservation phase can reach {method}, so the audit block no longer precedes the "
+            "external effect"
+        )
 
-    # And the caller reserves before it calls out.
+    # And the caller reserves before it calls out, on both branches.
     assert execute.index("_reserve_under_lock") < execute.index("create_payment_link")
+    assert execute.index("_reserve_under_lock") < execute.index("notify_by")
 
 
 # ---------------------------------------------------------------------------
@@ -280,22 +286,36 @@ def test_the_execution_engine_consults_the_block_before_anything_else() -> None:
 
 
 @pytest.mark.pure
-def test_the_reasoning_package_has_no_public_surface() -> None:
-    """P31 in the form this build permits, and it is the strongest form.
+def test_the_reasoning_package_re_exports_nothing() -> None:
+    """P31's structural half, restated now that there *is* an adapter.
 
-    The design asked for a run with the adapter raising on every call, producing a
-    terminal-state distribution identical to a run with it available. There is no adapter: task 14
-    was dropped and ``revora.reasoning`` is empty. So rather than compare two runs of identical
-    code — a tautology — this asserts what the comparison was a proxy for: nothing to call.
+    This test used to assert that ``revora.reasoning`` had no public surface at all, on the
+    grounds that task 14 was dropped and the package was empty. Task 49.2 changed that
+    deliberately, which is what the previous version of this docstring said would have to
+    happen. The two-run distribution comparison the design originally specified now belongs to
+    Properties 49 and 51 in task 49.5, where a run with the credential absent is compared
+    against a run with every response rejected.
 
-    A later phase adding an adapter has to change this test deliberately, which is the point.
+    What remains here is the narrower claim, and it is still worth holding: the package's
+    ``__init__`` re-exports nothing. Every consumer therefore names the submodule it depends on
+    — ``revora.reasoning.adapter``, not ``revora.reasoning`` — so a grep for the adapter finds
+    every component that can reach one, and a convenience re-export cannot quietly turn "the
+    pipeline holds an adapter" into "anything that imports the package holds one".
+
+    Read from the source rather than through ``dir()``, because importing any submodule binds it
+    as an attribute of the package and would make this assertion depend on test ordering.
     """
-    import revora.reasoning
+    from pathlib import Path
 
-    public = [name for name in dir(revora.reasoning) if not name.startswith("_")]
-    assert public == [], (
-        f"revora.reasoning has gained a public surface {public}; the no-model claim now needs the "
-        "two-run distribution comparison the design originally specified"
+    init = Path(__file__).resolve().parents[2] / "revora" / "reasoning" / "__init__.py"
+    statements = [
+        line
+        for line in init.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert statements == [], (
+        f"revora/reasoning/__init__.py has gained content {statements}; a re-export makes the "
+        "set of components that can reach a model unreadable from their imports"
     )
 
 

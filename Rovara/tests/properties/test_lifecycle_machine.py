@@ -52,13 +52,18 @@ step is several round trips. The settings are deliberately modest and the invari
 deliberately built from one batch of queries per step rather than one query per invariant — the
 alternative is a test so slow that it gets excluded from CI, which is the same as not having it.
 
-**Three graph assertions live at the end of the file, in the ``pure`` tier** (task 37.4). They read
-``LEGAL_TRANSITIONS`` and nothing else, and they carry the half of Property 64 that is a fact about
+**Four graph assertions live at the end of the file, in the ``pure`` tier** (task 37.4). They read
+``LEGAL_TRANSITIONS`` and nothing else. Three carry the half of Property 64 that is a fact about
 the transition table rather than about any history: every cycle in the graph costs a decision cycle,
 every edge into ``DECISION_PENDING`` supplies one, and no cycle passes through a terminal state.
 They are here rather than in a file of their own because they are the static form of the same
 termination claim this machine's teardown checks dynamically, and a reader who doubts the teardown
 should find the proof's premises next to it.
+
+The fourth is about reachability rather than termination: ``RECOVERED`` must be reachable from every
+state a case can be sitting in when the customer pays, and every edge into it except the forward one
+must require a verified capture. It sits with the others because it reads the same table, and
+because it corrects a claim the other three were written alongside — see its docstring.
 """
 
 from __future__ import annotations
@@ -110,6 +115,7 @@ from revora.domain.payment_event import PaymentStatus
 from revora.domain.transitions import (
     LEGAL_TRANSITIONS,
     TERMINAL_STATES,
+    TransitionKind,
     legal_targets,
 )
 from revora.execution.reconcile import promote_stale_intents, reconcile_intents
@@ -1459,10 +1465,15 @@ class RecoveryLifecycleMachine(RuleBasedStateMachine):
         * ``POLICY_CHECK -> DECISION_PENDING`` is gated: ``handle_review`` refuses when
           ``decision_cycle_count >= MAX_RECOVERY_ATTEMPTS``, so it only ever moves ``n -> n+1`` for
           ``n <= MAX_RECOVERY_ATTEMPTS - 1``.
-        * ``WAITING_FOR_OUTCOME -> DECISION_PENDING`` is declared in the transition table and **no
-          code traverses it**. Every ``apply_transition`` call site was checked: the Outcome_Monitor
-          only ever targets ``RECOVERED`` or ``ESCALATED``. So it contributes nothing today, and if
-          a future task wires it up the assertion below is what will notice whether it is gated.
+        * ``WAITING_FOR_OUTCOME -> DECISION_PENDING`` **now has two callers, and both are gated
+          by the same counter.** It had none until R24.C13 gave the promise sweep a reason to
+          enqueue a decision cycle for a case waiting on an outcome: ``handle_review`` takes this
+          edge from that state and refuses at the identical
+          ``decision_cycle_count >= MAX_RECOVERY_ATTEMPTS`` gate it applies to the review edge,
+          and ``apply_missed_disposition`` takes it when a promise becomes ``MISSED``, asking
+          ``bound_reached`` — which reads the same counter against the same bound — and stopping
+          the case where it is spent. So the arithmetic below is unchanged: this edge, like the
+          other two, only ever moves ``n -> n+1`` for ``n <= MAX_RECOVERY_ATTEMPTS - 1``.
 
         Starting from 1 and stepping to at most ``MAX_RECOVERY_ATTEMPTS``, the ceiling is exactly
         ``MAX_RECOVERY_ATTEMPTS`` — measured at 3 against the seeded default of 3 by driving three
@@ -2289,11 +2300,78 @@ def test_every_edge_into_decision_pending_spends_a_decision_cycle() -> None:
 
 
 @pytest.mark.pure
+def test_every_state_can_reach_recovered_and_only_against_a_verified_capture() -> None:
+    """A customer can pay at any moment, so RECOVERED must be reachable from every state.
+
+    **This assertion replaces a claim this file and the transition module both used to make** —
+    that RECOVERED was reachable only from ``WAITING_FOR_OUTCOME`` on the forward path or from a
+    terminal state by reconciliation. That was true of the table and it was a hole, not an
+    invariant: a capture read while the case sat at ``DECISION_PENDING`` or ``EXECUTING`` had its
+    ``RECOVERY_RECORDED`` written and its money counted, and then its transition refused, so the
+    case expired with its amount already in the recovery figure. A 150-case batch produced 62
+    recovery records against 39 cases in RECOVERED. The old text is gone from
+    ``revora/domain/transitions.py`` rather than merely qualified, because a comment that states
+    the opposite of the table is worse than no comment.
+
+    What replaces it is the guard, asserted here in both directions:
+
+    * every non-terminal state has an edge to RECOVERED, and ``DECISION_PENDING`` and
+      ``EXECUTING`` are named explicitly because those are the two the measured failures came
+      from;
+    * every edge into RECOVERED requires a verified capture, **except** the forward edge from
+      ``WAITING_FOR_OUTCOME``, whose caller holds the same read. Nothing else may declare
+      recovery — not a webhook, not a timer, not a policy decision.
+
+    The second clause is the one that matters. Reachability without it would be an invitation to
+    close the hole by adding an ungated edge, which would trade "money counted for a case that
+    never recovered" for "a case declared recovered on a webhook", and the second is the failure
+    this whole subsystem is built to prevent.
+    """
+    non_terminal = frozenset(CaseState) - TERMINAL_STATES
+    missing = sorted(
+        state.value
+        for state in non_terminal
+        if (state, CaseState.RECOVERED) not in LEGAL_TRANSITIONS
+    )
+    assert not missing, (
+        f"no edge to RECOVERED from {missing}; a customer who pays while a case is in one of "
+        "those states has their money recorded and counted while the case goes on to expire"
+    )
+    for state in (CaseState.DECISION_PENDING, CaseState.EXECUTING):
+        assert (state, CaseState.RECOVERED) in LEGAL_TRANSITIONS, state.value
+
+    for (source, target), edge in LEGAL_TRANSITIONS.items():
+        if target is not CaseState.RECOVERED:
+            continue
+        if source is CaseState.WAITING_FOR_OUTCOME:
+            assert edge.kind is TransitionKind.FORWARD, (
+                "the ordinary recovery path stopped being the FORWARD edge, so the audit trail "
+                "no longer distinguishes it from a reconciliation"
+            )
+            continue
+        assert edge.requires_verified_capture, (
+            f"{source.value} -> RECOVERED does not require a verified capture; recovery is "
+            "declared only from an authoritative provider read reporting the capture, and an "
+            "ungated edge lets a webhook alone put money in the recovery figure"
+        )
+
+    for source in TERMINAL_STATES:
+        terminal_edge = LEGAL_TRANSITIONS.get((source, CaseState.RECOVERED))
+        if source is CaseState.RECOVERED:
+            assert terminal_edge is None, "RECOVERED gained an edge to itself"
+            continue
+        assert terminal_edge is not None and terminal_edge.at_most_once_per_case, (
+            f"{source.value} -> RECOVERED may now be taken more than once per case, which is a "
+            "second count of the same money"
+        )
+
+
+@pytest.mark.pure
 def test_no_cycle_passes_through_a_terminal_state() -> None:
     """A cycle through a terminal state would break termination in a way the counter cannot bound.
 
     Asked because the enumeration runs over the *whole* table, including the forty termination edges
-    and the five reconciliation ones — so it is fair to ask whether it can produce such a cycle, and
+    and every reconciliation edge — so it is fair to ask whether it can produce such a cycle, and
     what it would mean if it did.
 
     It cannot, and the reason is structural rather than lucky. Termination edges are declared only

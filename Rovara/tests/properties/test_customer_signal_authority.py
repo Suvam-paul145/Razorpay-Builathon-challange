@@ -22,14 +22,33 @@ exists" and "no execution intent row exists" are claims about rows.
 The design assigns P35 to ``model``. The structural half is here in that tier; the driven half is
 ``pg`` for the reason task 38 gave about P63, P64 and P66 — the honest placement of a property is
 the tier where it actually runs, and a claim about rows cannot run against a fake that has none.
+
+**Task 41 added P36, P37 and P38 below, and all three are the same shape as P35's first half:
+each has a behavioural test and a structural one, and the structural one is the stronger claim.**
+
+* **P36** — signal content moves no policy outcome. Behaviourally, arbitrary schema-valid content is
+  substituted onto a ``PolicyInput`` with the suppression state pinned, and the twelve outcomes are
+  fingerprinted before and after. Structurally, ``PolicyInput``'s declared field set is disjoint
+  from every ``customer_signal`` and ``promise_to_pay`` column, and ``revora/policy/`` imports
+  neither ``revora.persistence`` nor ``revora.customer`` — so there is no field for a signal to
+  arrive in and no way to go and fetch one.
+* **P37** — no signal sequence moves a configured bound. Behaviourally the eight bounds R25.C7 names
+  and the configuration version are compared across a generated sequence; structurally no module in
+  ``revora/customer/`` names any of the eight, or either of the two symbols that could write one.
+* **P38** — nothing is derived from a note's contents. The reference for every derivation is the
+  *same submission with the note absent*, which is what makes the property a statement about the
+  note's irrelevance rather than about four derivations happening to be right today.
 """
 
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -39,21 +58,60 @@ from hypothesis import strategies as st
 from sqlalchemy import Engine, text
 
 from revora.api.app import create_app
+from revora.api.rendering import (
+    RENDER_AS_TEXT_ONLY,
+    UNVERIFIED_CUSTOMER_TEXT,
+    customer_supplied_note,
+)
 from revora.customer import projection as projection_module
 from revora.customer import signals as signals_module
 from revora.customer import tokens as tokens_module
+from revora.customer.promises import effective_promise_limit
+from revora.customer.signals import (
+    DelayReasonSubmission,
+    PartialArrangementSubmission,
+    PromiseSubmission,
+    _note_for_storage,
+    cause_for_delay_reason,
+    effective_note_limit,
+)
 from revora.customer.tokens import TokenService
 from revora.domain.actions import CandidateAction
+from revora.domain.enums import CustomerSignalKind, DelayReason, HardStopReason
 from revora.persistence.repositories.engine import build_engine, dispose_engine, set_engine
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.config import default_configuration
+from revora.policy import input as policy_input_module
+from revora.policy.engine import evaluate
+from revora.policy.input import PolicyInput
+from revora.policy.rules import default_rule_set
 from tests.fakes.customer import installed_signing_secrets
 from tests.pg_support import insert_merchant
-from tests.strategies.customer import signal_submissions
+from tests.strategies.customer import delay_reason_notes, signal_submissions
+from tests.strategies.policy import policy_input
 
 _CONFIG = default_configuration()
 
 _CUSTOMER_PACKAGE = Path(inspect.getfile(signals_module)).parent
+
+_HARD_STOP_MEMBERS: frozenset[DelayReason] = frozenset(
+    DelayReason(reason.value) for reason in HardStopReason
+)
+"""The two Delay_Reasons that are Hard_Stop_Reasons, derived rather than listed.
+
+Derived so that a third Hard_Stop_Reason is covered by P36 and P38 the day it is added, instead of
+falling through as an ordinary payment problem — which is the failure that would be invisible,
+because the two enumerations overlapping by value is exactly what makes the derivation work."""
+
+_ASSIGNMENT_REFUSED = (dataclasses.FrozenInstanceError, AttributeError, TypeError)
+"""What a refused attribute assignment on a frozen, slotted dataclass may raise.
+
+Three types because the mechanism differs by case and by CPython version: ``FrozenInstanceError``
+for a declared field, ``TypeError`` or ``AttributeError`` for a name the slots layout has no room
+for. The property under test is that the assignment cannot succeed; pinning the type would make the
+test brittle about something it does not care about. The same tuple, and the same argument, as
+``tests/properties/test_policy.py``'s — restated rather than imported, because a shared constant
+between two property files makes one file's failure message describe the other's subject."""
 
 _FORBIDDEN_PACKAGES: tuple[str, ...] = (
     "revora.policy",
@@ -316,6 +374,20 @@ def test_p35_no_sequence_of_writes_produces_a_verdict_or_an_effect(
     exactly one however many signals were submitted — the dedupe key is on the case, so a customer
     submitting five times spends one decision cycle rather than five.
 
+    **A second promise is 409 and still records its signal, and that is asserted positionally.**
+    R23.C7 is the one refusal on this surface that keeps its write: the ``promise_to_pay`` row is
+    refused because the case already holds ``MAX_PROMISES_PER_CASE``, and the ``customer_signal``
+    is persisted anyway so Recovery_Memory keeps the fact that the customer revised their promise.
+    So the legal status of a submission depends on what came before it, and the expected set is
+    computed from the sequence rather than widened to admit 409 everywhere — a 409 on the *first*
+    promise would mean the bound is checked against the wrong number, and a 201 on the second
+    would mean it is not checked at all. Neither is distinguishable under a widened set.
+
+    A promise dated past the window is accepted (201) and escalates, and this test never runs the
+    worker, so the case is still at ``POLICY_CHECK`` afterwards even then — the transition of
+    R23.C5 belongs to ``handle_promise_escalation``, and R19.C9 is precisely the requirement that
+    keeps it there.
+
     **A hard stop in the sequence ends the sequence, and task 42 is where that started being true.**
     The generator draws ``DISPUTES_THE_CHARGE`` and ``NO_LONGER_WANTS_THE_ORDER`` like any other
     Delay_Reason, and R21.C10 requires the accepting request to revoke every Customer_Access_Token
@@ -379,11 +451,34 @@ def test_p35_no_sequence_of_writes_produces_a_verdict_or_an_effect(
     live = statuses if first_hard_stop is None else statuses[: first_hard_stop + 1]
     after = [] if first_hard_stop is None else statuses[first_hard_stop + 1 :]
 
-    assert all(status in {201, 429} for status in live), (
-        f"a declared write shape was answered {statuses}; only 201 and the two 429 caps are legal "
-        "outcomes for a schema-valid submission on a live token against a non-terminal case. The "
-        f"first hard stop is at index {first_hard_stop}, so everything up to and including it was "
-        "submitted on a token that had not been revoked"
+    # R23.C7. A *second* promise on one case is 409 and the case keeps its first promise, so the
+    # legal status of a submission depends on whether a promise came before it. Computed
+    # positionally rather than by widening the set to include 409, because the two failures the
+    # widened set would hide are the ones worth catching: a 409 on the *first* promise means the
+    # bound is being checked against the wrong number, and a 201 on the second means it is not
+    # being checked at all. ``MAX_PROMISES_PER_CASE`` is read rather than assumed to be one, so a
+    # merchant configuring 0 changes what this expects instead of breaking it.
+    promise_limit = effective_promise_limit(_CONFIG)
+    promises_before: list[int] = []
+    seen_promises = 0
+    for suffix, _body in submissions:
+        promises_before.append(seen_promises)
+        if suffix == "promise":
+            seen_promises += 1
+    legal_live = [
+        {409, 429} if suffix == "promise" and before >= promise_limit else {201, 429}
+        for (suffix, _body), before in zip(submissions, promises_before, strict=True)
+    ]
+
+    assert all(
+        status in legal
+        for status, legal in zip(live, legal_live[: len(live)], strict=True)
+    ), (
+        f"a declared write shape was answered {statuses}; only 201, the two 429 caps and R23.C7's "
+        "409 on a promise past MAX_PROMISES_PER_CASE are legal outcomes for a schema-valid "
+        "submission on a live token against a non-terminal case. The first hard stop is at index "
+        f"{first_hard_stop}, so everything up to and including it was submitted on a token that "
+        f"had not been revoked; the expected sets were {legal_live[: len(live)]}"
     )
     assert all(status == 410 for status in after), (
         f"submissions after the hard stop at index {first_hard_stop} were answered {after}; "
@@ -500,3 +595,564 @@ def test_p35_no_sequence_of_writes_produces_a_verdict_or_an_effect(
         "be *enqueued* rather than applied in the request, and the dedupe key is on the case, so "
         "two hard stops on one case queue one application"
     )
+
+
+# ---------------------------------------------------------------------------
+# `model` — Property 36: signal content moves no policy outcome
+# ---------------------------------------------------------------------------
+
+_RULES = default_rule_set(
+    max_recovery_attempts=int(_CONFIG.MAX_RECOVERY_ATTEMPTS),
+    max_customer_messages=int(_CONFIG.MAX_CUSTOMER_MESSAGES),
+    cooldown_interval=_CONFIG.COOLDOWN_INTERVAL,
+    policy_decision_validity=_CONFIG.POLICY_DECISION_VALIDITY,
+    risk_reason_codes=_CONFIG.RISK_REASON_CODES,
+    min_net_value_threshold=_CONFIG.MIN_NET_VALUE_THRESHOLD,
+    min_incremental_probability=_CONFIG.MIN_INCREMENTAL_PROBABILITY,
+)
+"""The rule set, built from the configured bounds rather than from literals.
+
+``tests/properties/test_policy.py`` builds its own from fixed numbers, which is right there: those
+properties are about the engine's *ordering* and want values chosen to make individual checks fail.
+P36 and P37 are about configuration not moving, so they have to be evaluated against the
+configuration — a rule set of test literals would leave "the bounds are unchanged" a claim about
+numbers this file invented."""
+
+_SIGNAL_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        "kind",
+        "delay_reason",
+        "delay_reason_note",
+        "note_truncated",
+        "note_redacted_at",
+        "retention_config_version",
+        "submitted_at",
+        "token_id",
+        "provenance",
+        "signal_id",
+        "promise_date",
+        "received_representation",
+        "status",
+        "follow_up_at",
+        "window_end_at_snapshot",
+        "recorded_at",
+        "hard_stop_reason",
+        "scope_key",
+        "customer_signal_id",
+        "note",
+        "signals_remaining",
+    }
+)
+"""Every column of ``customer_signal`` and ``promise_to_pay``, plus the wire field names.
+
+R20.C8 excludes "every Delay_Reason value, every Delay_Reason_Note, every Customer_Signal field,
+and every Promise_To_Pay field other than the persisted Contact_Suppression state" from the policy
+engine's declared deterministic input set. This is that list, and the test below asserts it is
+disjoint from ``PolicyInput``'s field set — which is what makes P36 a claim about the whole space
+of signal content rather than about the substitutions a test thought to try.
+
+``contact_suppressed`` is deliberately absent: it *is* on ``PolicyInput``, by R21.C3, and it is the
+one thing a signal legitimately moves. ``scope_key`` and ``customer_signal_id`` are here because
+they are ``contact_suppression`` columns and the check reads the boolean rather than the row.
+
+``case_id`` is deliberately absent too, and for a different reason worth stating because it looks
+like an omission. ``customer_signal.case_id`` is a column, so a literal reading of "every
+Customer_Signal field" would include it — and ``PolicyInput.case_id`` is on the input, because an
+evaluation has to know which case it is authorizing an action for. They are the same *value* and not
+the same *fact*: the case id is the case's own identity, which the signal borrows in order to point
+at it. What R20.C8 excludes is content a customer supplied, and a customer supplies no case id — the
+token names the case (R29.C2) and the request body has nowhere to put one. Listing it would make
+this test assert that policy may not know which case it is deciding about."""
+
+
+def _decision_fingerprint(evaluation: object) -> tuple[object, ...]:
+    """Verdict, primary reason and all twelve ordered check outcomes.
+
+    The same three things ``test_policy.py`` fingerprints for P2, and for the same reason: those
+    are exactly what R20.C10 requires unchanged. Recomputed here rather than imported, because a
+    shared helper between two property files would make one property's failure message describe the
+    other one's subject.
+    """
+    return (
+        evaluation.verdict,
+        evaluation.primary_reason,
+        tuple((check.order, check.check, check.outcome) for check in evaluation.checks),
+    )
+
+
+@pytest.mark.model
+@given(
+    suppressed=st.booleans(),
+    data=st.data(),
+)
+@settings(max_examples=40, deadline=None)
+def test_p36_no_signal_content_moves_a_policy_outcome(
+    suppressed: bool, data: st.DataObject
+) -> None:
+    """Feature: Customer Response Loop. Property 36 — replacing every Customer_Signal field with
+    arbitrary schema-valid content, with the suppression state held fixed, leaves the verdict, the
+    primary reason and all twelve ordered check outcomes unchanged (R20.C8, R20.C10).
+
+    **"Suppression state held fixed" is the load-bearing clause and it is not a weakening.** A
+    hard-stop Delay_Reason genuinely does change the verdict — that is R21.C3's whole point, and
+    task 42 built it: the persisted ``contact_suppression`` row enters check 5's input and blocks.
+    So P36 is a claim about every path *except* that one.
+
+    It is expressed by pinning ``contact_suppressed`` and drawing **both** of its values, rather
+    than by excluding ``DISPUTES_THE_CHARGE`` and ``NO_LONGER_WANTS_THE_ORDER`` from the generated
+    signals. The difference matters: excluding them would stop the property covering the two
+    members most likely to acquire an unintended second effect, which is precisely the failure
+    worth finding. Pinned-and-drawn instead, the property says something stronger — *a hard stop
+    changes the twelve outcomes through the suppression boolean and through nothing else*. On a
+    suppressed case the twelve outcomes are whatever suppression makes them, and they are still
+    identical before and after arbitrary signal content is substituted.
+
+    The substitution is attempted the only way it can be: by setting each name on the input.
+    ``PolicyInput`` is frozen and slotted, so every attempt raises, and the raising *is* the proof
+    — there is no attribute to overwrite and none to add. The evaluation is then re-run and
+    fingerprinted anyway, so a future edit that made the type mutable would be caught behaviourally
+    rather than only by the exception that no longer fires.
+    """
+    candidate = data.draw(policy_input(contact_suppressed=suppressed))
+    before = evaluate(candidate, _RULES)
+
+    submission = data.draw(signal_submissions(note_strategy=delay_reason_notes()))
+    _suffix, body = submission
+    substitutions: dict[str, object] = {
+        # The generated wire body, field by field, so the substituted values are the ones a real
+        # request could actually carry rather than values a test invented.
+        **body,
+        "delay_reason": body.get("delay_reason", DelayReason.OTHER.value),
+        "delay_reason_note": body.get("note"),
+        "kind": CustomerSignalKind.DELAY_REASON.value,
+        "note_truncated": True,
+        "provenance": "REAL",
+        "token_id": "rvt_" + "a" * 26,
+        "signals_remaining": 0,
+    }
+    for name, value in substitutions.items():
+        with pytest.raises(_ASSIGNMENT_REFUSED):
+            setattr(candidate, name, value)
+
+    after = evaluate(candidate, _RULES)
+    assert _decision_fingerprint(before) == _decision_fingerprint(after), (
+        "the twelve check outcomes moved after substituting Customer_Signal content with the "
+        f"suppression state pinned to {suppressed}. R20.C10 requires the same verdict, the same "
+        "primary reason and the same ordered outcomes; a signal that moved any of them would be a "
+        "text box on a public page moving an authorization"
+    )
+    assert not hasattr(candidate, "__dict__"), (
+        "PolicyInput acquired a __dict__, so an undeclared attribute can now be attached to it at "
+        "runtime — which is the one route by which signal content could reach an evaluation "
+        "without an edit to revora/policy/input.py that a reviewer would see"
+    )
+
+
+@pytest.mark.model
+def test_p36_policy_input_declares_no_customer_signal_field() -> None:
+    """Property 36, structurally: there is nowhere for signal content to sit (R20.C8).
+
+    The behavioural test above shows that the substitutions it drew changed nothing. This shows why
+    no substitution can, which is the stronger statement and the one that survives a generator
+    nobody updated: ``PolicyInput``'s declared field set is **disjoint** from every column of
+    ``customer_signal`` and ``promise_to_pay`` and from every wire field name the three write shapes
+    accept.
+
+    ``contact_suppressed`` is the deliberate exception and is asserted *present* rather than merely
+    left off the forbidden list. R21.C3 requires it, and an assertion that it is absent from the
+    forbidden set would pass just as well if somebody deleted the field — so the presence is
+    checked, and the pairing is what makes R20.C8 and R21.C3 legible as two halves of one design
+    instead of as a rule and its exception.
+    """
+    declared = {field.name for field in dataclasses.fields(PolicyInput)}
+    overlap = sorted(declared & _SIGNAL_FIELD_NAMES)
+    assert not overlap, (
+        f"PolicyInput declares {overlap}, which are Customer_Signal or Promise_To_Pay fields. "
+        "R20.C8 excludes every one of them from the declared deterministic input set, and the "
+        "exclusion is only structural while there is no field for them to arrive in"
+    )
+    assert "contact_suppressed" in declared, (
+        "PolicyInput no longer declares contact_suppressed. It is the one piece of state a "
+        "Customer_Signal may legitimately move (R21.C3), and check 5 reading it is what makes a "
+        "hard stop an absolute prohibition rather than a thirteenth check"
+    )
+
+
+@pytest.mark.model
+def test_p36_the_policy_package_imports_nothing_that_could_reach_a_signal() -> None:
+    """Property 36's other half: ``revora/policy/`` cannot read a signal even if it wanted to.
+
+    The ``policy-isolation`` contract forbids ``revora.persistence`` among others, and
+    ``lint-imports`` enforces it on every commit. This is the same claim as a test, so the *reason*
+    is visible in the suite: the twelve checks read a frozen value object, and the only route from
+    a persisted ``customer_signal`` row to an evaluation is a caller putting it there — which is
+    the route the field-set test above closes.
+
+    Asserted over every module in the package rather than the three that exist, so a fourth
+    inherits it.
+    """
+    policy_package = Path(inspect.getfile(policy_input_module)).parent
+    checked = sorted(policy_package.rglob("*.py"))
+    assert len(checked) >= 4, (
+        f"only {len(checked)} files found under {policy_package}; this test is meant to cover the "
+        "whole package and has stopped finding it"
+    )
+    for path in checked:
+        imported = _imports_of(path)
+        offending = sorted(
+            name
+            for name in imported
+            for forbidden in ("revora.persistence", "revora.customer", "revora.memory")
+            if name == forbidden or name.startswith(f"{forbidden}.")
+        )
+        assert not offending, (
+            f"{path.name} imports {offending}. A policy check that could read a customer_signal "
+            "row would make R20.C8's exclusion a discipline rather than a structure"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `model` — Property 37: no signal moves a configured bound
+# ---------------------------------------------------------------------------
+
+NAMED_BOUNDS: tuple[str, ...] = (
+    "MAX_RECOVERY_ATTEMPTS",
+    "MAX_CUSTOMER_MESSAGES",
+    "RECOVERY_WINDOW_DURATION",
+    "COOLDOWN_INTERVAL",
+    "MIN_NET_VALUE_THRESHOLD",
+    "MIN_INCREMENTAL_PROBABILITY",
+    "MAX_COST_TO_VALUE_RATIO",
+    "HIGH_BASELINE_THRESHOLD",
+)
+"""The eight bounds R25.C7 names, in the order it names them.
+
+Eight and not "the bounds": R25.C7 lists exactly these, and a test that iterated the whole
+catalogue would be asserting something broader than the requirement and would fail the day a
+deployment-only bound was added. Listed here so the requirement's set and the test's set are the
+same object rather than two lists somebody keeps in step."""
+
+
+@pytest.mark.model
+@given(submissions=st.lists(signal_submissions(note_strategy=delay_reason_notes()), max_size=6))
+@settings(max_examples=40, deadline=None)
+def test_p37_no_signal_sequence_moves_a_named_bound_or_the_config_version(
+    submissions: list[tuple[str, dict[str, object]]],
+) -> None:
+    """Feature: Customer Response Loop. Property 37 — all eight named bounds and the configuration
+    version identifier are unchanged under arbitrary Customer_Signal sequences (R25.C7).
+
+    Driven through the pure functions a submission actually reaches — the request models, the note
+    truncation and the mapping table — because those are the only things in the write path that read
+    a submitted value, and a ``model``-tier test that opened a database would be asserting the same
+    thing more slowly.
+
+    **The bounds cannot move because there is no writer, and this test says so twice.** The
+    behavioural half compares the eight values and the version before and after the sequence. The
+    structural half below asserts that no module in ``revora/customer/`` so much as names one of the
+    eight — which is the claim that holds for sequences nobody generated. Neither half alone is
+    enough: the first would pass against a module that wrote a bound on the ninth submission, and
+    the second would pass against one that reached a bound through a variable.
+
+    The configuration version is in the property for a reason R25.C7 states directly: a bound may
+    change only through a recorded configuration change *carrying a new version identifier*. So a
+    version that moved without a bound moving would be as much a violation as the reverse — it would
+    mean something wrote the table.
+    """
+    before = tuple(getattr(_CONFIG, name) for name in NAMED_BOUNDS)
+    before_version = _CONFIG.version
+
+    limit = effective_note_limit(_CONFIG)
+    for suffix, body in submissions:
+        # Validate through the real request model, so the values that reach the pure helpers are the
+        # ones the endpoint would have produced rather than raw dicts.
+        if suffix == "delay-reason":
+            submission = DelayReasonSubmission.model_validate(body)
+            cause_for_delay_reason(submission.delay_reason)
+        elif suffix == "partial-arrangement":
+            submission = PartialArrangementSubmission.model_validate(body)
+        else:
+            submission = PromiseSubmission.model_validate(body)
+        stored, truncated = _note_for_storage(submission.submitted_note, limit)
+        # Read the results so a future refactor cannot make this loop dead code the optimiser
+        # elides. The assertions about them belong to P38; here they only have to have happened.
+        assert stored is None or len(stored) <= limit
+        assert isinstance(truncated, bool)
+
+    after = tuple(getattr(_CONFIG, name) for name in NAMED_BOUNDS)
+    moved = {
+        name: (was, now_)
+        for name, was, now_ in zip(NAMED_BOUNDS, before, after, strict=True)
+        if was != now_
+    }
+    assert not moved, (
+        f"a configured bound moved across a Customer_Signal sequence: {moved}. R25.C7 permits a "
+        "change only through a recorded configuration change with an approving Merchant_User, and "
+        "a customer is not one"
+    )
+    assert _CONFIG.version == before_version, (
+        f"the configuration version moved from {before_version} to {_CONFIG.version} across a "
+        "signal sequence. A version that moves without an approving user means something wrote "
+        "app_config, which is the mechanism R25.C7 exists to keep closed"
+    )
+
+
+@pytest.mark.model
+def test_p37_the_customer_package_names_no_configured_bound_it_could_write() -> None:
+    """Property 37, structurally: the write path cannot reach a bound to change it (R25.C7).
+
+    The customer surface *reads* configured bounds and must — ``MAX_CUSTOMER_SIGNALS_PER_CASE`` and
+    ``DELAY_NOTE_MAX_LENGTH`` are what make R19.C7 and R20.C2 enforceable, and they are read through
+    ``Configuration``, which is a frozen dataclass. So the claim is not "no bound is named"; it is
+    that **none of the eight R25.C7 names appears at all**, and that no module here reaches the one
+    class that could produce a different configuration.
+
+    ``ConfigurationBound`` and ``seed_rows`` are the two names that would be involved in changing a
+    bound rather than reading one, so they are on the forbidden list beside the eight. A module that
+    imported ``seed_rows`` could write a new default; one that constructed a ``ConfigurationBound``
+    could add a bound the accessor does not declare.
+    """
+    forbidden = frozenset(NAMED_BOUNDS) | {"ConfigurationBound", "seed_rows", "app_config"}
+    for path in sorted(_CUSTOMER_PACKAGE.rglob("*.py")):
+        referenced = _referenced_names(path)
+        overlap = sorted(referenced & forbidden)
+        assert not overlap, (
+            f"{path.name} references {overlap} in code. None of the eight bounds R25.C7 names is "
+            "an input to anything the customer surface does, and the two configuration-writing "
+            "names are how a bound would be changed rather than read"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `pure` — Property 38: nothing is derived from a note's contents
+# ---------------------------------------------------------------------------
+
+_MARKUP_SIGNIFICANT: tuple[str, ...] = ("&", "<", ">", '"', "'")
+"""The five characters R29.C11 requires escaped, restated here rather than imported.
+
+Restated on purpose. Importing :data:`revora.api.rendering.MARKUP_ESCAPES` would make the test
+assert that the implementation escapes what the implementation says it escapes, which is true of any
+implementation. This is the requirement's list, written independently, and the two agreeing is the
+finding."""
+
+_ENTITIES: tuple[str, ...] = ("&amp;", "&lt;", "&gt;", "&quot;", "&#x27;")
+"""The five entities the escaped form may legally contain, in the order they must be removed.
+
+The assertion below cannot be "no ``&`` appears in the escaped text": every entity starts with one,
+so that would fail on any output that escaped anything. What R29.C11 requires is that no
+markup-significant character appears **unescaped**, which is checked by deleting each legal entity
+and then asserting that none of the five raw characters survives the deletion.
+
+``&amp;`` is removed first, and for the same reason the escape produces it first: removing ``&lt;``
+before ``&amp;`` would leave the ampersand of a ``&amp;lt;`` sequence looking like a stray one."""
+
+
+@pytest.mark.pure
+@given(reason=st.sampled_from(tuple(DelayReason)), note=delay_reason_notes())
+@settings(max_examples=250, deadline=None)
+def test_p38_nothing_is_derived_from_a_note_and_the_rendering_is_inert(
+    reason: DelayReason, note: str | None
+) -> None:
+    """Feature: Customer Response Loop. Property 38 — for arbitrary note content, the derived
+    Delay_Reason, Hard_Stop_Reason, Promise_Date, Partial_Arrangement_Request flag and every
+    currency figure equal their values with the note absent; the stored length is within the bound;
+    and the rendered output has every markup-significant character escaped (R20.C2, R20.C3,
+    R20.C7, R29.C11).
+
+    **The reference is the same submission with ``note=None``**, not a hand-written expected value.
+    That is what makes this a statement about the note's *irrelevance* rather than about the four
+    derivations happening to be right: whatever they produce, they must produce it identically with
+    the note present and absent, for every one of the generated shapes — markup, already-escaped
+    markup, SQL, control characters, four scripts, and text that spells out in words each of the
+    five things R20.C3 forbids deriving. A note reading ``DISPUTES_THE_CHARGE`` produces no hard
+    stop, and a note reading ``amount 249900 INR`` produces no currency figure, because the derived
+    values are compared against a submission that contains neither string.
+
+    **The currency clause is asserted as an absence of anything a figure could come from**, which is
+    the only honest form it has: ``DelayReasonSubmission`` declares no money field, so the assertion
+    is that the audit values it records contain no integer and no ``Decimal`` at all. R22.C1 is the
+    same absence one layer down — there is no ``amount`` column — so a currency figure derived from
+    a note would have to invent both a field and a column.
+
+    **The rendering clause is asserted on the escaped form, over the *stored* text**, which is the
+    order the implementation uses and the order that matters: escaping before truncation would let a
+    cut land inside ``&amp;`` and emit ``&am``, a broken entity, which is a rendering defect in
+    exactly the place the requirement is about. Truncate, then escape, then assert no
+    markup-significant character survives raw.
+    """
+    body: dict[str, object] = {"delay_reason": reason.value}
+    if note is not None:
+        body["note"] = note
+    with_note = DelayReasonSubmission.model_validate(body)
+    without_note = DelayReasonSubmission.model_validate({"delay_reason": reason.value})
+
+    # R20.C3, clause by clause. Each is a value something downstream reads, and each is compared
+    # against the note-absent submission rather than against a literal.
+    assert with_note.submitted_delay_reason == without_note.submitted_delay_reason
+    assert cause_for_delay_reason(with_note.submitted_delay_reason) == cause_for_delay_reason(
+        without_note.submitted_delay_reason
+    ), "the mapped Risk_Cause moved with the note's contents"
+    assert (with_note.submitted_delay_reason in _HARD_STOP_MEMBERS) == (
+        without_note.submitted_delay_reason in _HARD_STOP_MEMBERS
+    ), "a note's contents produced or removed a hard stop"
+    assert with_note.kind is without_note.kind is CustomerSignalKind.DELAY_REASON, (
+        "the signal kind moved with the note's contents, so a note could turn a stated reason into "
+        "a Partial_Arrangement_Request — which is R22's shape and has different consequences"
+    )
+    # No Promise_Date and no arrangement flag can be derived, because neither field exists on this
+    # shape. Asserted as the absence rather than as `is None`, so a field added later fails here
+    # instead of quietly becoming derivable.
+    for absent in ("promise_date", "amount", "instalment_count", "schedule", "partial"):
+        assert not hasattr(with_note, absent), (
+            f"DelayReasonSubmission acquired a {absent!r} field. R22.C1 and R20.C3 are both the "
+            "absence of one, and a nullable field is a field something eventually populates"
+        )
+
+    recorded = with_note.recorded_values()
+    assert set(recorded) == set(without_note.recorded_values()), (
+        "the audit value key set changed with the note's contents"
+    )
+    assert recorded["delay_reason"] == reason.value
+    for key, value in recorded.items():
+        assert not isinstance(value, int | Decimal) or isinstance(value, bool), (
+            f"the recorded audit values carry a numeric field {key!r}={value!r}. Every currency "
+            "figure in the system is an integer minor-unit count, so a numeric value derived on "
+            "this path is indistinguishable from one — and R20.C3 forbids deriving any currency "
+            "figure from a note. Booleans are exempt: note_present is one"
+        )
+    # The note itself is never an audit field; only whether one was supplied. Asserted as the
+    # absence of a key rather than as a substring search, because the note is generated content and
+    # some draws are Delay_Reason member names — a substring test would fail on the note "OTHER"
+    # beside the reason ``OTHER`` and would be asserting a coincidence rather than the requirement.
+    # It matters because the audit log cannot be rewritten: a note that reached it would outlive
+    # CUSTOMER_DATA_RETENTION with no sweep able to reach it.
+    assert "note" not in recorded and "delay_reason_note" not in recorded, (
+        f"the recorded audit values carry a note field: {sorted(recorded)}. The audit log is the "
+        "one store the R29.C10 retention sweep cannot reach, which is why the note is retained on "
+        "customer_signal and only note_present is recorded here"
+    )
+
+    # R20.C2: the stored length respects the effective bound, which is the smaller of the
+    # configured one and the column's.
+    limit = effective_note_limit(_CONFIG)
+    stored, truncated = _note_for_storage(with_note.submitted_note, limit)
+    if stored is None:
+        assert not truncated, (
+            "note_truncated was set on a note that stored as NULL. The flag means 'incomplete at "
+            "the end', and there is no end"
+        )
+    else:
+        assert len(stored) <= limit, (
+            f"stored note is {len(stored)} characters against a bound of {limit}; the column's "
+            "CHECK would reject the insert and the customer would get a 503 for a well-formed "
+            "request"
+        )
+        assert "\x00" not in stored, (
+            "a NUL byte survived into the stored note. It is the one character PostgreSQL TEXT "
+            "cannot hold, so the insert would fail and answer 503"
+        )
+        assert truncated == (len(_stripped(with_note.submitted_note)) > limit), (
+            "note_truncated disagrees with whether length truncation actually happened"
+        )
+
+    # R29.C11: the rendered form, escaped, over the stored text.
+    document = customer_supplied_note(stored, truncated=truncated)
+    if stored is None:
+        assert document is None, "an absent note produced a presentation document"
+        return
+    assert document is not None
+    assert document["label"] == UNVERIFIED_CUSTOMER_TEXT, (
+        "the note is presented without R20.C12's mark. The label is a fact about the data — a "
+        "stranger's assertion — and a surface that omitted it would present it as a finding"
+    )
+    assert document["verified"] is False
+    assert document["render_as"] == RENDER_AS_TEXT_ONLY
+    assert document["text"] == stored, (
+        "the verbatim text differs from what was stored. It is what a text-node renderer uses, and "
+        "a pre-escaped copy there would display a customer who typed '<3' as '&lt;3'"
+    )
+    escaped = document["text_escaped"]
+    assert isinstance(escaped, str)
+    residue = escaped
+    for entity in _ENTITIES:
+        residue = residue.replace(entity, "\u0001")
+    for character in _MARKUP_SIGNIFICANT:
+        assert character not in residue, (
+            f"{character!r} survives unescaped in the rendered note. R29.C11 requires every "
+            f"markup-significant character escaped, and {character!r} is one: the angle brackets "
+            "open and close a tag, the quotes close an attribute value, and the ampersand is what "
+            f"makes the substitution order load-bearing. Rendered: {escaped[:120]!r}"
+        )
+    # Nothing was dropped. Escaping only ever lengthens, so a shorter result means a character was
+    # removed rather than replaced — which R20.C3 forbids, because deciding a character does not
+    # belong in a note is deriving a judgement about its contents.
+    assert len(escaped) >= len(stored), (
+        "the escaped form is shorter than the stored text, so escaping removed content"
+    )
+
+
+def _stripped(note: str | None) -> str:
+    """The note as ``_note_for_storage`` sees it before the length check.
+
+    Duplicated from the writer on purpose, so the truncation assertion above compares against an
+    independently computed length rather than against the function under test. If the writer's
+    NUL-then-strip order ever changed, this is where the property would notice.
+    """
+    return "" if note is None else note.replace("\x00", "").strip()
+
+
+@pytest.mark.pure
+def test_p38_no_presentation_surface_renders_a_note_as_markup() -> None:
+    """Property 38's rendering clause at the surface that actually renders (R29.C11).
+
+    ``dangerouslySetInnerHTML`` is the only way a React component can execute a string as markup,
+    and R29.C11 forbids it "in any presentation surface" — so the assertion is over the **whole**
+    ``web/src`` tree rather than over the one component that shows a note. A second component added
+    later inherits the guarantee instead of being trusted to repeat it, and the customer-facing page
+    is covered by the same sweep as the dashboard.
+
+    A source-level check from a Python test rather than from vitest, and that is deliberate: this is
+    a property of the repository, not of a rendered component, and running it in the ``pure`` tier
+    means it fails on every commit rather than only when somebody runs the web suite.
+
+    **Comments are stripped first, for the reason :func:`_referenced_names` reads the AST.** These
+    components are documented at length and the one that renders a note explains in prose exactly
+    which API it must not use, so a substring search over the raw text fails on the explanation
+    rather than on a call — which is the failure that would teach the next person to delete the
+    comment instead of keeping the guarantee. Python has no JSX parser to hand, so the comments are
+    removed with two substitutions and the search runs on what is left. That is weaker than an AST
+    walk in one specific way, recorded here rather than glossed: a string constant containing the
+    name would still be found, which is fine, and a name assembled from fragments at runtime would
+    not be — and neither would it be by any check short of executing the module.
+    """
+    web_source = Path(inspect.getfile(signals_module)).parents[2] / "web" / "src"
+    assert web_source.is_dir(), f"{web_source} is not a directory; this test has lost its subject"
+    checked = sorted(
+        path
+        for suffix in ("*.jsx", "*.js")
+        for path in web_source.rglob(suffix)
+    )
+    assert len(checked) >= 10, (
+        f"only {len(checked)} source files found under {web_source}; this test is meant to cover "
+        "the whole tree and has stopped finding it"
+    )
+    for path in checked:
+        code = _without_comments(path.read_text(encoding="utf-8"))
+        assert "dangerouslySetInnerHTML" not in code, (
+            f"{path.relative_to(web_source)} uses dangerouslySetInnerHTML. It is the only way a "
+            "React component executes a string as markup, and a Delay_Reason_Note is a string a "
+            "stranger typed on an endpoint reachable without a session (R29.C11)"
+        )
+
+
+def _without_comments(source: str) -> str:
+    """JavaScript source with ``/* ... */`` and ``// ...`` comments removed.
+
+    Deliberately naive: it does not understand that ``//`` inside a string literal is not a comment,
+    which for this codebase means a URL in a string loses its tail. That is acceptable because the
+    only thing searched for afterwards is one identifier, and truncating a URL cannot create or
+    destroy an occurrence of it. A parser would be the right tool if anything more were being asked
+    of the result.
+    """
+    without_block = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", " ", without_block)

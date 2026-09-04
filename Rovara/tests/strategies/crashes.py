@@ -50,11 +50,17 @@ from revora.providers.classification import (
     PaymentEntity,
     PaymentLinkEntity,
     PaymentLinkList,
+    PaymentLinkResendAck,
     PaymentList,
     ProviderResult,
 )
-from revora.providers.payment_link import PaymentLinkRequest
-from tests.fakes.razorpay import CreateOutcome, FakeRazorpay, ProviderBehaviour
+from revora.providers.payment_link import NotifyMedium, PaymentLinkRequest
+from tests.fakes.razorpay import (
+    CreateOutcome,
+    FakeRazorpay,
+    ProviderBehaviour,
+    ResendOutcome,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.engine import Engine
@@ -67,6 +73,7 @@ __all__ = [
     "crash_on_statement",
     "crash_plan",
     "execution_crash_plan",
+    "resend_crash_plan",
 ]
 
 
@@ -204,6 +211,48 @@ def crash_plan() -> st.SearchStrategy[CrashPlan]:
     )
 
 
+_INTERESTING_RESEND_OUTCOMES: Final[tuple[ResendOutcome, ...]] = (
+    ResendOutcome.SUCCESS,
+    ResendOutcome.RATE_LIMITED,
+    ResendOutcome.TIMEOUT,
+    ResendOutcome.SERVER_ERROR,
+    ResendOutcome.CLIENT_ERROR,
+    ResendOutcome.ACK_FALSE,
+)
+"""The resend outcomes worth crossing with a crash, one per settled disposition.
+
+``SUCCESS`` confirms, ``RATE_LIMITED`` and ``CLIENT_ERROR`` fail definitively, ``TIMEOUT``,
+``SERVER_ERROR`` and ``ACK_FALSE`` land ``UNCERTAIN`` — which for a resend is terminal, and is
+therefore the outcome under which "no second call, ever" is hardest to hold. ``UNPARSEABLE``
+classifies exactly as ``ACK_FALSE`` does and ``CONNECT_ERROR`` exactly as ``CLIENT_ERROR`` does,
+so both buy a database round trip and no new behaviour."""
+
+
+def resend_crash_plan() -> st.SearchStrategy[CrashPlan]:
+    """:func:`crash_plan` with the resend outcomes varied instead of the create outcomes.
+
+    A separate strategy rather than a widened one, because the two paths are not
+    interchangeable: a create's plan wants ``TIMEOUT_EFFECT_CREATED`` against
+    ``TIMEOUT_NO_EFFECT``, and the resend has no such pair to draw — nothing reports whether a
+    notification was sent, so the fake cannot offer the distinction and a test must not assume
+    it. ``reconciliation_runs`` stays in the plan and is expected to change nothing at all: a
+    resend row is absent from the sweep's candidate set, so a plan that runs it three times is
+    a plan that proves the absence.
+    """
+    return st.builds(
+        CrashPlan,
+        point=st.sampled_from(CrashPoint),
+        behaviour=st.builds(
+            ProviderBehaviour,
+            resend_outcomes=st.lists(
+                st.sampled_from(_INTERESTING_RESEND_OUTCOMES), min_size=1, max_size=2
+            ).map(tuple),
+        ),
+        restarts=st.integers(min_value=1, max_value=3),
+        reconciliation_runs=st.integers(min_value=0, max_value=2),
+    )
+
+
 def execution_crash_plan() -> st.SearchStrategy[CrashPlan]:
     """:func:`crash_plan` restricted to plans that actually reach the provider.
 
@@ -259,6 +308,30 @@ class CrashingProvider:
             raise CrashInjected(self._point)
 
         result = self._inner.create_payment_link(request)
+
+        if self._armed and self._point is CrashPoint.AFTER_CALL_BEFORE_RESULT_COMMIT:
+            self._armed = False
+            raise CrashInjected(self._point)
+
+        return result
+
+    def notify_by(
+        self, payment_link_id: str, medium: NotifyMedium
+    ) -> ProviderResult[PaymentLinkResendAck]:
+        """The resend, dying on the same two sides as the create.
+
+        Present because the crash points are a property of the protocol, not of one operation:
+        ``PROMISE_TO_PAY_FOLLOW_UP`` reaches the provider through this method, so a Property 44
+        run against a client that lacked it would be a run against a client the engine cannot
+        use. The asymmetry with the create is not here but downstream — an effect this method
+        may have had is unreadable afterwards, which is why the property it serves asserts *no
+        second call ever* rather than *reconciled to one*.
+        """
+        if self._armed and self._point is CrashPoint.AFTER_INTENT_COMMIT_BEFORE_CALL:
+            self._armed = False
+            raise CrashInjected(self._point)
+
+        result = self._inner.notify_by(payment_link_id, medium)
 
         if self._armed and self._point is CrashPoint.AFTER_CALL_BEFORE_RESULT_COMMIT:
             self._armed = False

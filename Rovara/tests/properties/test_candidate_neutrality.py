@@ -310,7 +310,12 @@ def test_cause_ineligible_actions_are_recorded_as_excluded(
     excluded = set(candidates.excluded_by_cause)
     assert not (members & excluded)
     assert members | excluded == set(CandidateAction)
-    assert CandidateAction.PROMISE_TO_PAY_FOLLOW_UP in excluded
+    # ``PROMISE_TO_PAY_FOLLOW_UP`` used to be asserted absent from every set here, because it was
+    # absent from every eligibility row. R24.C1 made it executable and R24.C3 gave it rows, so
+    # restating it inside this partition would only re-assert the line above. The claim that
+    # replaced it — a member wherever the cause permits it, cause-excluded for
+    # ``FRAUD_OR_RISK_SIGNAL`` and ``UNKNOWN`` — is Property 46's third condition and is asserted
+    # against a *named* cause in ``test_promise.py``, which this generator does not expose.
 
 
 # ---------------------------------------------------------------------------
