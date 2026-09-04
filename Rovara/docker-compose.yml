@@ -33,7 +33,13 @@ services:
       timeout: 3s
       retries: 10
     volumes:
-      - revora_pgdata:/var/lib/postgresql/data
+      # Mounted at /var/lib/postgresql, not at /var/lib/postgresql/data. The postgres:18
+      # image refuses to start with a mount on the latter: from 18 the data directory is
+      # major-version-specific (/var/lib/postgresql/18/docker) so that `pg_upgrade --link`
+      # can run without crossing a mount boundary, and the entrypoint treats a mount on the
+      # legacy path as a half-finished upgrade rather than as a fresh volume. The container
+      # exits 1 with that diagnosis, which is what it did here before this line changed.
+      - revora_pgdata:/var/lib/postgresql
 
   api:
     build: .
