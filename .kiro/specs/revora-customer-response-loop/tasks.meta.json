@@ -1,5 +1,10 @@
 {
-  "pbtResults": {},
+  "pbtResults": {
+    "43.2 Property tests: partial money is never recovery": {
+      "status": "passed",
+      "lastRunTimestamp": 1788447920675
+    }
+  },
   "executionHistory": {
     "34.1 The four new tables with their constraints and RLS policies": [
       {

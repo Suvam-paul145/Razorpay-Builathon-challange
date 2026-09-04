@@ -2155,9 +2155,14 @@ flowchart LR
 **What can go wrong.** A seventh table added without its own `tenant_isolation` policy, because 0003
 looks like it handles that and does not. A bound added to 0004 instead of a new migration. A key string
 typed into a migration instead of selected from the catalogue, at which point there are two copies of a
-number and one of them is authoritative for reads and the other for writes. And one that cannot fire
-today: the `UNCERTAIN`-resend downgrade assertion is unreachable, because nothing writes
-`effect_kind = PAYMENT_LINK_RESEND` yet.
+number and one of them is authoritative for reads and the other for writes.
+
+**0008's `UNCERTAIN`-resend downgrade assertion became reachable in task 46.** `reserve_intent` now
+writes `effect_kind = PAYMENT_LINK_RESEND` for a resend attempt, and a resend whose outcome is
+unknown is left `UNCERTAIN` deliberately and forever — so a database that has run one can no longer
+be downgraded past 0008 without a person deciding what to do about it. That is the assertion working,
+not a new obstacle: restoring the pre-0008 index predicate would return those rows to the
+reconciliation sweep's scanned set, and the sweep would issue reads that can never resolve them.
 
 **How you would know.** A read of a new table returning another tenant's rows means the policy is
 missing. A configured bound whose accessor returns the catalogue default while the dashboard shows a
@@ -2974,7 +2979,7 @@ obviously absent, while a wired-up-looking thing with no caller reads as working
 | `contact_suppression` | Table, RLS policy, in-force index | **No writer and no reader.** So the `CUSTOMER_OPTED_OUT` policy check the in-force index exists to serve is not wired up, and the two hard-stop delay reasons produce no suppression and no token revocation | Task 42 |
 | `promise_to_pay` | Table, RLS policy, `UNIQUE (merchant_id, case_id)` | No writer. A promise submission persists a `customer_signal` row only, so the projection's `promise` field is **always `null`** in the current build, and `PROMISE_MIN_LEAD_TIME` is not enforced — only the degenerate "the date must be in the future" check | Task 44 |
 | `ai_invocation` | Table, and `call_kind` added by migration 0008 with a column, a model attribute and a `CHECK` | **No writer at all.** Nothing writes `call_kind`, because nothing writes the table | Task 49 |
-| `execution_intent.effect_kind` | Column, server default, and an unresolved-intent index whose predicate excludes resend rows | Read (the projection filters on it) but never written by application code — every row takes the server default. The resend path that would write `PAYMENT_LINK_RESEND` does not exist, which also means one of migration 0008's four downgrade refusals cannot currently fire | Follows the resend action |
+| `execution_intent.effect_kind` | Column, server default, an unresolved-intent index whose predicate excludes resend rows, and the same clause in `claim_unresolved`'s `WHERE` | **Written** since task 46: `reserve_intent` takes the kind explicitly and the resend path passes `PAYMENT_LINK_RESEND`, so migration 0008's fourth downgrade refusal is now reachable. What is still missing is the *caller* — `PROMISE_TO_PAY_FOLLOW_UP` is not yet selectable or executable, so no resend intent is written by the running pipeline | Task 47 |
 | `revoke_tokens_for_case` reason `CONTACT_SUPPRESSED` | The reason member, and a test that exercises it | No production writer. Waits on `contact_suppression` having a writer. `KEY_RETIRED` is written nowhere at all | Task 42 |
 | `revora.jobs.queue.reclaim_stale` | The function, and two docstrings describing it as the thing that returns a dead worker's `RUNNING` job to `PENDING` | **No caller anywhere.** A hard-killed worker's job stays `RUNNING` indefinitely | Needs a producer, same decision as 6.12 |
 | `REVIEW_SWEEP_INTERVAL` | Seeded by migration 0010, present in the catalogue, read by `scripts/dev_tick.py` and by tests | No module under `revora/` reads it, so the review sweeper's schedule is not yet driven from its own bound. `WAIT_REVIEW_INTERVAL` by contrast **is** read by the pipeline | Follows 6.12 |
