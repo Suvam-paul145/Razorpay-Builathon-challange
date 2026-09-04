@@ -20,6 +20,12 @@ state it is in, so a reader can tell "no policy decision" from "blocked by polic
 applies to that figure alone — the rest of a metrics response still returns, with its own
 timestamps. Substituting zero for either is not a display bug; it is a false financial statement.
 
+**A customer's own words are labelled here, and escaped here (R20.C12, R29.C11).** A
+Delay_Reason_Note is the only string in the system that a stranger typed on an endpoint reachable
+without a session, and it is the only one that leaves with a label saying so. :func:`escape_markup`
+and :func:`customer_supplied_note` are the two halves — see the note document's own docstring for
+why the wire carries the verbatim text *and* its escaped form rather than one of the two.
+
 **A human-readable label is chosen here, never in the browser (R26.C14).** ``DO_NOTHING`` and
 ``WAIT`` share one label because they are the same thing to a merchant — the case is being watched,
 not abandoned — while the three Terminal_States get three distinct labels because they are three
@@ -50,13 +56,19 @@ __all__ = [
     "CURRENCY_SYMBOLS",
     "DATA_UNAVAILABLE",
     "HARD_STOP_LABELS",
+    "MARKUP_ESCAPES",
+    "NOTE_REDACTED",
     "NOT_YET_RECORDED",
     "PRESENT",
+    "RENDER_AS_TEXT_ONLY",
     "SELECTED_ACTION_LABELS",
+    "UNVERIFIED_CUSTOMER_TEXT",
     "WAITING_AND_WATCHING",
     "MoneyField",
     "case_state_label",
+    "customer_supplied_note",
     "data_unavailable",
+    "escape_markup",
     "grouping_for",
     "money",
     "not_yet_recorded",
@@ -196,6 +208,154 @@ def data_unavailable(figure: str, reason: str) -> dict[str, object]:
     are what make them usable.
     """
     return {"status": DATA_UNAVAILABLE, "figure": figure, "detail": reason}
+
+
+# ---------------------------------------------------------------------------
+# A customer's own words (R20.C12, R29.C11)
+# ---------------------------------------------------------------------------
+
+UNVERIFIED_CUSTOMER_TEXT: Final[str] = "customer-supplied unverified text"
+"""R20.C12's label, verbatim, chosen here for the reason every other label is.
+
+The requirement says the note is *presented marked as* customer-supplied unverified text, and the
+mark is a fact about the data rather than a styling choice — so it travels on the wire beside the
+text it describes and the browser renders what it is given. A client that composed this phrase
+itself would be a second vocabulary that could disagree with this one, and the disagreement would
+be about whether a stranger's assertion is a finding."""
+
+RENDER_AS_TEXT_ONLY: Final[str] = "TEXT_ONLY"
+"""How this string may be rendered, stated on the wire (R29.C11).
+
+Named rather than implied by the field's name, so a surface added later has to read a value that
+says *text* before it decides how to render. The one thing R29.C11 forbids is the note being
+executed as markup or as script, and a field that only *implied* its own inertness is a field
+somebody eventually interpolates."""
+
+NOTE_REDACTED: Final[str] = "REDACTED"
+"""The note existed and the retention sweep removed it (R29.C10).
+
+A third status beside ``PRESENT`` and the absence markers, because it is a third fact. "This
+customer wrote nothing" and "this customer wrote something we are no longer permitted to hold" are
+different histories, and a redaction rendered as an absence would make a retention action look
+like a customer who stayed silent."""
+
+MARKUP_ESCAPES: Final[dict[str, str]] = dict(
+    MappingProxyType(
+        {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#x27;",
+        }
+    )
+)
+"""Every markup-significant character, and what it becomes (R29.C11).
+
+Five, and the set is closed on purpose. ``<`` and ``>`` open and close a tag; ``&`` starts an
+entity and is why the substitution order below matters; ``"`` and ``'`` close an attribute value,
+which is the injection an escape that handled only the angle brackets would let through.
+
+**Ampersand first, and this is the whole correctness argument.** Substituting ``<`` before ``&``
+turns ``<`` into ``&lt;`` and then that ampersand into ``&amp;lt;``, so the note displays as
+``&lt;`` rather than as ``<``. ``dict`` preserves insertion order and ``&`` is declared first, so
+:func:`escape_markup` iterating this mapping is correct by the mapping's order rather than by a
+comment asking the reader to keep it that way.
+
+Nothing else is touched. A control character, a line separator, a right-to-left override are all
+retained: escaping them would be deriving a judgement about the note's contents, which R20.C3
+forbids, and none of them is markup."""
+
+
+def escape_markup(text: str) -> str:
+    """Every markup-significant character replaced by its entity. Nothing else changed.
+
+    A local table rather than :func:`html.escape`, for one reason worth the six lines: the
+    stdlib's ``quote=True`` escapes ``"`` and leaves ``'`` alone unless you read the source to
+    find out, and the set of characters this function handles is a claim R29.C11 makes rather
+    than an implementation detail to inherit. :data:`MARKUP_ESCAPES` is that claim, reviewable,
+    and a test asserts the function handles every member of it.
+
+    Length is not bounded here and deliberately: the escaped form of a note at
+    ``DELAY_NOTE_MAX_LENGTH`` can be several times longer, and truncating *after* escaping is how
+    a trailing ``&amp;`` becomes ``&am`` — a broken entity, which is a rendering bug in the one
+    place the requirement is about. The stored length is bounded on the way in
+    (``revora.customer.signals.effective_note_limit``); this is presentation only.
+
+    Idempotent in the sense that matters and not in the sense that would be wrong: escaping twice
+    yields ``&amp;lt;``, because the first pass produced real ampersands and a second pass has no
+    way to know they were once escapes. Which is why this is applied at exactly one point, in
+    :func:`customer_supplied_note`, and never composed.
+    """
+    escaped = text
+    for character, entity in MARKUP_ESCAPES.items():
+        escaped = escaped.replace(character, entity)
+    return escaped
+
+
+def customer_supplied_note(
+    note: str | None,
+    *,
+    truncated: bool,
+    redacted_at: str | None = None,
+) -> dict[str, object] | None:
+    """One Delay_Reason_Note for the wire, labelled and escaped. ``None`` where there is none.
+
+    ``None`` rather than a marker for the absent case, unlike every other absence in this module.
+    An absent figure needs a marker because the alternative is a zero somebody reads as a
+    measurement; an absent note has no such failure mode — most signals carry none, and
+    ``not_yet_recorded`` would claim the pipeline had not got there yet, which is false. A
+    *redacted* note is the case that does need naming, and :data:`NOTE_REDACTED` names it.
+
+    **The document carries the verbatim text and its escaped form, and both are deliberate.**
+    ``text`` is what a client rendering a text node uses — React escapes on render, so shipping
+    only the escaped form would display a customer who typed ``I <3 this`` as ``I &lt;3 this``,
+    which is a legibility defect in the one field whose whole purpose is that a merchant can read
+    what the customer actually wrote. ``text_escaped`` is what any surface interpolating into
+    markup uses, and shipping it is R29.C11 performed by the server rather than delegated to
+    every consumer.
+
+    Two copies of the same untrusted string is exactly the "two places that can disagree" shape
+    this codebase argues against elsewhere, so the reason it is safe here is worth stating: one is
+    a pure function of the other, computed at this single point, at the same instant, from the
+    same value. They cannot disagree about content. What they differ in is which rendering
+    context they are safe in, and naming that difference on the wire is what stops a consumer
+    guessing.
+
+    Args:
+        note: the stored note, or ``None``.
+        truncated: ``customer_signal.note_truncated`` — whether R20.C2's length truncation
+            applied. Surfaced because a note cut short at 500 characters reads as a customer who
+            stopped mid-sentence, and a merchant deciding whether to phone them should know which
+            it was.
+        redacted_at: ISO-8601 instant the retention sweep removed the note, where it did.
+    """
+    if redacted_at is not None:
+        return {
+            "status": NOTE_REDACTED,
+            "label": UNVERIFIED_CUSTOMER_TEXT,
+            "verified": False,
+            "render_as": RENDER_AS_TEXT_ONLY,
+            "redacted_at": redacted_at,
+            "detail": (
+                "this customer wrote a note and it has passed CUSTOMER_DATA_RETENTION, so it "
+                "was deleted. The signal itself is retained."
+            ),
+        }
+    if note is None:
+        return None
+    return {
+        "status": PRESENT,
+        "label": UNVERIFIED_CUSTOMER_TEXT,
+        # A boolean beside the label, because the label is prose and this is what a client
+        # branches on. R20.C12 is not satisfied by a phrase a consumer might not render.
+        "verified": False,
+        "render_as": RENDER_AS_TEXT_ONLY,
+        "text": note,
+        "text_escaped": escape_markup(note),
+        "truncated": truncated,
+        "redacted_at": None,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,14 @@ Three of the values differ from the requirements table, and deliberately:
   fraud-or-risk diagnosis derives from membership in this set, so extending it does
   not require a release.
 
+Two of the bounds have their *values* constrained by the loader rather than only their
+kinds — ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` may not fall below
+``DIAGNOSIS_CONFIDENCE_FLOOR`` (:data:`CONFIDENCE_ORDERINGS`), and
+``PROMISE_WINDOW_SAFETY_MARGIN`` must be strictly positive
+(:func:`_enforce_positive_margin`). Both refusals exist for the same reason: a bound that
+silently disables or breaks the feature it configures is worse than a bound that refuses to
+load.
+
 Two of the bounds are cost priors rather than limits — ``PAYMENT_LINK_FINANCIAL_COST``
 and ``MESSAGE_COMMUNICATION_COST``, which R31.C11 requires to be versioned rows on the
 same terms as everything else here. They live in this catalogue and
@@ -55,14 +63,17 @@ from revora.domain.money import Minor
 
 __all__ = [
     "CATALOGUE",
+    "CONFIDENCE_ORDERINGS",
     "COST_SPLIT_BOUND_KEYS",
     "CUSTOMER_STATED_CAUSE_BOUND_KEYS",
     "CUSTOMER_SURFACE_BOUND_KEYS",
     "CUSTOMER_TOKEN_BOUND_KEYS",
     "DEFAULTS_MERCHANT_ID",
     "DEFAULT_CONFIG_VERSION",
+    "PROMISE_BOUND_KEYS",
     "REVIEW_LOOP_BOUND_KEYS",
     "SWEEP_INTERVAL_BOUND_KEYS",
+    "ConfidenceOrdering",
     "Configuration",
     "ConfigurationBound",
     "ConfigurationError",
@@ -573,6 +584,100 @@ _BOUNDS: tuple[ConfigurationBound, ...] = (
             "pass redacts a batch and re-enqueues its own successor while more remains."
         ),
     ),
+    # --- The Promise_To_Pay capture of R23. Five bounds, and they are grouped because
+    # they are one mechanism read end to end: how soon a promise may be for, how long
+    # after it Revora looks, how much of the window must be left over, how many promises
+    # one case may hold, and how often the promises are swept. Every one of the five is
+    # marked [ASSUMPTION] in the requirements, and none of them was measured.
+    #
+    # **Two of the five decide what is storable, not merely what is permitted**, and that
+    # is the reason this block is worth reading rather than skimming.
+    # ``promise_to_pay`` carries ``CHECK (follow_up_at IS NULL OR follow_up_at <
+    # window_end_at_snapshot)`` from migration ``0008`` — half of P42 as a database fact —
+    # so a Follow_Up_Instant computed at or past the window end is not a bad decision, it
+    # is a failed INSERT on a public endpoint, which answers 503 to a well-formed request.
+    # PROMISE_WINDOW_SAFETY_MARGIN strictly above zero is what makes the clamp land
+    # strictly inside the CHECK, and MAX_PROMISES_PER_CASE at 1 is what makes the
+    # application check agree with ``UNIQUE (merchant_id, case_id)`` instead of naming a
+    # bound the schema would refuse to honour.
+    ConfigurationBound(
+        "PROMISE_MIN_LEAD_TIME", ValueKind.DURATION_SECONDS, "3600",
+        "Minimum interval between a promise submission and the date it promises (1 hour)",
+        note=(
+            "[ASSUMPTION] 1 hour, and the bound exists to make a promise mean something "
+            "rather than to police the customer. A Promise_Date one second in the future "
+            "is storable — ``CHECK (promise_date > recorded_at)`` admits it — and it is "
+            "not a promise: nothing can be scheduled against it and no follow-up can be "
+            "usefully placed around it, so accepting it would put a row in the table that "
+            "the sweep would resolve before the customer closed the page. Deliberately "
+            "far below PROMISE_FOLLOW_UP_OFFSET (24 hours): this bounds when a promise "
+            "may be *for*, and that one bounds when Revora looks, so a value near or "
+            "above the offset would refuse a promise for this evening while still "
+            "following up a day later on one made for tomorrow."
+        ),
+    ),
+    ConfigurationBound(
+        "PROMISE_FOLLOW_UP_OFFSET", ValueKind.DURATION_SECONDS, "86400",
+        "Interval after a Promise_Date at which the promise follow-up becomes due (24 hours)",
+        note=(
+            "[ASSUMPTION] 24 hours after the promised date, and equal to COOLDOWN_INTERVAL "
+            "rather than coincidentally near it. The follow-up is a customer-visible "
+            "action, so it is subject to the cooldown like every other one; an offset "
+            "*below* the cooldown would produce a follow-up that becomes due and is then "
+            "refused by policy check 8 for being too soon after the message that carried "
+            "the promise, which reads to an operator as a lost nudge rather than as a "
+            "configured gap. Above zero on purpose: following up *on* the promised date "
+            "asks a customer who said 'today' whether they have paid yet, which is the "
+            "one message R23 exists to stop Revora from sending."
+        ),
+    ),
+    ConfigurationBound(
+        "PROMISE_WINDOW_SAFETY_MARGIN", ValueKind.DURATION_SECONDS, "3600",
+        "Interval before the recovery window end inside which no follow-up is scheduled (1 hour)",
+        note=(
+            "[ASSUMPTION] 1 hour, and **it must be strictly positive**. The clamp is "
+            "``min(promise_date + PROMISE_FOLLOW_UP_OFFSET, window_end_at - this)`` and "
+            "``promise_to_pay`` refuses ``follow_up_at >= window_end_at_snapshot``, so a "
+            "margin of zero would make every clamped promise a failed INSERT and a 503 on "
+            "a well-formed submission. The loader enforces the positivity rather than "
+            "trusting this note — see PROMISE_MARGIN_KEY and _enforce_positive_margin. "
+            "One hour rather than a minute because the margin also has to mean something "
+            "to a person: a follow-up on the last minute of the window is a nudge nobody "
+            "can act on, and R23.C6 is explicit that a window with less room than this "
+            "left escalates instead of scheduling."
+        ),
+    ),
+    ConfigurationBound(
+        "MAX_PROMISES_PER_CASE", ValueKind.INTEGER, "1",
+        "Promise_To_Pay records permitted per recovery case",
+        note=(
+            "[ASSUMPTION] 1, and **the schema encodes this same 1** as ``UNIQUE "
+            "(merchant_id, case_id)`` on promise_to_pay. The two are not redundant and "
+            "they are not free to disagree: a configured value above 1 would be a bound "
+            "the database refuses to honour, so the second promise would be refused by a "
+            "constraint rather than by R23.C7's 409 and the customer would see a 503. The "
+            "row is the authority for *lowering* — a merchant may set 0 and stop accepting "
+            "promises without a migration — and the index is the backstop against a "
+            "concurrent pair of submissions. Raising it above 1 requires a later migration "
+            "to drop the index first, which is why the writer refuses a configured value "
+            "above the schema's own bound instead of attempting a row the schema will not "
+            "hold. See MAX_PROMISES_PER_CASE in revora.customer.promises."
+        ),
+    ),
+    ConfigurationBound(
+        "PROMISE_SWEEP_INTERVAL", ValueKind.DURATION_SECONDS, "300",
+        "Maximum interval between sweeps over promises awaiting a follow-up (5 minutes)",
+        note=(
+            "[ASSUMPTION] 5 minutes, matching REVIEW_SWEEP_INTERVAL, and the pairing is "
+            "the point: design.md's open-questions table asks whether the container host "
+            "can schedule at or below ``min(PROMISE_SWEEP_INTERVAL, "
+            "REVIEW_SWEEP_INTERVAL)``, and two equal values make that one question rather "
+            "than two. Finer than the three sweeps 0014 added, because those detect "
+            "conditions that persist for hours while this one decides *when a customer is "
+            "contacted about a date they named* — a promise for 09:00 followed up at "
+            "10:00 reads as attentive and one followed up at 18:00 reads as automated."
+        ),
+    ),
 )
 
 CATALOGUE: Mapping[str, ConfigurationBound] = MappingProxyType(
@@ -709,6 +814,51 @@ if any(
         "every CUSTOMER_STATED_CAUSE_BOUND_KEYS member must be a DECIMAL bound"
     )
 
+PROMISE_BOUND_KEYS: Final[Mapping[str, ValueKind]] = MappingProxyType(
+    {
+        "PROMISE_MIN_LEAD_TIME": ValueKind.DURATION_SECONDS,
+        "PROMISE_FOLLOW_UP_OFFSET": ValueKind.DURATION_SECONDS,
+        "PROMISE_WINDOW_SAFETY_MARGIN": ValueKind.DURATION_SECONDS,
+        "MAX_PROMISES_PER_CASE": ValueKind.INTEGER,
+        "PROMISE_SWEEP_INTERVAL": ValueKind.DURATION_SECONDS,
+    }
+)
+"""The five bounds R23 introduces, as a named subset for migration ``0016`` to select.
+
+A **mapping** rather than one of the tuples, and for the reason ``CUSTOMER_TOKEN_BOUND_KEYS``
+is one: these five are of **different kinds** — four durations and a count — so there is no
+single kind to assert and a uniform check is unavailable. Pairing each key with the kind it
+must have keeps the same import-time guarantee a tuple gets from a uniform check, and it is
+the guarantee that matters most in this group: ``MAX_PROMISES_PER_CASE`` re-typed as a
+``DURATION_SECONDS`` would seed a row the accessor parses into a ``timedelta``, and the
+comparison against it would then be a count against a duration.
+
+Migration ``0016`` seeds exactly these keys through this mapping, on the pattern ``0009`` set
+and ``0010`` through ``0014`` followed: the migration holds no key string, no value, no kind
+and no purpose text of its own, so the accessor and the seeded row cannot disagree about a
+default. 3600, 86400, 3600, 1 and 300 are written down once, in the catalogue above.
+
+The five are grouped because they are one mechanism rather than because they arrived together.
+Every one of them is consumed by :mod:`revora.customer.promises`, and four of the five appear
+in a single expression there — the clamp — so a reader who found them scattered across four
+blocks of the catalogue would have to reassemble the formula to see that the safety margin and
+the follow-up offset are pulling in opposite directions on purpose."""
+
+_mistyped_promise_bounds = sorted(
+    key for key, kind in PROMISE_BOUND_KEYS.items() if CATALOGUE[key].kind is not kind
+)
+if _mistyped_promise_bounds:
+    raise ConfigurationError(  # pragma: no cover - import-time invariant
+        "PROMISE_BOUND_KEYS disagrees with the catalogue about the kind of "
+        f"{_mistyped_promise_bounds}"
+    )
+
+PROMISE_MARGIN_KEY: Final[str] = "PROMISE_WINDOW_SAFETY_MARGIN"
+"""The one bound whose *value* the loader constrains rather than merely parsing.
+
+Named as a constant so :func:`_enforce_positive_margin` and the catalogue entry cannot come to
+spell it differently, on the same terms :data:`CONFIDENCE_ORDERINGS` names its two."""
+
 _mistyped_customer_token_bounds = sorted(
     key for key, kind in CUSTOMER_TOKEN_BOUND_KEYS.items() if CATALOGUE[key].kind is not kind
 )
@@ -717,6 +867,136 @@ if _mistyped_customer_token_bounds:
         "CUSTOMER_TOKEN_BOUND_KEYS disagrees with the catalogue about the kind of "
         f"{_mistyped_customer_token_bounds}"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfidenceOrdering:
+    """One required ordering between two ``DECIMAL`` bounds, and why it is required.
+
+    A declared pair rather than an ``if`` inside the loader, because the reason a bound
+    cannot legally sit below another is the interesting half and it belongs beside the
+    pair rather than in a commit message. A second ordering added later is a row here
+    and no new code.
+    """
+
+    at_or_above: str
+    """The bound that must be the greater-or-equal of the two."""
+
+    floor: str
+    """The bound it must not fall below."""
+
+    because: str
+    """What breaks if the ordering is violated. Copied into the raised message, so the
+    deployment that tripped it is told the consequence rather than the comparison."""
+
+
+CONFIDENCE_ORDERINGS: Final[tuple[ConfidenceOrdering, ...]] = (
+    ConfidenceOrdering(
+        at_or_above="CUSTOMER_STATED_CAUSE_CONFIDENCE",
+        floor="DIAGNOSIS_CONFIDENCE_FLOOR",
+        because=(
+            "a customer-stated cause recorded below the floor substitutes to UNKNOWN under "
+            "R3.C8, so the whole Delay_Reason capture would be inert: the mapping table would "
+            "resolve a cause, the substitution gate would discard it, and the second contact "
+            "would repeat the first while the record showed a refinement had happened"
+        ),
+    ),
+)
+"""R20.C7, as data the loader enforces.
+
+**A bound that silently disables the feature it configures is worse than a bound that
+refuses to load.** Setting ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` to 0.5 under a floor of
+0.6 breaks nothing visibly: every request still succeeds, every diagnosis is still
+recorded, and every stated reason quietly becomes ``UNKNOWN`` with
+``CONFIDENCE_BELOW_FLOOR`` in its evidence. Nobody reads that field until they ask why
+the customer's answer changed nothing, which is months later and after the notes have
+aged past ``CUSTOMER_DATA_RETENTION``. So the ordering is refused at load.
+
+**Enforced in :meth:`Configuration.from_values` rather than at a write path**, because
+there is no write path — a configuration change is a new active ``app_config`` row, and
+``from_values`` is the single point every set of rows passes through on its way to being
+usable. A validator attached to an imagined admin endpoint would leave the migration and
+the seed unguarded; this one covers the bootstrap, the per-merchant load and the change,
+because all three are the same call.
+
+The rejected alternative is clamping — recording the stated cause at the floor when the
+configured value is below it. It is rejected because it would make the recorded confidence
+a number nobody configured, and R3.C10's reading of a recorded confidence ("1.0 means the
+provider told us") depends on the column meaning exactly what was configured."""
+
+
+def _enforce_confidence_orderings(parsed: Mapping[str, object]) -> None:
+    """Refuse a parsed configuration that violates any :data:`CONFIDENCE_ORDERINGS` pair.
+
+    Reads the already-parsed ``Decimal`` values rather than the raw strings, so the
+    comparison is the same one the consumer makes. Comparing the raw text would make
+    ``"0.6"`` and ``"0.60"`` order differently from the numbers they denote, which is the
+    one failure a validator like this must not have.
+
+    Raises:
+        ConfigurationError: naming both bounds, both values and the consequence. A message
+            that named only the comparison would leave the operator to work out whether
+            lowering the floor or raising the confidence is the correct repair.
+    """
+    for ordering in CONFIDENCE_ORDERINGS:
+        upper = parsed.get(ordering.at_or_above)
+        lower = parsed.get(ordering.floor)
+        if not isinstance(upper, Decimal) or not isinstance(lower, Decimal):
+            # Unreachable while both bounds are DECIMAL, which an import-time check above
+            # already enforces for CUSTOMER_STATED_CAUSE_BOUND_KEYS. Skipped rather than
+            # raised so a mis-declared kind fails with that check's message, which names
+            # the real mistake, instead of with this one's.
+            continue  # pragma: no cover - guarded by the kind checks above
+        if upper < lower:
+            raise ConfigurationError(
+                f"{ordering.at_or_above} is {upper}, below {ordering.floor} at {lower}: "
+                f"{ordering.because}"
+            )
+
+
+def _enforce_positive_margin(parsed: Mapping[str, object]) -> None:
+    """Refuse a configuration whose ``PROMISE_WINDOW_SAFETY_MARGIN`` is not strictly positive.
+
+    **A margin of zero is not a permissive setting, it is an unstorable one.** R23.C3 computes
+    the Follow_Up_Instant as ``min(promise_date + PROMISE_FOLLOW_UP_OFFSET, window_end_at -
+    PROMISE_WINDOW_SAFETY_MARGIN)`` and ``promise_to_pay`` carries ``CHECK (follow_up_at IS NULL
+    OR follow_up_at < window_end_at_snapshot)`` from migration ``0008``. At a margin of zero the
+    clamped branch computes ``follow_up_at = window_end_at`` exactly, which the CHECK refuses —
+    so a merchant who set the margin to zero expecting "use the whole window" would instead get
+    a failed INSERT and a 503 answer to a well-formed promise, on the one endpoint reachable
+    without a session. A negative margin is worse in the same direction: it computes an instant
+    *past* the window end.
+
+    Enforced here rather than in :mod:`revora.customer.promises` for the reason
+    :data:`CONFIDENCE_ORDERINGS` is enforced here: ``from_values`` is the single point every set
+    of rows passes through on its way to being usable, so this covers the bootstrap, the
+    per-merchant load and the change, because all three are the same call. A guard in the writer
+    would leave the seed and the settings screen unguarded and would turn a misconfiguration
+    into a customer-visible error instead of a deployment that refuses to start.
+
+    The rejected alternative is clamping the margin up to one second. It is rejected because the
+    resulting Follow_Up_Instant would then be a time nobody configured, one second inside a
+    window that is about to close, and R23.C6's whole point is that a window with no room left
+    escalates to a person rather than scheduling a nudge nobody can act on.
+
+    Raises:
+        ConfigurationError: naming the bound, its value and the constraint it violates. The
+            message names the ``CHECK`` because that is what an operator has to be told: the
+            repair is a positive margin, not a schema change.
+    """
+    margin = parsed.get(PROMISE_MARGIN_KEY)
+    if not isinstance(margin, timedelta):
+        # Unreachable while the bound is DURATION_SECONDS, which the PROMISE_BOUND_KEYS check
+        # above already enforces. Skipped rather than raised so a mis-declared kind fails with
+        # that check's message, which names the real mistake, instead of with this one's.
+        return  # pragma: no cover - guarded by the kind check above
+    if margin <= timedelta(0):
+        raise ConfigurationError(
+            f"{PROMISE_MARGIN_KEY} is {margin}, which is not strictly positive: the clamped "
+            "Follow_Up_Instant would land at or past window_end_at, and promise_to_pay's "
+            "follow_up_within_window CHECK refuses it — so every clamped promise would fail "
+            "its INSERT and answer 503 to a well-formed submission"
+        )
 
 
 def money_default(key: str) -> Minor:
@@ -847,6 +1127,12 @@ class Configuration:
     CALIBRATION_REPORT_INTERVAL: timedelta
     CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL: timedelta
 
+    PROMISE_MIN_LEAD_TIME: timedelta
+    PROMISE_FOLLOW_UP_OFFSET: timedelta
+    PROMISE_WINDOW_SAFETY_MARGIN: timedelta
+    MAX_PROMISES_PER_CASE: int
+    PROMISE_SWEEP_INTERVAL: timedelta
+
     defaulted_keys: frozenset[str] = field(default_factory=frozenset)
     """Bounds that had no row and fell back to the placeholder. Non-empty is a
     deployment smell: it means the seed migration did not run, or a key was
@@ -874,8 +1160,8 @@ class Configuration:
                 configuration passes ``False``.
 
         Raises:
-            ConfigurationError: on an unparseable value, or on a missing bound when
-                ``strict``.
+            ConfigurationError: on an unparseable value, on a missing bound when
+                ``strict``, or on a violated :data:`CONFIDENCE_ORDERINGS` pair.
         """
         parsed: dict[str, object] = {}
         defaulted: set[str] = set()
@@ -887,6 +1173,13 @@ class Configuration:
                 defaulted.add(key)
                 raw = bound.default
             parsed[key] = parse_value(bound.kind, raw)
+        # R20.C7. After every value is parsed and before any of them is usable, so a
+        # configuration change that would make a feature inert is a refusal to load rather
+        # than a feature that stops working without saying so.
+        _enforce_confidence_orderings(parsed)
+        # R23.C3's other half, and the same argument: a bound whose value makes the row it
+        # governs unstorable is refused at load rather than discovered by a customer.
+        _enforce_positive_margin(parsed)
         unrecognized = frozenset(values) - frozenset(CATALOGUE)
         return cls(
             version=version,

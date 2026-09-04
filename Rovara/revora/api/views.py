@@ -43,12 +43,14 @@ from revora.api.rendering import (
     HARD_STOP_LABELS,
     MoneyField,
     case_state_label,
+    customer_supplied_note,
     data_unavailable,
     money,
     not_yet_recorded,
     rate,
     selected_action_label,
 )
+from revora.customer.arrangements import first_arrangement_request
 from revora.customer.suppression import scope_key_for_case
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import (
@@ -56,6 +58,7 @@ from revora.domain.enums import (
     CaseState,
     EstimationMethod,
     SelectionReason,
+    TerminalReason,
 )
 from revora.domain.failure_taxonomy import EVIDENCE_SOURCE
 from revora.metrics.engine import CohortMetrics
@@ -66,6 +69,7 @@ from revora.persistence.repositories.consent import CustomerConsentRepository
 from revora.persistence.repositories.customer import (
     ContactSuppressionRepository,
     CustomerSignalRepository,
+    PromiseToPayRepository,
 )
 from revora.persistence.repositories.diagnosis import DiagnosisRepository
 from revora.persistence.repositories.estimates import BaselineEstimateRepository
@@ -441,8 +445,144 @@ def case_detail(
         # that shows only one of the two. Adjacent, both always present, so "objected to this
         # debt" and "asked not to be contacted at all" are visibly separate facts.
         "contact_suppression": _suppression_document(session, merchant_id, case),
+        # R20.C12. Below the suppression rather than above it, because the suppression is the
+        # consequence and these are the statements — a reader who has just seen "disputes the
+        # charge" reads the signal list to find out what the customer actually wrote.
+        "customer_signals": _signal_documents(session, merchant_id, case, config=config),
+        # R23.C14. Directly after the signals, because a promise *is* one of the signals and this
+        # block is what became of it: the reader has just seen "PROMISE_TO_PAY, 12 March" in the
+        # list above and this says where that stands and when Revora will act on it.
+        "promise": _promise_document(session, merchant_id, case),
         "terminal_reason": case.terminal_reason,
     }
+
+
+def _promise_document(
+    session: Session, merchant_id: uuid.UUID, case: RecoveryCase
+) -> dict[str, object] | None:
+    """The persisted Promise_To_Pay of one case, or ``None`` (R23.C14).
+
+    **The window end travels in this block, not only in the case summary, and that is the clause
+    rather than a duplication.** R23.C14 requires the Recovery_Window end presented *adjacent to*
+    the Promise_Date "so that a clamped Follow_Up_Instant is visible as a clamp". A follow-up on the
+    last hour of a window is an arbitrary-looking time next to the date the customer gave, and it
+    only reads as a clamp when the thing that clamped it is in the same sentence. The summary panel
+    carries ``window_end_at`` too, several screens up; a reader comparing two numbers on two panels
+    is a reader who will not.
+
+    The value presented is ``window_end_at_snapshot``, the window end **as the clamp saw it**, not
+    ``recovery_case.window_end_at``. The two cannot legitimately differ — R2.C5 makes the column
+    immutable and no transition writes it — and presenting the snapshot is still the right choice:
+    what a reader is checking is whether the follow-up was clamped *against something*, and the only
+    value that question is about is the one the arithmetic used. Presenting the live column would
+    make the panel silently correct itself if the two ever came apart, which is the one case where a
+    reader needs to see that they have.
+
+    ``clamped`` is not a stored column and is deliberately not derived here either. It is computed
+    at write time and recorded on the ``PROMISE_RECORDED`` audit record; re-deriving it for this
+    view would mean applying today's ``PROMISE_FOLLOW_UP_OFFSET`` to a promise recorded under a
+    possibly different one, so the answer would be wrong exactly when the bound had changed. What
+    this block gives the reader instead is the three instants, from which the clamp is visible
+    without any derived flag: a ``follow_up_at`` that is not ``promise_date`` plus the offset, and
+    is exactly the window end minus the margin, was clamped.
+
+    ``None`` rather than a not-yet-recorded marker, on the same terms
+    :func:`_signal_documents` returns an empty list: a case with no promise is the ordinary case,
+    because most customers never name a date, and a marker naming the case state would read as a
+    pipeline stage that had not run.
+    """
+    promise = PromiseToPayRepository(session).for_case(merchant_id, case.id)
+    if promise is None:
+        return None
+    return {
+        "promise_id": str(promise.id),
+        "customer_signal_id": str(promise.customer_signal_id),
+        "status": str(promise.status),
+        "promise_date": promise.promise_date.isoformat(),
+        # R23.C14's four facts. The window end is third of four and immediately beside the date
+        # rather than last, so the pair a reader has to compare is a pair.
+        "window_end_at": promise.window_end_at_snapshot.isoformat(),
+        "follow_up_at": (
+            None if promise.follow_up_at is None else promise.follow_up_at.isoformat()
+        ),
+        "recorded_at": promise.recorded_at.isoformat(),
+        "kept_at": None if promise.kept_at is None else promise.kept_at.isoformat(),
+        "missed_at": None if promise.missed_at is None else promise.missed_at.isoformat(),
+        # R23.C10, and an integer count of seconds rather than a formatted duration. Signed:
+        # negative means the customer paid before the date they named, which is a promise kept
+        # well. The surface that renders it decides how to word that; this decides nothing.
+        "seconds_promise_to_payment": (
+            None
+            if promise.seconds_promise_to_payment is None
+            else int(promise.seconds_promise_to_payment)
+        ),
+        "voided_by_terminal_state": promise.voided_by_terminal_state,
+    }
+
+
+def _signal_documents(
+    session: Session,
+    merchant_id: uuid.UUID,
+    case: RecoveryCase,
+    *,
+    config: Configuration,
+) -> list[dict[str, object]]:
+    """Every persisted Customer_Signal of one case, oldest first (R20.C12).
+
+    **Every one, not the ones that produced a consequence.** A ``PAGE_VIEWED`` signal caused
+    nothing and is still evidence — "the customer opened the link and said nothing" is the answer
+    to a merchant asking whether the message landed, and it is only visible if the silent signals
+    are listed too. So the list is the repository's whole per-case read, capped at
+    ``MAX_CUSTOMER_SIGNALS_PER_CASE`` because that is the bound on how many there can be.
+
+    Oldest first, matching the repository's ordering, because the sequence is part of the
+    evidence: stated a reason and *then* promised a date is a different history from the reverse.
+
+    The four presented facts are exactly R20.C12's list — the kind, the submitted values, the
+    submission instant and the note — and the note goes through
+    :func:`~revora.api.rendering.customer_supplied_note`, which is the single point where it
+    acquires its label and its escaped form. The stated ``delay_reason`` is presented rather than
+    the Risk_Cause it maps to: the mapping is R20.C5's *reading* of the customer's words, and the
+    words themselves are what this view is for. The mapped cause is already on the diagnosis
+    block, beside the evidence source that says a customer produced it.
+
+    An empty list is returned rather than a not-yet-recorded marker, and the asymmetry with every
+    other block here is deliberate. A case with no recommendation is a case the pipeline has not
+    reached; a case with no signals is the ordinary case, because most customers never open the
+    page. A marker naming the case state would read as a pipeline stage that had not run.
+    """
+    signals = CustomerSignalRepository(session).list_for_case(
+        merchant_id, case.id, limit=int(config.MAX_CUSTOMER_SIGNALS_PER_CASE)
+    )
+    return [
+        {
+            "signal_id": str(signal.id),
+            "kind": str(signal.kind),
+            "submitted_at": signal.submitted_at.isoformat(),
+            "delay_reason": signal.delay_reason,
+            # A hard stop is presented as one rather than left to the reader to recognise from
+            # the reason's name. The two Hard_Stop_Reasons are members of the Delay_Reason
+            # enumeration, so "this is an objection to the debt rather than a payment problem" is
+            # a fact about which member it is — and the label comes from the same table the
+            # ESCALATED grouping reads (R21.C11), so the two surfaces cannot word it differently.
+            "hard_stop_label": HARD_STOP_LABELS.get(str(signal.delay_reason)),
+            "note": customer_supplied_note(
+                signal.delay_reason_note,
+                truncated=bool(signal.note_truncated),
+                redacted_at=(
+                    None
+                    if signal.note_redacted_at is None
+                    else signal.note_redacted_at.isoformat()
+                ),
+            ),
+            # Which retention bound erased the note, where one did (R29.C10). Beside the note
+            # rather than inside it, because it is a fact about the sweep and not about what the
+            # customer wrote.
+            "retention_config_version": signal.retention_config_version,
+            "provenance": str(signal.provenance),
+        }
+        for signal in signals
+    ]
 
 
 def _suppression_document(
@@ -672,12 +812,19 @@ _EXECUTABLE = frozenset(
         CandidateAction.WAIT,
         CandidateAction.PAYMENT_LINK,
         CandidateAction.CUSTOMER_MESSAGE,
+        CandidateAction.PROMISE_TO_PAY_FOLLOW_UP,
         CandidateAction.HUMAN_ESCALATION,
     }
 )
 """Mirrors ``domain.actions.EXECUTABLE_ACTIONS``. Referenced rather than imported as a name so a
 reader of this file can see what "is_executable" means without following an import — and asserted
-equal to the domain set by a test, so the two cannot drift."""
+equal to the domain set by a test, so the two cannot drift.
+
+``PROMISE_TO_PAY_FOLLOW_UP`` joined under R24.C1, and the flag it feeds is why the restatement
+has to be kept in step by hand rather than left stale: a follow-up rendered ``is_executable:
+false`` beside an exclusion reason of ``PROMISE_DATE_NOT_REACHED`` would tell a merchant Revora
+*cannot* chase this promise, when the truth is that it is waiting for the date the customer
+named."""
 
 
 def _policy_document(
@@ -805,6 +952,12 @@ def metrics_document(
                 "DASHBOARD_METRICS_TIMEOUT; every other figure in this response is current",
             )
         ),
+        # R28.C11 through C13. Its own key, adjacent to the one above, carrying its own two
+        # labels. Not degraded by ``incremental_available``: that flag names a timeout on the
+        # *attribution gate*, and a demonstration figure that is present is present.
+        "demonstration_incremental_revenue": _demonstration_document(
+            metrics, currency=currency
+        ),
         "recovery_rate": rate(metrics.recovery_rate),
         "intervention_rate": rate(metrics.intervention_rate),
         "action_success_rate": rate(metrics.action_success_rate),
@@ -849,6 +1002,41 @@ def _incremental_document(metrics: CohortMetrics, *, currency: str) -> dict[str,
         "control_case_count": finding.control_case_count,
         "treatment_case_count": finding.treatment_case_count,
         "lift": None if finding.lift is None else str(finding.lift),
+        "lift_interval": (
+            None
+            if finding.lift_ci_low is None
+            else f"[{finding.lift_ci_low}, {finding.lift_ci_high}]"
+        ),
+    }
+
+
+def _demonstration_document(
+    metrics: CohortMetrics, *, currency: str
+) -> dict[str, object]:
+    """``demonstration_incremental_revenue``, under its own key and with both labels attached.
+
+    **The key name is the requirement.** R28.C12 forbids presenting this figure as
+    ``incremental_recovered_revenue``, and the enforcement is that the two are separate keys
+    built by separate functions — so a dashboard wanting to show one as the other has to
+    rename a key in a diff rather than change a caption. The two keys sit adjacent in
+    :func:`metrics_document` so a reader comparing them does not have to scroll.
+
+    Both labels travel *inside* the figure's own object rather than in the report's top-level
+    ``labels`` array, which is R28.C13's "adjacent to the figure rather than in a separate
+    view" expressed in the response shape: a client cannot render the amount without having
+    the labels in hand, because they came out of the same dictionary.
+
+    ``presented: false`` when there is no completed demonstration experiment, and the detail
+    line says so in words. Never a zero amount — see
+    :class:`~revora.metrics.engine.DemonstrationFinding`.
+    """
+    finding = metrics.demonstration
+    document = finding.as_document()
+    if not finding.presented:
+        return document
+    return {
+        **document,
+        "amount": money(int(finding.value or 0), currency=currency),
         "lift_interval": (
             None
             if finding.lift_ci_low is None
@@ -1007,6 +1195,19 @@ def unresolved_view(
         # Named ``suppressed`` and not ``escalated_detail``: the list is defined by the
         # suppression record, so a case escalated for another reason is correctly absent.
         "suppressed": _suppressed_cases(session, merchant_id, currency=currency),
+        # R22.C9. The second breakdown of the same ``ESCALATED`` row, for the same reason the
+        # first one is a breakdown rather than a group: a case that ended because the customer
+        # asked to pay differently *is* escalated, its money is already counted in that row, and a
+        # sixth group would split one grouping's money across two places and stop the footer being
+        # the sum of the rows above it. ``unresolved_groups`` aggregates by ``state``, and both
+        # these lists are aggregated by something finer than state — which is precisely why
+        # neither can be a row in it.
+        #
+        # Two lists rather than one "escalated by what the customer said", because the next action
+        # differs: a suppressed case needs a person to decide whether contact may resume, and an
+        # arrangement request needs a person to answer a question. Merged, a reader would have to
+        # read the reason column to know which queue they were in.
+        "partial_arrangements": _arrangement_cases(session, merchant_id, currency=currency),
         "total_case_count": sum(group.case_count for group in groups),
         # Summed from the same integers the groups carry, so the total is exactly the sum of the
         # rows above it and not a separately-rounded figure that can disagree with them.
@@ -1061,6 +1262,90 @@ def _suppressed_cases(
                     str(suppression.hard_stop_reason), str(suppression.hard_stop_reason)
                 ),
                 "suppressed_at": suppression.suppressed_at.isoformat(),
+                "unresolved_amount": money(
+                    int(case.payment_amount), currency=str(case.currency) or currency
+                ),
+            }
+        )
+    return listed
+
+
+ARRANGEMENT_CASE_LIMIT: int = 100
+"""How many arrangement requests the unresolved grouping lists.
+
+The same hundred as :data:`SUPPRESSED_CASE_LIMIT` and for the same reason — a table on a page a
+merchant loads interactively stops being readable long before it stops being bounded. A separate
+constant rather than one shared bound, because the two lists are separate queues and the day one
+of them needs a different limit should not be the day the other one changes too."""
+
+
+def _arrangement_cases(
+    session: Session, merchant_id: uuid.UUID, *, currency: str
+) -> list[dict[str, object]]:
+    """R22.C9: each arrangement request with its instant, its note and the unresolved amount.
+
+    Three facts because the requirement names three, and each is doing work on this screen. The
+    **instant** is how long the customer has been waiting for an answer, which is the only thing
+    that orders this queue by urgency. The **note** is the whole content of what they asked, since
+    the request itself carries no amount and no schedule — so a merchant with the instant and the
+    amount but not the note knows a negotiation was requested and nothing about what was proposed.
+    The **unresolved amount** is what the conversation is about, and it is the case's
+    ``payment_amount`` in full: R22.C7 leaves it unchanged and R22.C5 records it once in
+    ``unresolved_revenue``, so the figure in this row is the same integer that is inside the
+    ``ESCALATED`` total above it rather than a second, smaller number somebody might read as a
+    settlement offer.
+
+    Driven from the **terminal reason on the case**, not from the signal, and the direction matters.
+    A ``customer_signal`` of kind ``PARTIAL_ARRANGEMENT_REQUEST`` exists from the moment the
+    request is accepted, while the escalation is applied by the worker a moment later — so a
+    signal-driven list would show cases that are still mid-pipeline and are not in the
+    ``ESCALATED`` row this list claims to break down. Reading
+    ``terminal_reason = CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT`` means every entry is provably one
+    of the cases whose money is in that row. It also makes R22.C10 fall out: a case that also
+    persisted a Hard_Stop_Reason ended under the hard stop's reason, so it appears in
+    ``suppressed`` and not here, which is the same one-terminal-reason fact the handler enforces.
+
+    The note goes through :func:`~revora.api.rendering.customer_supplied_note`, the single point
+    where a customer-written string acquires its label, its ``verified: false`` flag and its
+    escaped form (R29.C11). Not re-escaped here and not escaped again by the browser: one escaper,
+    called once, is what keeps ``&amp;`` from becoming ``&amp;amp;`` on the one field where a
+    merchant needs to read exactly what was typed.
+
+    ``None`` where the request row cannot be found, which is not the same as "no note". A case can
+    hold the terminal reason with no readable signal only if the retention sweep has been through,
+    and a missing row is reported as an absent note rather than as an absent request — the case
+    ending for this reason is itself the record that the request happened.
+    """
+    listed: list[dict[str, object]] = []
+    for case in RecoveryCaseRepository(session).list_by_terminal_reason(
+        merchant_id,
+        TerminalReason.CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT,
+        limit=ARRANGEMENT_CASE_LIMIT,
+    ):
+        request = first_arrangement_request(session, merchant_id, case.id)
+        listed.append(
+            {
+                "case_id": str(case.id),
+                "state": str(case.state),
+                "terminal_reason": case.terminal_reason,
+                "requested_at": (
+                    None if request is None else request.requested_at.isoformat()
+                ),
+                "note": (
+                    None
+                    if request is None
+                    else customer_supplied_note(
+                        request.note,
+                        truncated=request.note_truncated,
+                        redacted_at=(
+                            None
+                            if request.note_redacted_at is None
+                            else request.note_redacted_at.isoformat()
+                        ),
+                    )
+                ),
+                # Minor units all the way to ``money``, which is the one place a symbol is chosen
+                # and a decimal point is placed. The browser divides nothing.
                 "unresolved_amount": money(
                     int(case.payment_amount), currency=str(case.currency) or currency
                 ),
