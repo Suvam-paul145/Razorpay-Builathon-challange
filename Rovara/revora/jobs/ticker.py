@@ -72,6 +72,7 @@ from revora.jobs.scheduler import (
     LIFECYCLE_EVALUATION_KIND,
     PAYMENT_STATE_RECONCILIATION_KIND,
     PERIODIC_SWEEP_KINDS,
+    PROMISE_SWEEP_KIND,
     enqueue_sweep,
 )
 from revora.persistence.repositories.config import ConfigurationRepository
@@ -153,8 +154,9 @@ def _bucket_seconds(kind: str, config: Configuration) -> int:
     that a ``KeyError`` in the author's editor rather than a schedule nobody chose.
 
     Raises:
-        UnscheduledSweepKindError: if ``kind`` has no configured interval. All seven members
-            of ``PERIODIC_SWEEP_KINDS`` have one as of migration ``0014``; an eighth added
+        UnscheduledSweepKindError: if ``kind`` has no configured interval. All eight members
+            of ``PERIODIC_SWEEP_KINDS`` have one as of migration ``0016``, which added
+            ``PROMISE_SWEEP_INTERVAL`` for the promise sweep; a ninth added
             without a bound stops the ticker instead of being given a default.
     """
     by_kind = {
@@ -165,6 +167,7 @@ def _bucket_seconds(kind: str, config: Configuration) -> int:
         CALIBRATION_REPORT_KIND: config.CALIBRATION_REPORT_INTERVAL,
         CUSTOMER_DATA_RETENTION_KIND: config.CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL,
         CASE_REVIEW_KIND: config.REVIEW_SWEEP_INTERVAL,
+        PROMISE_SWEEP_KIND: config.PROMISE_SWEEP_INTERVAL,
     }
     interval = by_kind.get(kind)
     if interval is None:

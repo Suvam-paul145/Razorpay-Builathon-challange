@@ -101,11 +101,37 @@ def run_detection(
     config: Configuration,
     *,
     correlation_id: uuid.UUID | None = None,
+    provenance: Provenance = Provenance.REAL,
+    synthetic_run_id: uuid.UUID | None = None,
 ) -> DetectionServiceResult:
     """Classify one persisted event and, if at risk, open or attach a case.
 
     Must be called inside a transaction; it commits nothing itself. The worker's job
     handler owns the transaction so the verdict, the case and the audit are atomic.
+
+    Args:
+        provenance: what a case opened on this pass is labelled with. ``REAL`` always, in
+            every deployment, and the parameter exists for exactly one caller — the
+            Demonstration_Loader's worker registry, which drains a generated batch and has
+            to be able to say so on the row (R28.C1, R28.C16).
+
+            **Why the argument is here rather than derived from the event.** The obvious
+            alternative is for ingestion to mark a ``webhook_event`` synthetic and for this
+            function to read it, and that alternative is worse in the one direction that
+            matters: the webhook endpoint is reachable by anything holding the merchant's
+            signing secret, so a label derived from request content would be a switch that
+            says "this money is not real" available to whoever can deliver an event. A case
+            mislabelled ``SYNTHETIC`` is silently removed from every honesty label in the
+            metrics engine, which is the failure this whole provenance column exists to
+            prevent. Here the label is decided by the *process draining the queue*, which is
+            the same seam ``build_registry``'s ``provider`` already uses and which no request
+            can reach.
+        synthetic_run_id: the ``synthetic_run`` row a seeded case belongs to. ``None`` always,
+            except from the same caller, and it travels beside ``provenance`` rather than
+            separately because the two are one fact: a ``SYNTHETIC`` case with no run id is a
+            case nobody can reproduce, and a run id on a ``REAL`` case is a contradiction. The
+            column is what links a Demonstration_Experiment to the ground truth it is being
+            measured against (R28.C9).
     """
     verdicts = DetectionVerdictRepository(session)
     if verdicts.exists_for_event(merchant_id, webhook_event_id):
@@ -145,7 +171,17 @@ def run_detection(
     signal_case_id: uuid.UUID | None = None
     if result.verdict is DetectionVerdict.AT_RISK:
         case_id, case_created = _open_or_attach(
-            cases, writer, merchant_id, canonical, event, config, result, correlation_id, moment
+            cases,
+            writer,
+            merchant_id,
+            canonical,
+            event,
+            config,
+            result,
+            correlation_id,
+            moment,
+            provenance,
+            synthetic_run_id,
         )
     else:
         signal_case_id = _recovery_signal_case(cases, merchant_id, canonical)
@@ -242,6 +278,8 @@ def _open_or_attach(
     result: DetectionResult,
     correlation_id: uuid.UUID | None,
     moment: datetime,
+    provenance: Provenance,
+    synthetic_run_id: uuid.UUID | None,
 ) -> tuple[uuid.UUID, bool]:
     """Open a new case, or attach to the one already open. Returns ``(case_id, created)``."""
     payment_id = canonical.provider_payment_id
@@ -263,7 +301,10 @@ def _open_or_attach(
             "source_event_id": webhook_event_id,
             "detected_at": moment,
             "window_end_at": window_end,
-            "provenance": Provenance.REAL.value,
+            # From the argument, not a literal. See ``run_detection``: the only caller
+            # that passes anything else is the Demonstration_Loader's worker registry.
+            "provenance": provenance.value,
+            "synthetic_run_id": synthetic_run_id,
         },
     )
 

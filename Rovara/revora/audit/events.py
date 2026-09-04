@@ -99,6 +99,9 @@ __all__ = [
     "POLICY_DECISION_RECORDED",
     "POST_PAYMENT_ACTION",
     "POST_SUPPRESSION_ACTION",
+    "PROMISE_ALREADY_RECORDED",
+    "PROMISE_RECORDED",
+    "PROMISE_REJECTED",
     "RATE_LIMIT_APPLIED",
     "RECOMMENDATION_RECORDED",
     "RECONCILED_TO_RECOVERED",
@@ -753,6 +756,68 @@ Answered 429, and **the read projection keeps being served until expiry**. R18.C
 that asymmetry: a customer who has explained themselves five times must not lose the page telling
 them what they owe as a consequence."""
 
+PROMISE_RECORDED: Final = "PROMISE_RECORDED"
+"""A Promise_To_Pay was persisted, with the clamp computed (R23.C8).
+
+**The record is written so that a reader can check the clamp from the audit trail alone**, which
+is R23.C8's stated purpose and the reason this is not folded into ``CUSTOMER_SIGNAL_RECORDED``.
+It carries the Promise_Date, the computed Follow_Up_Instant, the Recovery_Window end timestamp
+and the ``token_id`` in the actor field, so ``follow_up_at ≤ window_end -
+PROMISE_WINDOW_SAFETY_MARGIN`` — half of Property 42 — is verifiable from three fields of one
+record without joining to ``promise_to_pay`` or to ``recovery_case``. A reader who had to join
+could not check a clamp against a window end that a later migration had moved; a reader of this
+record can, because the record holds the window end as it stood.
+
+**Written for the ``BEYOND_WINDOW_ESCALATED`` path too, not only for ``RECORDED``.** R23.C8 names
+``RECORDED``, and writing one for the escalated status as well is strictly more information than
+the clause asks for rather than a different record: the alternative is a promise that was
+persisted, escalated a case and left no trace in the transaction that accepted it, so the only
+audit evidence would be the worker's ``CASE_ESCALATED`` some seconds later. The ``status`` field
+distinguishes the two, and ``follow_up_at`` is null on the escalated one — which is
+``escalated_schedules_nothing`` as an audit fact beside the database one.
+
+Written inside the accepting transaction, immediately before ``CUSTOMER_SIGNAL_RECORDED``, which
+stays last. So this record existing is proof the ``promise_to_pay`` row and the
+``customer_signal`` row it names both committed, and its absence is proof neither did."""
+
+PROMISE_REJECTED: Final = "PROMISE_REJECTED"
+"""A Promise_To_Pay submission was refused for a reason about the date itself (R23.C2).
+
+Two conditions, both 422 and both persisting nothing — no promise, no signal, no submission-count
+increment. A Promise_Date at or before the submission instant is the degenerate one and consults
+no bound: ``CHECK (promise_date > recorded_at)`` means such a date is not a promise the system can
+*hold*, so refusing it is a statement about storability. A Promise_Date inside
+``PROMISE_MIN_LEAD_TIME`` is the configured one, and the record names **the bound key** —
+``PROMISE_MIN_LEAD_TIME`` — rather than the interval or the submitted date, because R23.C2 asks
+the rejection to name the lead-time rule and the submitted date is attacker-supplied text on an
+endpoint reachable without a session.
+
+Distinct from ``CUSTOMER_SIGNAL_REJECTED`` because the two answer different operational
+questions. That one covers a malformed request or a case that has ended; this one covers a
+well-formed request about a date, and "how many customers named a date too soon to be useful" is
+a question about the *bound*, answerable only if these refusals are separable from schema
+rejections in the log."""
+
+PROMISE_ALREADY_RECORDED: Final = "PROMISE_ALREADY_RECORDED"
+"""A Recovery_Case already holds ``MAX_PROMISES_PER_CASE`` promises (R23.C7). 409.
+
+**The signal is still persisted, and that asymmetry is the whole of R23.C7.** Unlike every other
+refusal on this surface, this one keeps the write: the Customer_Signal is recorded for
+Recovery_Memory, the submission count increments, and only the ``promise_to_pay`` row is refused.
+A customer saying "actually, Friday" is evidence about this case whether or not the system will
+hold a second promise, and discarding it would lose the one fact a future model most wants —
+that the first promise was already being revised.
+
+So a case can hold both this record and a ``CUSTOMER_SIGNAL_RECORDED`` for one submission, and
+that is not a contradiction: the first says the promise was refused, the second says the
+submission was kept. The persisted Promise_To_Pay, its Promise_Status and its Follow_Up_Instant
+are all left exactly as they stand, which is the rest of the clause.
+
+Recorded when the application check against the configured bound refuses, and also when
+``uq_promise_to_pay_merchant_id_case_id`` refuses behind it — the backstop path, reached only by
+two concurrent submissions. Both produce this record, because from the customer's side they are
+the same answer."""
+
 CUSTOMER_DATA_REDACTED: Final = "CUSTOMER_DATA_REDACTED"
 """Contact data was deleted or irreversibly masked after ``CUSTOMER_DATA_RETENTION`` elapsed.
 
@@ -863,6 +928,9 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset(
         CUSTOMER_SIGNAL_REJECTED,
         CUSTOMER_SIGNAL_LIMIT_REACHED,
         CUSTOMER_SUBMISSION_LIMIT_REACHED,
+        PROMISE_RECORDED,
+        PROMISE_REJECTED,
+        PROMISE_ALREADY_RECORDED,
         CUSTOMER_TOKEN_ISSUED,
         CUSTOMER_TOKEN_ISSUE_FAILED,
         CUSTOMER_TOKEN_REJECTED,

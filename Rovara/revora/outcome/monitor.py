@@ -62,6 +62,7 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter
 from revora.cases.manager import apply_locked_transition
+from revora.customer.promises import apply_missed_disposition, resolve_kept, resolve_missed
 from revora.domain.enums import CaseState, IntentState, OutcomeClass, TerminalReason
 from revora.domain.transitions import TERMINAL_STATES
 from revora.memory.store import observation_writer
@@ -418,6 +419,36 @@ def _assess(
             )
 
         if not record.recovered:
+            # R23.C11. The read says the money is not there, and this is the point where a
+            # promise can be established as missed — but only where a PROMISE_TO_PAY_FOLLOW_UP
+            # intent reached CONFIRMED, which ``resolve_missed`` checks. Without that condition
+            # the promise would be marked missed while the follow-up Revora owed the customer was
+            # still queued, so the record would blame the customer for a message Revora had not
+            # sent. Inside this transaction, so the ``payment_state_read`` row that established
+            # the miss and the status change commit together.
+            if resolve_missed(session, merchant_id, case_id, moment=moment):
+                # R24.C14. The promise just became MISSED, and a missed promise is not the end of
+                # the case — it is the end of *waiting* for it. The remaining window and the three
+                # counters decide whether another decision cycle could lead anywhere, and the
+                # disposition applies exactly one legal transition on that answer. Applied here
+                # because this is the transaction that established the miss, and applied through
+                # ``revora.customer.promises`` rather than inline because the rule belongs beside
+                # the status change that triggers it — a copy here would be the one that drifted
+                # when the promise's own resolution logic changed.
+                #
+                # Only on a genuine move. ``resolve_missed`` returns false when there was no
+                # promise, when one exists in a status that cannot be missed, or when no
+                # follow-up ever reached CONFIRMED — and in all three cases nothing about the
+                # case's disposition changed, so re-deciding it here would spend a cycle on an
+                # observation that said nothing new.
+                apply_missed_disposition(
+                    session,
+                    merchant_id,
+                    case,
+                    config,
+                    correlation_id=correlation_id,
+                    moment=moment,
+                )
             return OutcomeAssessment(
                 OutcomeVerdict.NOT_RECOVERED,
                 case_id,
@@ -635,6 +666,14 @@ def _declare_recovery(
     recovered_at, timestamp_source = payment_timestamp(record.entity, fallback=record.row.read_at)
     seconds = max(int((recovered_at - case.detected_at).total_seconds()), 0)
 
+    # R23.C10. The authoritative read reports captured, so any promise on this case was kept, and
+    # the interval between the Promise_Date and the provider-reported payment timestamp is
+    # recorded. Signed: a customer who paid before the date they named produces a negative
+    # interval, which is a correct measurement of a promise kept well rather than an error to
+    # clamp to zero. ``recovered_at`` is the provider's instant, the same one the recovery outcome
+    # is timed from, so the two figures cannot disagree about when the money moved.
+    promise_seconds = resolve_kept(session, merchant_id, case_id, paid_at=recovered_at)
+
     # The amount comes from the read, never from the webhook (R10.C3).
     recovered_amount = int(record.entity.amount)
 
@@ -668,6 +707,14 @@ def _declare_recovery(
                 "recovery_timestamp_source": timestamp_source,
                 "confirmed_actions": confirmed,
                 "gross_of_refunds": True,
+                # Present only where a promise was resolved by this read, so the field's absence
+                # means there was no promise rather than that it was not measured. An integer
+                # count of seconds, signed — see the comment above.
+                **(
+                    {}
+                    if promise_seconds is None
+                    else {"seconds_promise_to_payment": promise_seconds}
+                ),
             },
         ),
         correlation_id=correlation_id,
@@ -708,11 +755,24 @@ def _declare_recovery(
         max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
     )
     if rejection is not None:
-        _logger.warning(
-            "recovery verified but the transition to RECOVERED was refused",
+        # Error, not a warning, and the message says what the inconsistency *is*. Every
+        # non-terminal state now has a verified-capture edge to RECOVERED, so a refusal here
+        # can no longer be the ordinary consequence of a customer paying mid-pipeline — that
+        # was the hole, and it cost 23 cases out of 150 in a measured batch: money recorded
+        # and counted against cases that went on to expire. What remains reachable is a
+        # version conflict, which is a genuine defect in this path's locking.
+        #
+        # The audit write above is deliberately left where it is. Recording the read and the
+        # money before attempting the transition is what makes the recorded money survive a
+        # rollback of the state change rather than the other way round, and reordering it to
+        # silence this log would trade a loud inconsistency for a quiet loss.
+        _logger.error(
+            "recovered money was recorded for a case whose state does not reflect it: the "
+            "transition to RECOVERED was refused",
             case_id=str(case_id),
             outcome=rejection.outcome.value,
             state=previous_state.value,
+            recovered_amount=recovered_amount,
         )
 
     return OutcomeAssessment(

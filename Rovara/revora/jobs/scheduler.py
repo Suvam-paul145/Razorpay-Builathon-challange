@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Final
 
 from revora.cases.review import CASE_REVIEW_KIND
+from revora.customer.promises import PROMISE_SWEEP_KIND
 from revora.jobs.queue import enqueue
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.clock import now
@@ -46,6 +47,7 @@ __all__ = [
     "LIFECYCLE_EVALUATION_KIND",
     "PAYMENT_STATE_RECONCILIATION_KIND",
     "PERIODIC_SWEEP_KINDS",
+    "PROMISE_SWEEP_KIND",
     "enqueue_lifecycle_sweep",
     "enqueue_sweep",
 ]
@@ -70,6 +72,7 @@ PERIODIC_SWEEP_KINDS: Final[tuple[str, ...]] = (
     CALIBRATION_REPORT_KIND,
     CUSTOMER_DATA_RETENTION_KIND,
     CASE_REVIEW_KIND,
+    PROMISE_SWEEP_KIND,
 )
 """Every periodic sweep kind. The worker registers a handler for each; the ones whose
 owners do not exist yet are registered as no-ops so a scheduled sweep completes rather
@@ -79,7 +82,16 @@ than dead-lettering.
 It is the one sweep kind that is also enqueued from below this layer — the detection service
 and the customer response surface both trigger a review, and neither may import
 ``revora.jobs`` — so the constant lives at the lowest layer that all three callers can see.
-Its interval is ``REVIEW_SWEEP_INTERVAL``."""
+Its interval is ``REVIEW_SWEEP_INTERVAL``.
+
+``PROMISE_SWEEP_KIND`` is defined in ``revora.customer.promises`` and imported for a different
+reason from that one: nothing below this layer enqueues it, so it *could* have been declared
+above. It lives beside its own body instead, because the sweep's branches read and write
+``promise_to_pay`` statuses that only that module transitions, and a kind whose name and whose
+handler sit in different packages is a kind somebody renames in one of them. Its interval is
+``PROMISE_SWEEP_INTERVAL``, and it is the **eighth** member of this tuple — the task text calls
+it the seventh, which was the count before migration ``0014``'s ticker role brought the three
+intervals that made all seven of its predecessors schedulable."""
 
 
 def enqueue_sweep(

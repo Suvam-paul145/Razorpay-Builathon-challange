@@ -28,9 +28,11 @@ from typing import Final
 from revora.cases.retention import sweep_customer_data_retention
 from revora.cases.review import CASE_REVIEW_KIND, sweep_due_reviews
 from revora.cases.sweeper import sweep_expired_cases
+from revora.customer.arrangements import PARTIAL_ARRANGEMENT_KIND
+from revora.customer.promises import PROMISE_ESCALATION_KIND, PROMISE_SWEEP_KIND
 from revora.customer.suppression import CONTACT_SUPPRESSION_KIND
 from revora.detection.service import run_detection
-from revora.domain.enums import HardStopReason, ReviewTrigger
+from revora.domain.enums import HardStopReason, Provenance, ReviewTrigger
 from revora.execution.reconcile import reconcile_intents
 from revora.ingestion.backfill import backfill_detection_gap
 from revora.ingestion.service import DETECTION_JOB_KIND
@@ -49,7 +51,10 @@ from revora.jobs.pipeline import (
     handle_execution,
     handle_optimizer,
     handle_outcome,
+    handle_partial_arrangement,
     handle_policy,
+    handle_promise_escalation,
+    handle_promise_sweep,
     handle_review,
 )
 from revora.jobs.queue import ClaimedJob, claim_one, complete, enqueue, fail
@@ -88,12 +93,20 @@ _DEFAULT_MERCHANT_SCAN_LIMIT: Final[int] = 100
 picks up any it did not reach."""
 
 
-def _handle_detection(claimed: ClaimedJob) -> None:
+def _handle_detection(
+    claimed: ClaimedJob,
+    provenance: Provenance,
+    synthetic_run_id: uuid.UUID | None,
+) -> None:
     """Classify one persisted event, open or attach a case, start the decision pipeline.
 
     The verdict, the case and the diagnosis job all commit together. A case that exists with
     no job to advance it would sit until the lifecycle sweeper expired it, which is a silent
     way to lose a recovery — so the enqueue shares the transaction that created the case.
+
+    ``provenance`` is ``REAL`` in every deployment and is carried here rather than read off
+    the event on purpose — see :func:`revora.detection.service.run_detection`, which explains
+    why a label meaning "this money is not real" must not be derivable from request content.
     """
     webhook_event_id = uuid.UUID(str(claimed.payload["webhook_event_id"]))
     with tenant_transaction(claimed.merchant_id) as session:
@@ -104,6 +117,8 @@ def _handle_detection(claimed: ClaimedJob) -> None:
             webhook_event_id,
             config,
             correlation_id=claimed.correlation_id,
+            provenance=provenance,
+            synthetic_run_id=synthetic_run_id,
         )
         # A failure starts the decision pipeline; a success routes to an outcome observation.
         # Both in detection's own transaction, so a case never exists with no job to advance it.
@@ -191,6 +206,65 @@ def _handle_contact_suppression(claimed: ClaimedJob) -> None:
         hard_stop_reason=HardStopReason(str(claimed.payload["hard_stop_reason"])),
         correlation_id=claimed.correlation_id,
     )
+
+
+def _handle_partial_arrangement(claimed: ClaimedJob) -> None:
+    """Escalate a case whose customer asked to pay differently (R22.C2).
+
+    The signal identifier is required rather than defaulted, and an absent or malformed one fails
+    the job into the retry path. There is no safe substitute: the escalation's audit record names
+    the signal that caused it, and a record that named the wrong signal — or none — would leave a
+    terminal case whose stated cause could not be checked against what the customer actually
+    submitted.
+
+    Nothing here resolves a provider client, and the handler's signature is where that is visible:
+    an arrangement request cancels nothing and expires nothing (R22.C8), so there is no external
+    call for this path to make.
+    """
+    handle_partial_arrangement(
+        claimed.merchant_id,
+        _case_id_of(claimed),
+        signal_id=uuid.UUID(str(claimed.payload["signal_id"])),
+        correlation_id=claimed.correlation_id,
+    )
+
+
+def _handle_promise_escalation(claimed: ClaimedJob) -> None:
+    """Escalate a case whose customer promised a date the Recovery_Window cannot reach (R23.C5).
+
+    The promise identifier and the signal identifier are both required rather than defaulted, and
+    an absent or malformed one fails the job into the retry path. There is no safe substitute for
+    either: the escalation's audit record names the promise whose date caused it and the signal the
+    promise came from, and a record naming the wrong one — or none — would leave a terminal case
+    whose stated cause could not be checked against what the customer actually submitted.
+
+    Nothing here resolves a provider client, and the handler's signature is where that is visible:
+    this escalation cancels nothing and expires nothing, so there is no external call for the path
+    to make. That matters more on this path than on the arrangement's — the customer said they
+    *will* pay, so a live payment link left live is how the money still arrives.
+    """
+    handle_promise_escalation(
+        claimed.merchant_id,
+        _case_id_of(claimed),
+        promise_id=uuid.UUID(str(claimed.payload["promise_id"])),
+        signal_id=uuid.UUID(str(claimed.payload["signal_id"])),
+        correlation_id=claimed.correlation_id,
+    )
+
+
+def _handle_promise_sweep(claimed: ClaimedJob) -> None:
+    """Evaluate every promise whose Follow_Up_Instant has been reached (R23.C13).
+
+    A pure sweep, unlike ``CASE_REVIEW_KIND``: it carries no ``case_id`` shape, because a single
+    promise's follow-up is not enqueued as a job of its own. Making the follow-up eligible is a
+    status change on the promise row, and *deciding* to send it is the ordinary decision cycle the
+    sweep enqueues — so there is nothing per-case for this kind to dispatch.
+
+    Needs no terminal callback and no provider client. It voids promises and schedules follow-ups;
+    the one transition it could imply — a case whose window elapsed — is deliberately left to the
+    lifecycle sweep, so two sweeps are not both writers of ``EXPIRED``.
+    """
+    handle_promise_sweep(claimed.merchant_id, correlation_id=claimed.correlation_id)
 
 
 def _handle_case_review(claimed: ClaimedJob) -> None:
@@ -350,21 +424,50 @@ def _handle_detection_gap_backfill(
     )
 
 
-def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str, Handler]:
+def build_registry(
+    *,
+    provider: PaymentProviderClient | None = None,
+    provenance: Provenance = Provenance.REAL,
+    synthetic_run_id: uuid.UUID | None = None,
+) -> dict[str, Handler]:
     """The kind-to-handler map. One place, so a job kind cannot be dispatched two ways.
 
     ``provider`` is injectable so a test can substitute the scriptable fake, and defaults to
     the shared client resolved on first use. The three provider-touching sweeps close over it
     here rather than reaching for a global inside the handler, which keeps "what can make an
     external call" answerable by reading this function.
+
+    ``provenance`` is what a case opened by this registry's detection handler is labelled
+    with. ``REAL`` in every deployment; the Demonstration_Loader's worker is the one caller
+    that passes ``SYNTHETIC``, which is how R28.C1's label reaches the row without the
+    loader writing it. It sits beside ``provider`` deliberately: both are facts about the
+    process draining the queue rather than about any request, and keeping them in one
+    function keeps "what is substituted in this run" answerable by reading one signature.
+
+    ``synthetic_run_id`` travels with it for the same reason and is subject to the same
+    check: a ``SYNTHETIC`` case with no run id cannot be reproduced from a seed, and a run
+    id on a ``REAL`` case is a contradiction.
+
+    Raises:
+        ValueError: if exactly one of ``provenance is SYNTHETIC`` and ``synthetic_run_id is
+            not None`` holds. Refused here rather than left to produce a half-labelled row,
+            because both halves of the label are what make a seeded case auditable and the
+            failure would only be visible months later, in a figure nobody could re-derive.
     """
+    if (provenance is Provenance.SYNTHETIC) != (synthetic_run_id is not None):
+        raise ValueError(
+            "provenance=SYNTHETIC and synthetic_run_id must be supplied together; got "
+            f"provenance={provenance.value} and synthetic_run_id={synthetic_run_id!r}"
+        )
     client = provider
 
     def _resolve() -> PaymentProviderClient:
         return client if client is not None else shared_provider()
 
     return {
-        DETECTION_JOB_KIND: _handle_detection,
+        DETECTION_JOB_KIND: lambda claimed: _handle_detection(
+            claimed, provenance, synthetic_run_id
+        ),
         DIAGNOSIS_JOB_KIND: _handle_diagnosis,
         CANDIDATE_JOB_KIND: _handle_estimation,
         OPTIMIZER_JOB_KIND: _handle_optimization,
@@ -384,6 +487,9 @@ def build_registry(*, provider: PaymentProviderClient | None = None) -> dict[str
         CUSTOMER_DATA_RETENTION_KIND: _handle_customer_data_retention,
         CASE_REVIEW_KIND: _handle_case_review,
         CONTACT_SUPPRESSION_KIND: _handle_contact_suppression,
+        PARTIAL_ARRANGEMENT_KIND: _handle_partial_arrangement,
+        PROMISE_ESCALATION_KIND: _handle_promise_escalation,
+        PROMISE_SWEEP_KIND: _handle_promise_sweep,
         CALIBRATION_REPORT_KIND: _handle_not_yet_implemented,
     }
 

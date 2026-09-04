@@ -36,12 +36,13 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import func, select
 
 from revora.domain.attribution import attribution_refusals
 from revora.domain.enums import (
+    DEMONSTRATION_ONLY,
     NOT_ESTABLISHED,
     RECOVERY_GROSS_OF_REFUNDS,
     UNDEFINED,
@@ -59,11 +60,13 @@ from revora.domain.segments import AmountBand, amount_band_for
 from revora.persistence.models import (
     Diagnosis,
     ExecutionIntent,
+    ExperimentAssignment,
     MemoryObservation,
     PolicyDecision,
     RecommendationCandidate,
     RecoveryCase,
     RecoveryOutcome,
+    SyntheticRun,
 )
 from revora.persistence.repositories.experiments import (
     ExperimentAssignmentRepository,
@@ -79,14 +82,27 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.orm import Session
 
 __all__ = [
+    "GROUND_TRUTH_LIFT_KEY",
     "RATE_PLACES",
     "CohortMetrics",
+    "DemonstrationFinding",
     "IncrementalFinding",
     "ReportingPeriod",
     "SegmentKey",
     "compute_metrics",
+    "demonstration_finding",
+    "incremental_finding",
     "rate",
 ]
+
+GROUND_TRUTH_LIFT_KEY: Final[str] = "true_lift_for_treated_action"
+"""The key a ``synthetic_run.ground_truth`` document carries its planted average lift under.
+
+Named here rather than in the loader that writes it, because this module is the reader and a
+reader that guessed the key would report ``None`` forever without failing. The producer
+imports the constant from here, which is the wrong direction for a layering diagram and the
+right one for a contract: there is one spelling, and it lives with the code that would be
+silently wrong if it changed."""
 
 _logger = get_logger(__name__)
 
@@ -225,6 +241,113 @@ class IncrementalFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class DemonstrationFinding:
+    """``demonstration_incremental_revenue`` — a real comparison over a generated world.
+
+    **This is a separate figure with a separate name, and that separation is the whole of
+    R28.C12.** A dashboard that wanted to present this as ``incremental_recovered_revenue``
+    would have to rename a key, not merely relabel a number — which is a change a reviewer
+    sees in a diff rather than a caption somebody edits.
+
+    What it is: the control-versus-treatment comparison of a ``COMPLETED`` experiment whose
+    inputs came from a Synthetic_Dataset, computed by exactly the arithmetic
+    :func:`_incremental_value` applies to a real experiment. The comparison is sound. The
+    world it describes is one we wrote down, which is what :data:`DEMONSTRATION_ONLY` says.
+
+    What it is not, and cannot become: evidence for a causal claim about real money.
+    ``incremental_recovered_revenue`` keeps reporting :data:`NOT_ESTABLISHED` while this
+    carries a number (R28.C12), because the attribution gate refuses a ``SYNTHETIC``-labelled
+    experiment (R13.C8) and nothing here touches that gate. There is deliberately **no** code
+    path from this class to :class:`IncrementalFinding`.
+
+    ``value`` is ``None`` when there is no completed demonstration experiment — not zero.
+    Zero would be a measurement, and "we have not run one" is not one.
+    """
+
+    value: int | None = None
+    experiment_id: uuid.UUID | None = None
+    experiment_name: str | None = None
+    control_case_count: int | None = None
+    treatment_case_count: int | None = None
+    lift: Decimal | None = None
+    lift_ci_low: Decimal | None = None
+    lift_ci_high: Decimal | None = None
+    ground_truth_lift: Decimal | None = None
+    """The lift the generator planted, read from ``synthetic_run.ground_truth``.
+
+    Present so R28.C9's "difference between the measured incremental lift and the embedded
+    ground truth lift" is reportable. Read from a persisted document rather than recomputed,
+    because recomputing it would need the generator — and ``synthetic-containment`` forbids
+    this package from importing it, for the reason that makes the whole comparison worth
+    having: a measurement path that could see the answer would be marking its own homework."""
+
+    seed: int | None = None
+    scenario: str | None = None
+    generation_note: str | None = None
+
+    @property
+    def presented(self) -> bool:
+        """Whether there is a figure to present at all."""
+        return self.value is not None
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """The two labels R28.C11 requires, adjacent to the figure and never apart from it.
+
+        A property rather than a stored tuple, so there is no constructor through which a
+        caller could build this figure carrying one label, or none. The figure and its
+        qualification are the same object.
+        """
+        return (ExperimentLabel.SYNTHETIC.value, DEMONSTRATION_ONLY)
+
+    @property
+    def measured_minus_ground_truth(self) -> Decimal | None:
+        """Measured lift less the planted one (R28.C9, R28.C13). ``None`` if either is absent.
+
+        ``None`` rather than zero when one side is missing, on the same terms as
+        :attr:`IncrementalFinding` treats an absent measurement: "we could not compare" and
+        "the comparison found no difference" are the two readings a zero would merge, and the
+        second is the flattering one.
+        """
+        if self.lift is None or self.ground_truth_lift is None:
+            return None
+        return self.lift - self.ground_truth_lift
+
+    def as_document(self) -> dict[str, object]:
+        """Every field together, because the figure without its labels reads as a finding."""
+        if not self.presented:
+            return {
+                "presented": False,
+                "detail": (
+                    "No completed experiment on generated inputs exists for this merchant, so "
+                    "there is no demonstration figure. This is not zero recovered revenue."
+                ),
+            }
+        difference = self.measured_minus_ground_truth
+        return {
+            "presented": True,
+            "value": self.value,
+            "experiment_id": None if self.experiment_id is None else str(self.experiment_id),
+            "experiment_name": self.experiment_name,
+            "control_case_count": self.control_case_count,
+            "treatment_case_count": self.treatment_case_count,
+            "lift": None if self.lift is None else str(self.lift),
+            "lift_ci_low": None if self.lift_ci_low is None else str(self.lift_ci_low),
+            "lift_ci_high": None if self.lift_ci_high is None else str(self.lift_ci_high),
+            "ground_truth_lift": (
+                None if self.ground_truth_lift is None else str(self.ground_truth_lift)
+            ),
+            "measured_minus_ground_truth": (
+                None if difference is None else str(difference)
+            ),
+            "seed": self.seed,
+            "scenario": self.scenario,
+            "labels": list(self.labels),
+            "generation_note": self.generation_note,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CohortMetrics:
     """Every figure for one cohort, with the labels that qualify them.
 
@@ -273,6 +396,14 @@ class CohortMetrics:
 
     incremental: IncrementalFinding
     labels: tuple[str, ...]
+
+    demonstration: DemonstrationFinding = field(default_factory=DemonstrationFinding)
+    """``demonstration_incremental_revenue``, kept as its own field beside
+    :attr:`incremental` rather than folded into it (R28.C12, P61).
+
+    Defaulted to an absent figure so every existing construction of this class keeps meaning
+    what it meant: a merchant with no demonstration experiment has no demonstration figure,
+    which is the honest answer and not a zero."""
 
     @property
     def net_recovered_revenue(self) -> int:
@@ -324,6 +455,10 @@ class CohortMetrics:
             "observed_recovered_revenue": self.observed_recovered_revenue,
             "natural_recovered_revenue": self.natural_recovered_revenue,
             "incremental_recovered_revenue": self.incremental.as_document(),
+            # A separate key, adjacent to the one above so a reader sees both at once and
+            # neither can be mistaken for the other. R28.C12: presenting the second as the
+            # first has to be a rename.
+            "demonstration_incremental_revenue": self.demonstration.as_document(),
             "total_recovery_cost": self.total_recovery_cost,
             "net_recovered_revenue": self.net_recovered_revenue,
             "unresolved_revenue": self.unresolved_revenue,
@@ -375,6 +510,7 @@ def compute_metrics(
     segment: SegmentKey | None = None,
     moment: datetime | None = None,
     incremental: IncrementalFinding | None = None,
+    demonstration: DemonstrationFinding | None = None,
 ) -> CohortMetrics:
     """Compute every figure for one cohort. Reads only; commits nothing.
 
@@ -406,6 +542,11 @@ def compute_metrics(
 
     finding = (
         incremental if incremental is not None else _incremental_finding(session, merchant_id)
+    )
+    demo = (
+        demonstration
+        if demonstration is not None
+        else demonstration_finding(session, merchant_id)
     )
 
     labels = _labels(
@@ -446,6 +587,7 @@ def compute_metrics(
         ),
         incremental=finding,
         labels=labels,
+        demonstration=demo,
     )
 
     _logger.info(
@@ -891,6 +1033,118 @@ def _incremental_finding(session: Session, merchant_id: uuid.UUID) -> Incrementa
     return IncrementalFinding(
         value=NOT_ESTABLISHED,
         refusal_codes=tuple(dict.fromkeys(all_refusals)),
+    )
+
+
+def demonstration_finding(
+    session: Session, merchant_id: uuid.UUID
+) -> DemonstrationFinding:
+    """``demonstration_incremental_revenue`` for this merchant, or an absent figure (R28.C11).
+
+    The newest ``COMPLETED`` experiment carrying ``SYNTHETIC``, its stored result, and the
+    ground truth reached through the cases it assigned. Nothing here consults
+    :func:`_incremental_finding` and nothing there consults this: the two figures are
+    computed by two functions with two names and are reported under two keys, which is what
+    R28.C12 asks for and what a single function returning "the incremental figure, synthetic
+    or not" would have quietly undone.
+
+    The value comes from :func:`_incremental_value` — the *same* arithmetic a real
+    experiment's figure would use. Deliberately the same: a demonstration whose number was
+    computed differently would be demonstrating a different calculation.
+    """
+    experiments = ExperimentRepository(session)
+    completed = experiments.list_by_state(merchant_id, ExperimentState.COMPLETED, limit=10)
+    results = ExperimentResultRepository(session)
+
+    for experiment in completed:
+        if ExperimentLabel.SYNTHETIC.value not in set(experiment.labels or ()):
+            continue
+        result = results.latest_for_experiment(merchant_id, experiment.id)
+        if result is None or result.lift is None:
+            continue
+        truth = _ground_truth_for(session, merchant_id, experiment.id)
+        return DemonstrationFinding(
+            value=_incremental_value(session, merchant_id, experiment.id),
+            experiment_id=experiment.id,
+            experiment_name=str(experiment.name),
+            control_case_count=int(result.control_case_count),
+            treatment_case_count=int(result.treatment_case_count),
+            lift=result.lift,
+            lift_ci_low=result.lift_ci_low,
+            lift_ci_high=result.lift_ci_high,
+            ground_truth_lift=truth.lift,
+            seed=truth.seed,
+            scenario=truth.scenario,
+            generation_note=truth.note,
+        )
+
+    return DemonstrationFinding()
+
+
+@dataclass(frozen=True, slots=True)
+class _GroundTruth:
+    """What a ``synthetic_run`` row says about the world an experiment measured."""
+
+    lift: Decimal | None = None
+    seed: int | None = None
+    scenario: str | None = None
+    note: str | None = None
+
+
+def _ground_truth_for(
+    session: Session, merchant_id: uuid.UUID, experiment_id: uuid.UUID
+) -> _GroundTruth:
+    """The ground truth of the run whose cases this experiment assigned.
+
+    Reached through ``recovery_case.synthetic_run_id`` rather than by matching a name or a
+    seed, because that column is the only link that cannot be wrong: it is written on the
+    case at detection, in the same statement as the ``SYNTHETIC`` provenance, and a case
+    carrying one without the other is refused where the two are supplied together.
+
+    Returns an empty truth rather than raising when the link is absent. A ``SYNTHETIC``
+    experiment whose cases carry no run id is possible — the evidence harness writes its own
+    cases and its own run — and the honest answer is a figure with no ground-truth column
+    rather than no figure at all.
+    """
+    row = session.execute(
+        select(SyntheticRun.seed, SyntheticRun.scenario, SyntheticRun.ground_truth)
+        .select_from(SyntheticRun)
+        .where(
+            SyntheticRun.merchant_id == merchant_id,
+            SyntheticRun.id.in_(
+                select(RecoveryCase.synthetic_run_id)
+                .join(
+                    ExperimentAssignment,
+                    (ExperimentAssignment.case_id == RecoveryCase.id)
+                    & (ExperimentAssignment.merchant_id == merchant_id),
+                )
+                .where(
+                    RecoveryCase.merchant_id == merchant_id,
+                    ExperimentAssignment.experiment_id == experiment_id,
+                    RecoveryCase.synthetic_run_id.is_not(None),
+                )
+            ),
+        )
+        .order_by(SyntheticRun.created_at.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return _GroundTruth()
+
+    document = row.ground_truth if isinstance(row.ground_truth, dict) else {}
+    raw = document.get(GROUND_TRUTH_LIFT_KEY)
+    lift: Decimal | None = None
+    if isinstance(raw, str):
+        try:
+            lift = Decimal(raw)
+        except ArithmeticError:  # pragma: no cover - a malformed document, not a data one
+            lift = None
+    note = document.get("note")
+    return _GroundTruth(
+        lift=lift,
+        seed=int(row.seed),
+        scenario=None if row.scenario is None else str(row.scenario),
+        note=None if not isinstance(note, str) else note,
     )
 
 

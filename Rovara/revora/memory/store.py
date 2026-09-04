@@ -29,11 +29,22 @@ labelled rather than solved: ``MERCHANT_INTERVENTION_UNKNOWN`` is a distinct val
 per segment is reported, and it is excluded from the posterior. A design that folded unknown
 into confirmed would produce a baseline that looked better-evidenced and was quietly wrong.
 
-**The feature document is an interface, and a fragile one.** The five keys must be exactly
-what ``estimation.segments.SegmentFeatures.as_values()`` produces, because the estimator
+**The feature document is an interface, and a fragile one.** The five *segment* keys must be
+exactly what ``estimation.segments.SegmentFeatures.as_values()`` produces, because the estimator
 matches segments by JSONB containment. A renamed key does not raise — it silently stops
 matching, every segment collapses to the global prior, and nothing looks broken. So the
 document is built by calling that function rather than by assembling a dict here.
+
+**One non-segment observation feature exists, and the distinction matters.** R15.C1 lets an
+observation carry features about what happened to a case; R22.C6 requires a Partial_Arrangement_
+Request to be one of them. It is added under
+:data:`~revora.customer.arrangements.FEATURE_PARTIAL_ARRANGEMENT`, alongside the five and
+deliberately not among them: the estimator's backoff levels are truncations of one ordered tuple,
+so a sixth *segment* dimension would resegment the whole training set, while a key no containment
+probe ever names changes no estimate at all. Its value is a nested object, which a probe built
+from string values cannot match even by accident — so "adding this cannot move a baseline" is
+structural rather than a promise. The key is present only on the cases that have a request, which
+is why the pg test asserting the exact five-key set on an expired case still holds.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ from typing import TYPE_CHECKING
 
 from revora.audit.events import RECOVERY_OBSERVATION_RECORDED
 from revora.audit.writer import AuditEntry, AuditWriter
+from revora.customer.arrangements import arrangement_feature, first_arrangement_request
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import (
     NOT_ESTABLISHED,
@@ -210,10 +222,12 @@ def record_observation(
         executed_action_count=0,
         error_source=canonical_error_source,
     )
+    feature_document: dict[str, object] = dict(features.as_values())
+    feature_document.update(_arrangement_features(session, merchant_id, case_id))
 
     row = MemoryObservation(
         case_id=case_id,
-        features=features.as_values(),
+        features=feature_document,
         cause=None if diagnosis is None else str(diagnosis.cause),
         confidence=None if diagnosis is None else diagnosis.confidence,
         diagnosis_method=None if diagnosis is None else str(diagnosis.method),
@@ -313,6 +327,34 @@ def observation_writer(
 # ---------------------------------------------------------------------------
 # The derived fields
 # ---------------------------------------------------------------------------
+
+
+def _arrangement_features(
+    session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID
+) -> dict[str, object]:
+    """R22.C6: the Partial_Arrangement_Request as an observation feature, or no key at all.
+
+    An empty mapping when the case holds no request, rather than the key with a ``None`` value.
+    The difference shows up in the one place it matters: ``memory_observation.features`` is JSONB
+    and a present-but-null key is a key a containment probe can match on, so the absent form keeps
+    the document of a case nobody made a request about byte-identical to what it was before this
+    feature existed. It also keeps the honest reading — a document with no arrangement key says
+    nothing was asked, and there is no third state to represent.
+
+    Read here rather than passed in, because every other field on the observation is read off
+    persisted rows in this function and the alternative would put an argument on
+    :func:`observation_writer` that eleven call sites would have to supply and ten would supply as
+    ``None``.
+
+    The earliest request, which is
+    :func:`~revora.customer.arrangements.first_arrangement_request`'s contract and the right one
+    here: the observation records when this case became a person's problem, and a second identical
+    ask does not move that instant.
+    """
+    request = first_arrangement_request(session, merchant_id, case_id)
+    if request is None:
+        return {}
+    return arrangement_feature(request)
 
 
 def _selected_action(

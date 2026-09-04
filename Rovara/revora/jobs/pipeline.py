@@ -64,6 +64,8 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter
 from revora.cases.manager import apply_locked_transition, apply_transition
+from revora.customer.arrangements import first_arrangement_request, hard_stop_recorded
+from revora.customer.promises import follow_up_due_for_case, sweep_due_promises
 from revora.customer.suppression import suppression_in_force
 from revora.detection.service import DetectionServiceResult
 from revora.diagnosis.service import run_diagnosis
@@ -90,13 +92,14 @@ from revora.outcome.monitor import (
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.config import ConfigurationRepository
 from revora.persistence.repositories.consent import CustomerConsentRepository
+from revora.persistence.repositories.customer import PromiseToPayRepository
 from revora.persistence.repositories.diagnosis import DiagnosisRepository
 from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.persistence.repositories.jobs import JobRepository
 from revora.persistence.repositories.policy import PolicyDecisionRepository
 from revora.persistence.repositories.recommendations import RecommendationRepository
 from revora.persistence.repositories.session import tenant_transaction
-from revora.platform.clock import now
+from revora.platform.clock import ensure_utc, now
 from revora.platform.config import Configuration
 from revora.platform.logging import get_logger
 from revora.policy.engine import PolicyEvaluation, evaluate, idempotency_key_for
@@ -121,7 +124,10 @@ __all__ = [
     "handle_execution",
     "handle_optimizer",
     "handle_outcome",
+    "handle_partial_arrangement",
     "handle_policy",
+    "handle_promise_escalation",
+    "handle_promise_sweep",
     "handle_review",
     "rule_set_from_config",
     "run_policy_evaluation",
@@ -132,6 +138,22 @@ _logger = get_logger(__name__)
 _POLICY_ACTOR: Final = "policy_engine"
 _REVIEW_ACTOR: Final = "review_engine"
 _SUPPRESSION_ACTOR: Final = "contact_suppression"
+_ARRANGEMENT_ACTOR: Final = "partial_arrangement"
+"""The actor on an arrangement escalation's records.
+
+Distinct from ``_SUPPRESSION_ACTOR`` even though both are this module escalating a case on
+something a customer said, because the audit log is where the two are told apart afterwards: a
+suppression ended contact permanently and an arrangement did not, and one actor name for both
+would make "why did contact stop on this case?" unanswerable from the record."""
+
+_PROMISE_ACTOR: Final = "promise_to_pay"
+"""The actor on a beyond-window promise escalation's records.
+
+A third name for a third reason a customer's own words end a case, and separate from the other
+two on the same argument. All three escalate; none of them means the same thing afterwards. A
+dispute ended contact, an arrangement request asked for different terms, and this one is the case
+where the customer *intends to pay* and named a date the window cannot reach — which is the only
+one of the three where a person picking the case up may well recover the money."""
 
 SUPPRESSION_TERMINAL_REASON: Final[Mapping[HardStopReason, TerminalReason]] = (
     MappingProxyType(
@@ -526,7 +548,16 @@ def handle_review(
     trigger: ReviewTrigger,
     correlation_id: uuid.UUID | None = None,
 ) -> None:
-    """Look at a case that chose restraint again, and start it on a fresh decision cycle.
+    """Look at a case again, and start it on a fresh decision cycle.
+
+    **Two source states, and they are two different questions with one answer.** A case that
+    chose restraint rests at ``POLICY_CHECK`` and is looked at again under R30.C1. A case whose
+    customer promised to pay rests at ``WAITING_FOR_OUTCOME`` — a promise can only be submitted
+    with a Customer_Access_Token, and one is minted inside the transition into ``EXECUTING`` — and
+    is looked at again under R24.C13 once its Follow_Up_Instant has been reached. The two take
+    different edges into ``DECISION_PENDING`` (``REVIEW`` and ``REENTRY``), both already declared
+    in :mod:`revora.domain.transitions` and both carrying ``decision_cycle_delta = 1``, so the cap
+    below bounds them together and no new edge was needed for the second.
 
     Assembled from the four steps the forward path already uses — diagnosis, baseline,
     candidates, optimizer — rather than reimplementing any of them. A second implementation
@@ -538,7 +569,7 @@ def handle_review(
     **The decision-cycle numbering.** All four steps read ``case.decision_cycle_count`` off
     the row themselves and file under it; none of them takes a cycle number. Because they run
     *before* the transition into ``DECISION_PENDING`` — which is the edge that increments the
-    counter — a case resting at ``POLICY_CHECK`` with the counter at ``n`` produces a
+    counter — a case resting with the counter at ``n`` produces a
     diagnosis, a baseline, a candidate set and a recommendation all filed under cycle ``n``,
     which is the ``n+1``-th decision cycle of the case's life. Passing a cycle number in, or
     running any step after the transition, would file the recommendation under ``n+1`` where
@@ -552,7 +583,9 @@ def handle_review(
     that reached the cap between that read and this lock. R30.C10 is this one — the sweep
     cannot satisfy it, because a sweep that merely declines to enqueue leaves a capped case
     sitting at ``POLICY_CHECK`` until its window elapses, which is a different ending with a
-    different reason on the record.
+    different reason on the record. R24.C13's last clause is the same gate reached from
+    ``WAITING_FOR_OUTCOME``: a due follow-up on a case whose cycle budget is spent stops the case
+    with ``DECISION_CYCLE_LIMIT_REACHED`` rather than starting a cycle that cannot finish.
 
     **Nothing here reads the trigger except the audit record.** R30.C15 requires the policy
     evaluation to take no input from the Review_Trigger and none from the count of prior
@@ -574,10 +607,24 @@ def handle_review(
         # has since committed and any trigger's enqueue is older than this claim. A case that
         # has been approved and scheduled, terminated, or already reviewed is not an error
         # here: it is a review that arrived after the question stopped being open.
+        #
+        # ``WAITING_FOR_OUTCOME`` is admitted only with a due promise behind it, and the
+        # condition is what keeps R24.C13 from widening into a general re-entry. A review job
+        # enqueued while the case was at ``POLICY_CHECK`` can be claimed after the case has
+        # advanced through execution — the dedupe key is the case, not the state it was in — and
+        # admitting that job here would spend a decision cycle on a trigger whose evidence the
+        # cycle it caused has already consumed. A due follow-up is different in kind: the promise
+        # is the new evidence, it is still unactioned, and the sweep will keep finding it until a
+        # cycle considers it.
         state = CaseState(case.state)
-        if state is not CaseState.POLICY_CHECK:
+        admitted = (
+            follow_up_due_for_case(session, merchant_id, case_id, instant=review_at_start)
+            if state is CaseState.WAITING_FOR_OUTCOME
+            else state is CaseState.POLICY_CHECK
+        )
+        if not admitted:
             _logger.info(
-                "review skipped: case is no longer waiting at POLICY_CHECK",
+                "review skipped: the case is not in a state this review can act on",
                 case_id=str(case_id),
                 observed_state=state.value,
                 review_trigger=trigger.value,
@@ -876,6 +923,409 @@ def handle_contact_suppression(
         cancelled_actions=len(cancelled),
         in_flight_actions=in_flight,
     )
+
+
+# ---------------------------------------------------------------------------
+# Partial_Arrangement_Request: escalate, record, and touch no money field (R22.C2, C7, C8, C10)
+# ---------------------------------------------------------------------------
+
+
+def handle_partial_arrangement(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    signal_id: uuid.UUID,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Escalate a case whose customer asked to pay differently. One transaction, no money moved.
+
+    The whole of R22 is a statement about restraint, and this handler is where the restraint has
+    to be visible. A customer asking to settle for less or to pay in instalments has asked Revora
+    to agree to something, and Revora is structurally unable to: there is no field on the request
+    for an amount, no column for one, and nothing on this path that reads one. So the consequence
+    is the smallest one that is still an answer — the case ends ``ESCALATED`` with
+    ``CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT`` and a person picks it up.
+
+    **Deliberately shorter than :func:`handle_contact_suppression`, and every omission is a
+    requirement.** That handler cancels scheduled actions, records the in-flight ones, and ends
+    contact permanently. This one does none of the three:
+
+    * **Nothing is cancelled** and no ``ACTION_CANCELLED_*`` record is written. There is no
+      provider client in this function's arguments, so no cancellation is issuable from here at
+      all, and the terminal state is what stops a queued execution — ``execute_approved_action``
+      re-requests authority against reloaded state and refuses a terminal case.
+    * **No payment link is expired or modified** (R22.C8). A live link stays live for its
+      remaining validity, which is the clause that makes the *whole feature* safe rather than
+      merely correct: a customer who reads "we have passed this to a person" and then decides to
+      pay in full still recovers the case under R10.C14, and the reconciliation edge counts that
+      recovery exactly once. Expiring the link to tidy up would take that path away from them.
+    * **No Contact_Suppression is written.** Asking about instalments is not an objection to the
+      debt. Suppressing contact on it would make an arrangement request indistinguishable from a
+      dispute, and it would do so in the direction that silently ends chasing.
+
+    **The three money fields are untouched, and they are untouched by construction** (R22.C7).
+    ``payment_amount``, ``currency`` and ``window_end_at`` are never assigned in this function or
+    in anything it calls: ``apply_locked_transition`` writes ``state``, ``version``,
+    ``terminal_reason``, the three counters, ``last_outbound_at`` and ``next_review_at``, and
+    those are the entire set of columns a transition may move. So R22.C7 is a property of the one
+    writer of case state rather than a discipline this handler keeps, which is why there is no
+    assertion here restating it.
+
+    **The unresolved amount is *recorded*, not changed.** ``CASE_ESCALATED`` carries
+    ``int(case.payment_amount)`` — an ``int`` read from a ``BIGINT`` column, minor units, never a
+    float and never re-derived from a formatted string. Recording it is what lets the ``ESCALATED``
+    grouping name the money at stake (R22.C9) from the audit trail alone.
+
+    **Where a Hard_Stop_Reason is also persisted, this yields** (R22.C10). A case holds one
+    Terminal_State reason and the hard stop is the stronger statement, so the arrangement stays
+    recorded as a Customer_Signal and applies **no second Terminal_State transition**. The check
+    is :func:`~revora.customer.arrangements.hard_stop_recorded` — a read of the case's own
+    signals — and it is a read rather than a lock ordering on purpose: resolving the collision by
+    "whichever job runs first" would make the recorded reason a function of queue order, so the
+    same two submissions would end one case ``CUSTOMER_DISPUTED_CHARGE`` and the next
+    ``CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT``. Yielding to the hard stop is deterministic in both
+    orders: if the suppression handler has already run the case is terminal and the early return
+    below covers it, and if it has not, this returns and leaves the case for it.
+
+    The ordering inside the transaction is :func:`handle_contact_suppression`'s, minus the two
+    steps it has that this does not:
+
+    1. **Lock the case**, so everything after is serialized against the pipeline's own writer.
+    2. **Return early if the case is already terminal** — not an error and not rare. A sweep can
+       expire the case seconds after the customer submits, the suppression handler may have got
+       there first, and a retried job finds the case this handler itself escalated. In all three
+       the correct action is none, and this early return is also what makes the handler idempotent
+       without a flag column.
+    3. **Return early if a Hard_Stop_Reason is persisted** (R22.C10).
+    4. **Write ``CASE_ESCALATED``** carrying the unresolved amount, before the transition, because
+       the audit sequence is allocated under the case row lock this transaction already holds and
+       the transition must be the last thing that happens — so a failure anywhere above it leaves
+       the case exactly where it was.
+    5. **Transition to ``ESCALATED``** through ``apply_locked_transition``, in its locked form
+       because this transaction already holds the row and the wrapper would deadlock against
+       itself.
+
+    Args:
+        signal_id: the ``customer_signal`` row that queued this escalation, from the job payload.
+            It travels rather than being re-derived, on the same terms the Hard_Stop_Reason
+            travels on a suppression job: the record names its cause without a reader having to
+            infer which of a case's signals was the trigger. The request *instant* is read back
+            instead of travelling, because a retried job must produce the same record as the first
+            attempt and a payload copy of a column is a copy that can disagree with it.
+    """
+    with tenant_transaction(merchant_id) as session:
+        config = ConfigurationRepository(session).load(merchant_id)
+        case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+        if case is None:  # pragma: no cover - RESTRICT makes a case undeletable
+            _logger.warning("arrangement consequence on missing case", case_id=str(case_id))
+            return
+
+        state = CaseState(case.state)
+        if is_terminal(state):
+            _logger.info(
+                "arrangement escalation skipped: case already terminal",
+                case_id=str(case_id),
+                state=state.value,
+                terminal_reason=case.terminal_reason,
+            )
+            return
+
+        hard_stop = hard_stop_recorded(session, merchant_id, case_id)
+        if hard_stop is not None:
+            # R22.C10. The signal is already persisted — that happened in the accepting request —
+            # so "recorded as a Customer_Signal without a second Terminal_State transition" is
+            # satisfied by returning and writing nothing. No audit record either: the escalation
+            # that does happen is the suppression's, its CASE_ESCALATED names the Hard_Stop_Reason,
+            # and a second record saying "and also this" would put two escalations of one case in
+            # the log for one ending.
+            _logger.info(
+                "arrangement escalation yielded to a hard stop",
+                case_id=str(case_id),
+                hard_stop_reason=hard_stop.value,
+            )
+            return
+
+        request = first_arrangement_request(session, merchant_id, case_id)
+        writer = AuditWriter(
+            session,
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        unresolved_amount = int(case.payment_amount)
+
+        writer.write_for_case(
+            merchant_id,
+            case_id,
+            AuditEntry(
+                event_type=CASE_ESCALATED,
+                actor=_ARRANGEMENT_ACTOR,
+                previous_state=state.value,
+                new_state=CaseState.ESCALATED.value,
+                decision={
+                    "terminal_reason": (
+                        TerminalReason.CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT.value
+                    ),
+                    "signal_id": str(signal_id),
+                    # R22.C2: the unresolved amount in minor currency units.
+                    "unresolved_amount": unresolved_amount,
+                    # The currency travels with the amount so a reader never has to guess which
+                    # one an integer counts. Read off the case, not defaulted.
+                    "currency": str(case.currency),
+                    "requested_at": (
+                        None if request is None else request.requested_at.isoformat()
+                    ),
+                    # *Whether* a note was written, never the note. The note is free text a
+                    # stranger typed on a public endpoint and the audit log is the one store that
+                    # cannot be rewritten, so it is retained on ``customer_signal`` where the
+                    # retention sweep can reach it (R29.C10) and presented from there.
+                    "note_present": request is not None and request.note is not None,
+                    # Named so the record says what did *not* happen. R22.C8 is the clause a
+                    # reader is most likely to doubt, and an audit trail that only records
+                    # actions taken cannot answer "was the link cancelled?" at all.
+                    "detail": (
+                        "customer asked to pay differently; escalated to a person. No amount, "
+                        "instalment count or schedule was accepted, payment_amount, currency and "
+                        "window_end_at are unchanged, and any live payment link is left live and "
+                        "unmodified for its remaining validity"
+                    ),
+                },
+            ),
+            correlation_id=correlation_id,
+        )
+
+        # Terminal, so the training set is owed a row (R15.C1) — and this population especially,
+        # because a case where the customer engaged and asked for different terms is evidence a
+        # model needs about which contact is worth making.
+        _, rejection = apply_locked_transition(
+            session,
+            merchant_id,
+            case,
+            expected_version=int(case.version),
+            target_state=CaseState.ESCALATED,
+            reason="customer requested a partial arrangement",
+            actor=_ARRANGEMENT_ACTOR,
+            terminal_reason=TerminalReason.CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT,
+            correlation_id=correlation_id,
+            on_success=observation_writer(config, correlation_id=correlation_id),
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        if rejection is not None:  # pragma: no cover - every non-terminal edge is legal
+            _logger.warning(
+                "arrangement escalation refused",
+                case_id=str(case_id),
+                outcome=rejection.outcome.value,
+                state=state.value,
+            )
+            return
+
+    _logger.info(
+        "partial arrangement escalation applied",
+        case_id=str(case_id),
+        signal_id=str(signal_id),
+        unresolved_amount=unresolved_amount,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Promise_To_Pay beyond the window: escalate, and extend nothing (R23.C5, C6)
+# ---------------------------------------------------------------------------
+
+
+def handle_promise_escalation(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    promise_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    correlation_id: uuid.UUID | None = None,
+) -> None:
+    """Escalate a case whose customer promised a date the Recovery_Window cannot reach.
+
+    **The window is not extended, and the whole requirement is that absence.** R2.C5 makes
+    ``window_end_at`` immutable once a case opens, and that immutability is what makes R2.C12's
+    termination bound provable — a promise that could extend the window would remove the
+    guarantee, not merely bend it. So a Promise_Date at or past the window end is not a scheduling
+    problem to be solved by stretching the window; it is a case for a person, and this handler is
+    the person's inbox.
+
+    Like :func:`handle_partial_arrangement`, and shorter than
+    :func:`handle_contact_suppression`, with every omission deliberate:
+
+    * **Nothing is cancelled** and no ``ACTION_CANCELLED_*`` record is written. There is no
+      provider client in this function's arguments, so no cancellation is issuable from here.
+    * **No payment link is expired or modified.** This is the escalation where that matters most
+      of the three: the customer said they *will* pay, just later than the window allows, so a
+      live link left live is exactly the path by which the money still arrives — and R10.C14's
+      reconciliation edge counts that recovery once, from a terminal case.
+    * **The promise's own status is not touched.** It is already ``BEYOND_WINDOW_ESCALATED``,
+      written by the transaction that accepted the submission, and ``escalated_schedules_nothing``
+      means it carries no Follow_Up_Instant to cancel. R23.C12's ``VOIDED`` is for a promise still
+      ``RECORDED`` when its case ends, which this one never was.
+
+    **The window end is untouched by construction** (R23.C4). ``apply_locked_transition`` writes
+    ``state``, ``version``, ``terminal_reason``, the three counters, ``last_outbound_at`` and
+    ``next_review_at`` — that is the entire set of columns a transition may move, and
+    ``window_end_at`` is not among them. So R23.C4 is a property of the only writer of case state
+    rather than a discipline this handler keeps, which is why there is no assertion here restating
+    it. Property 41 asserts it from the outside.
+
+    **Where a Hard_Stop_Reason is also persisted, this yields**, on exactly
+    :func:`handle_partial_arrangement`'s argument and through the same
+    :func:`~revora.customer.arrangements.hard_stop_recorded` read. A case holds one Terminal_State
+    reason, the hard stop is the stronger statement — an objection to the debt rather than a date
+    Revora cannot reach — and resolving the collision by queue order would make the recorded
+    reason a function of which job ran first. R22.C10 says this about an arrangement request; the
+    same reasoning is what makes it correct here, and applying it to both is what keeps the
+    recorded reason deterministic in every order the two jobs can run in.
+
+    The ordering inside the transaction is :func:`handle_partial_arrangement`'s:
+
+    1. **Lock the case.**
+    2. **Return early if the case is already terminal** — a sweep may have expired it, the
+       suppression handler may have got there first, and a retried job finds the case this handler
+       itself escalated. This early return is what makes the handler idempotent without a flag
+       column.
+    3. **Return early if a Hard_Stop_Reason is persisted.**
+    4. **Write ``CASE_ESCALATED``** carrying the unresolved amount and the submitted Promise_Date,
+       both of which R23.C5 names, before the transition — the audit sequence is allocated under
+       the case row lock this transaction already holds, and the transition must be last so a
+       failure above it leaves the case where it was.
+    5. **Transition to ``ESCALATED``** with ``PROMISE_BEYOND_RECOVERY_WINDOW``.
+
+    Args:
+        promise_id: the ``promise_to_pay`` row that queued this escalation. The Promise_Date is
+            read back through it rather than travelling on the payload, because a retried job must
+            produce the same record as the first attempt and a payload copy of a column can
+            disagree with it.
+        signal_id: the ``customer_signal`` row the promise names, so an audit reader can join the
+            escalation to the submission without inferring which of a case's signals caused it.
+    """
+    with tenant_transaction(merchant_id) as session:
+        config = ConfigurationRepository(session).load(merchant_id)
+        case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+        if case is None:  # pragma: no cover - RESTRICT makes a case undeletable
+            _logger.warning("promise escalation on missing case", case_id=str(case_id))
+            return
+
+        state = CaseState(case.state)
+        if is_terminal(state):
+            _logger.info(
+                "promise escalation skipped: case already terminal",
+                case_id=str(case_id),
+                state=state.value,
+                terminal_reason=case.terminal_reason,
+            )
+            return
+
+        hard_stop = hard_stop_recorded(session, merchant_id, case_id)
+        if hard_stop is not None:
+            # The stronger statement wins, and no audit record is written here: the escalation
+            # that does happen is the suppression's, its CASE_ESCALATED names the
+            # Hard_Stop_Reason, and a second record saying "and also this" would put two
+            # escalations of one case in the log for one ending.
+            _logger.info(
+                "promise escalation yielded to a hard stop",
+                case_id=str(case_id),
+                hard_stop_reason=hard_stop.value,
+            )
+            return
+
+        promise = PromiseToPayRepository(session).get(merchant_id, promise_id)
+        writer = AuditWriter(
+            session,
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        unresolved_amount = int(case.payment_amount)
+
+        writer.write_for_case(
+            merchant_id,
+            case_id,
+            AuditEntry(
+                event_type=CASE_ESCALATED,
+                actor=_PROMISE_ACTOR,
+                previous_state=state.value,
+                new_state=CaseState.ESCALATED.value,
+                decision={
+                    "terminal_reason": TerminalReason.PROMISE_BEYOND_RECOVERY_WINDOW.value,
+                    "promise_id": str(promise_id),
+                    "signal_id": str(signal_id),
+                    # R23.C5 names both of these explicitly: the unresolved payment_amount and the
+                    # submitted Promise_Date. An int of minor currency units, never a float and
+                    # never re-derived from a formatted string.
+                    "unresolved_amount": unresolved_amount,
+                    "currency": str(case.currency),
+                    "promise_date": (
+                        None if promise is None else ensure_utc(promise.promise_date).isoformat()
+                    ),
+                    # The window end the promise was measured against, so a reader can see that
+                    # the date was past it without joining — and can see that it is still the
+                    # value it was when the case opened.
+                    "window_end_at": ensure_utc(case.window_end_at).isoformat(),
+                    # Named so the record says what did *not* happen. R23.C4 is the clause a
+                    # reader is most likely to doubt, and an audit trail that only recorded
+                    # actions taken could not answer "was the window extended?" at all.
+                    "detail": (
+                        "the customer named a date at or past the recovery window end, or one "
+                        "leaving no room for a follow-up inside it; escalated to a person. "
+                        "window_end_at is unchanged, no PROMISE_TO_PAY_FOLLOW_UP was scheduled, "
+                        "and any live payment link is left live and unmodified for its remaining "
+                        "validity"
+                    ),
+                },
+            ),
+            correlation_id=correlation_id,
+        )
+
+        # Terminal, so the training set is owed a row (R15.C1) — and this population especially:
+        # a customer who engaged and named a date is evidence a model needs about which contact is
+        # worth making, even though the date was one the window could not reach.
+        _, rejection = apply_locked_transition(
+            session,
+            merchant_id,
+            case,
+            expected_version=int(case.version),
+            target_state=CaseState.ESCALATED,
+            reason="promised date beyond the recovery window",
+            actor=_PROMISE_ACTOR,
+            terminal_reason=TerminalReason.PROMISE_BEYOND_RECOVERY_WINDOW,
+            correlation_id=correlation_id,
+            on_success=observation_writer(config, correlation_id=correlation_id),
+            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
+            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
+        )
+        if rejection is not None:  # pragma: no cover - every non-terminal edge is legal
+            _logger.warning(
+                "promise escalation refused",
+                case_id=str(case_id),
+                outcome=rejection.outcome.value,
+                state=state.value,
+            )
+            return
+
+    _logger.info(
+        "promise beyond window escalation applied",
+        case_id=str(case_id),
+        promise_id=str(promise_id),
+        unresolved_amount=unresolved_amount,
+    )
+
+
+def handle_promise_sweep(
+    merchant_id: uuid.UUID, *, correlation_id: uuid.UUID | None = None
+) -> None:
+    """One pass of the promise sweep (R23.C13). Delegates entirely.
+
+    The body is :func:`revora.customer.promises.sweep_due_promises`, one layer down, and this
+    exists only to give ``PROMISE_SWEEP_KIND`` a handler with the signature every other
+    sweep handler has — on the same terms :func:`handle_execution` and
+    :func:`handle_outcome` delegate to the modules
+    that own their guarantees. A second opinion here about which promises are due would be a
+    second reading of the partial index the claim is served by.
+    """
+    sweep_due_promises(merchant_id, correlation_id=correlation_id)
+
 
 # ---------------------------------------------------------------------------
 # Step 5: execution — the only step that can produce an external effect
