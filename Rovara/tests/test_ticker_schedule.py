@@ -5,8 +5,10 @@ development script the ticker replaced mapped four kinds by hard-coded string li
 everything else a 300-second fallback, so three of the seven sweeps ran on a number nobody
 chose and a renamed constant would have silently joined them. Migration ``0014`` seeded the
 three intervals that did not exist, ``_bucket_seconds`` keys on the constants, and there is no
-fallback left — so an eighth kind added to ``PERIODIC_SWEEP_KINDS`` without a bound fails here
-rather than inheriting five minutes.
+fallback left — so a kind added to ``PERIODIC_SWEEP_KINDS`` without a bound fails here rather
+than inheriting five minutes. Migration ``0016`` added the eighth kind, the promise sweep of
+R23.C13, and both assertions below failed until ``PROMISE_SWEEP_INTERVAL`` existed — which is
+the arrangement working rather than the test being brittle.
 
 Pure tier: this is a mapping over the catalogue defaults, with no database and no clock.
 """
@@ -27,6 +29,7 @@ from revora.jobs.scheduler import (
     LIFECYCLE_EVALUATION_KIND,
     PAYMENT_STATE_RECONCILIATION_KIND,
     PERIODIC_SWEEP_KINDS,
+    PROMISE_SWEEP_KIND,
 )
 from revora.jobs.ticker import UnscheduledSweepKindError, _bucket_seconds, _selected_kinds
 from revora.platform.config import default_configuration
@@ -42,6 +45,7 @@ EXPECTED_BOUND: dict[str, str] = {
     CALIBRATION_REPORT_KIND: "CALIBRATION_REPORT_INTERVAL",
     CUSTOMER_DATA_RETENTION_KIND: "CUSTOMER_DATA_RETENTION_SWEEP_INTERVAL",
     CASE_REVIEW_KIND: "REVIEW_SWEEP_INTERVAL",
+    PROMISE_SWEEP_KIND: "PROMISE_SWEEP_INTERVAL",
 }
 """Which bound each sweep kind is scheduled on, written out a second time on purpose.
 
@@ -58,8 +62,10 @@ distinguishes them."""
 def test_every_sweep_kind_has_an_expectation_here() -> None:
     """The table above covers ``PERIODIC_SWEEP_KINDS`` exactly.
 
-    Without this, an eighth kind could be added and the parametrized test below would simply
-    not cover it — a test suite that grows quieter as the system grows.
+    Without this, a further kind could be added and the parametrized test below would simply
+    not cover it — a test suite that grows quieter as the system grows. It has already earned
+    its keep once: the promise sweep of R23.C13 was added as the eighth kind and this is the
+    assertion that failed until ``PROMISE_SWEEP_INTERVAL`` was seeded and mapped.
     """
     assert set(EXPECTED_BOUND) == set(PERIODIC_SWEEP_KINDS)
 
@@ -67,7 +73,7 @@ def test_every_sweep_kind_has_an_expectation_here() -> None:
 @pytest.mark.pure
 @pytest.mark.parametrize("kind", PERIODIC_SWEEP_KINDS)
 def test_every_sweep_kind_resolves_to_its_configured_bound_with_no_fallback(kind: str) -> None:
-    """All seven are priced from configuration, and from the *right* bound.
+    """All eight are priced from configuration, and from the *right* bound.
 
     ``> 0`` matters separately from the equality: the resolved number is a divisor in the
     dedupe bucket arithmetic, and a zero would put every tick in one bucket forever — a sweep

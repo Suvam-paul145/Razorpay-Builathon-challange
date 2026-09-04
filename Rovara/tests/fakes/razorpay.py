@@ -24,6 +24,13 @@ the two correctness-critical flags — not the customer contact, even though the
 object carries it. A test fixture is still somewhere a PII habit can form, and the
 recorded arguments are the part of a fake most likely to be printed on a failure.
 
+**The resend has its own outcome set**, and one member of it exists for a reason worth
+naming: ``RATE_LIMITED``. A 429 is the only outcome whose classification differs between the
+create and the resend — for a resend it is definitive rather than unclassifiable — and it is
+also the outcome that spends a customer-message increment for nothing. A fake that could not
+produce one would leave both facts untestable. ``ACK_FALSE`` and ``UNPARSEABLE`` cover the
+other half of the resend's table: a 200 that does not mean what a 200 usually means.
+
 Scripting model, deliberately small: one behaviour object drives everything.
 ``create_outcomes`` is consumed in order and its last entry repeats, so
 ``(TIMEOUT_NO_EFFECT, SUCCESS)`` means "the first attempt times out having done
@@ -46,11 +53,15 @@ from hypothesis import strategies as st
 
 from revora.domain.payment_event import PaymentStatus
 from revora.providers.classification import (
+    RATE_LIMITED,
+    RATE_LIMITED_REASON,
+    RATE_LIMITED_STATUS,
     CallPhase,
     ClientError,
     PaymentEntity,
     PaymentLinkEntity,
     PaymentLinkList,
+    PaymentLinkResendAck,
     PaymentList,
     ProviderResult,
     ResultSource,
@@ -60,7 +71,7 @@ from revora.providers.classification import (
     Unclassifiable,
     refused_for_invalid_request,
 )
-from revora.providers.payment_link import PaymentLinkRequest
+from revora.providers.payment_link import NotifyMedium, PaymentLinkRequest
 from revora.providers.razorpay import (
     MAX_PAYMENT_WINDOW_TS,
     MAX_PAYMENTS_PAGE_SIZE,
@@ -69,6 +80,7 @@ from revora.providers.razorpay import (
     OPERATION_FETCH_PAYMENT,
     OPERATION_FIND_PAYMENT_LINKS,
     OPERATION_LIST_PAYMENTS,
+    OPERATION_NOTIFY_BY,
     PaymentProviderClient,
 )
 
@@ -79,6 +91,7 @@ __all__ = [
     "FakeRazorpay",
     "ProviderBehaviour",
     "RecordedCall",
+    "ResendOutcome",
     "as_provider_client",
     "provider_behaviour",
 ]
@@ -116,6 +129,39 @@ class CreateOutcome(StrEnum):
     UNCLASSIFIABLE = "UNCLASSIFIABLE"
 
 
+@unique
+class ResendOutcome(StrEnum):
+    """What one ``notify_by`` attempt does.
+
+    Named for the *effect* like :class:`CreateOutcome`, with one difference that matters: there
+    is no ``TIMEOUT_MESSAGE_SENT`` / ``TIMEOUT_NOT_SENT`` pair, because for a resend the
+    distinction is not observable by anything — not by the caller, and not by a later read. The
+    fake cannot offer a ground-truth oracle for a resend for the same reason the provider
+    cannot: nothing reports whether a notification was sent. ``TIMEOUT`` is therefore one
+    member, and a test asserting behaviour after it is asserting behaviour under permanent
+    ignorance, which is the real situation.
+    """
+
+    SUCCESS = "SUCCESS"
+    ACK_FALSE = "ACK_FALSE"
+    """200 with ``{"success": false}``. Undocumented surface, so it is unknown, not a no."""
+
+    UNPARSEABLE = "UNPARSEABLE"
+    """200 with a body that is not JSON. A proxy cut the response short."""
+
+    RATE_LIMITED = "RATE_LIMITED"
+    """429 from the provider's gateway. Definitive for a resend, and it still spends a
+    customer-message increment."""
+
+    CLIENT_ERROR = "CLIENT_ERROR"
+    SERVER_ERROR = "SERVER_ERROR"
+    TIMEOUT = "TIMEOUT"
+    """Read timeout after the request was sent. Permanently unresolvable."""
+
+    CONNECT_ERROR = "CONNECT_ERROR"
+    """Nothing left the process, so nothing was sent. The one definitive network failure."""
+
+
 @dataclass(frozen=True, slots=True)
 class RecordedCall:
     """One call the fake received.
@@ -142,6 +188,13 @@ class ProviderBehaviour:
 
     create_outcomes: tuple[CreateOutcome, ...] = (CreateOutcome.SUCCESS,)
     """Consumed in order; the last entry repeats forever. Empty means always succeed."""
+
+    resend_outcomes: tuple[ResendOutcome, ...] = (ResendOutcome.SUCCESS,)
+    """Consumed in order per ``(payment_link_id, medium)``; the last entry repeats.
+
+    Keyed per link and medium rather than globally, because that is what the provider's
+    documented rate limit is per, so a test scripting a 429 for one medium can assert the other
+    is unaffected."""
 
     listing_unavailable_reads: int = 0
     """How many of the first listing reads answer 5xx. Reconciliation must retry these
@@ -215,6 +268,16 @@ class ProviderBehaviour:
         final attempt, because an early empty read cannot be told from lag.
         """
         return cls(create_outcomes=(CreateOutcome.TIMEOUT_NO_EFFECT,))
+
+    @classmethod
+    def resend_rate_limited(cls) -> ProviderBehaviour:
+        """The provider's gateway declines the resend. Definitive; nothing was delivered."""
+        return cls(resend_outcomes=(ResendOutcome.RATE_LIMITED,))
+
+    @classmethod
+    def resend_unverifiable(cls) -> ProviderBehaviour:
+        """The resend times out after sending. Nothing can establish what happened."""
+        return cls(resend_outcomes=(ResendOutcome.TIMEOUT,))
 
     @classmethod
     def listing_lag(cls, empty_reads: int) -> ProviderBehaviour:
@@ -299,7 +362,8 @@ class FakeRazorpay:
     """
 
     __slots__ = ("_behaviour", "_calls", "_create_attempts", "_fetch_attempts", "_links",
-                 "_listing_attempts", "_lock", "_sequence", "_window_attempts")
+                 "_listing_attempts", "_lock", "_notify_attempts", "_payment_amounts",
+                 "_payment_scripts", "_sequence", "_window_attempts")
 
     def __init__(self, behaviour: ProviderBehaviour | None = None) -> None:
         self._behaviour = behaviour if behaviour is not None else ProviderBehaviour()
@@ -309,8 +373,13 @@ class FakeRazorpay:
         self._create_attempts: dict[str, int] = {}
         self._listing_attempts: dict[str, int] = {}
         self._fetch_attempts: dict[str, int] = {}
+        self._notify_attempts: dict[str, int] = {}
         self._window_attempts = 0
         self._links: dict[str, PaymentLinkEntity] = {}
+        # Per-payment overrides. Empty for every existing test, which is why the read path
+        # below falls through to the behaviour object when a payment is not in here.
+        self._payment_amounts: dict[str, int] = {}
+        self._payment_scripts: dict[str, tuple[PaymentStatus, ...]] = {}
 
     # -- the call log ------------------------------------------------------
 
@@ -339,6 +408,17 @@ class FakeRazorpay:
         with self._lock:
             return self._create_attempts.get(reference_id, 0)
 
+    def notify_call_count_for(self, payment_link_id: str, medium: NotifyMedium) -> int:
+        """How many resends were issued against one link on one medium.
+
+        The counterpart to :meth:`create_call_count_for`, and needed for the same kind of
+        assertion in the opposite direction: after an ``UNCERTAIN`` resend the count must stay
+        where it is forever, because nothing — not a sweep, not a restart, not a further
+        decision cycle on the same key — is permitted to send that message again.
+        """
+        with self._lock:
+            return self._notify_attempts.get(_notify_key(payment_link_id, medium), 0)
+
     def created_link_exists(self, reference_id: str) -> bool:
         """Whether the external effect exists on the fake provider side.
 
@@ -355,6 +435,42 @@ class FakeRazorpay:
 
     # -- the three operations ---------------------------------------------
 
+    # -- per-payment scripting ---------------------------------------------
+
+    def script_payment(
+        self,
+        payment_id: str,
+        *,
+        amount: int,
+        statuses: tuple[PaymentStatus, ...],
+    ) -> None:
+        """Pin what ``fetch_payment`` answers for **one** payment id.
+
+        Added for the Demonstration_Loader, which drives a thousand cases through one worker
+        and one provider client. :attr:`ProviderBehaviour.payment_amount` and
+        :attr:`ProviderBehaviour.payment_statuses` are process-wide, and both are wrong for a
+        batch: the amount on an authoritative read has to equal the *case's* ``payment_amount``
+        or the Outcome_Monitor correctly treats the read as a partial capture and declares no
+        recovery, and a batch whose whole point is a mix of terminal states needs some payments
+        to answer captured and others to stay failed.
+
+        The overrides are per id, so scripting one payment says nothing about any other, and a
+        payment nobody scripted still answers from the behaviour object exactly as before —
+        which is what keeps every existing test unchanged.
+
+        Raises:
+            ValueError: on an empty status tuple. An empty script would silently fall back to
+                the behaviour's global sequence, which is the one outcome a caller reaching for
+                this method cannot have meant.
+        """
+        if not statuses:
+            raise ValueError(
+                f"script_payment({payment_id!r}) needs at least one status; an empty tuple "
+                "would silently fall back to the process-wide sequence"
+            )
+        with self._lock:
+            self._payment_amounts[payment_id] = int(amount)
+            self._payment_scripts[payment_id] = statuses
     def create_payment_link(self, request: PaymentLinkRequest) -> ProviderResult[PaymentLinkEntity]:
         """Create a link, or fail in whichever way the script says.
 
@@ -414,6 +530,73 @@ class FakeRazorpay:
             # into a caller that expects one of five results.
             raise AssertionError(f"unhandled create outcome {outcome!r}")
 
+    def notify_by(
+        self, payment_link_id: str, medium: NotifyMedium
+    ) -> ProviderResult[PaymentLinkResendAck]:
+        """Re-notify against an existing link, or fail in whichever way the script says.
+
+        **No link is created on any path, and no oracle is offered.** Both are the provider's
+        behaviour rather than a shortcut: the endpoint re-notifies an existing link, and nothing
+        reports whether a notification went out. A fake exposing ``notification_was_sent`` would
+        let a test assert something the system under test can never observe, and the test would
+        then be checking a fact the production code has no access to.
+
+        The 429 is built here rather than left to a status code, so the fake and the real client
+        agree on the ``ClientError`` a rate limit produces — a fake that returned an
+        ``Unclassifiable`` for it would make the resend's one deviation from the generic table
+        untested against the code that ships.
+        """
+        with self._lock:
+            key = _notify_key(payment_link_id, medium)
+            attempt = self._notify_attempts.get(key, 0) + 1
+            self._notify_attempts[key] = attempt
+            self._record(
+                OPERATION_NOTIFY_BY,
+                {"payment_link_id": payment_link_id, "medium": medium.value},
+            )
+            outcomes = self._behaviour.resend_outcomes or (ResendOutcome.SUCCESS,)
+            outcome = outcomes[min(attempt - 1, len(outcomes) - 1)]
+
+            match outcome:
+                case ResendOutcome.SUCCESS:
+                    return Success(entity=PaymentLinkResendAck(success=True), http_status=200)
+                case ResendOutcome.ACK_FALSE:
+                    return Unclassifiable(
+                        raw='{"success": false}',
+                        detail="success: resend response reports success false",
+                        http_status=200,
+                    )
+                case ResendOutcome.UNPARSEABLE:
+                    return Unclassifiable(
+                        raw=_UNPARSEABLE_BODY,
+                        detail="body is not valid JSON",
+                        http_status=200,
+                    )
+                case ResendOutcome.RATE_LIMITED:
+                    return ClientError(
+                        code=RATE_LIMITED,
+                        reason=RATE_LIMITED_REASON,
+                        source=ResultSource.PROVIDER,
+                        http_status=RATE_LIMITED_STATUS,
+                    )
+                case ResendOutcome.CLIENT_ERROR:
+                    return ClientError(
+                        code="BAD_REQUEST_ERROR",
+                        reason="invalid_request",
+                        source=ResultSource.PROVIDER,
+                        http_status=400,
+                        description="The payment link is not in a notifiable state",
+                    )
+                case ResendOutcome.SERVER_ERROR:
+                    return ServerError(http_status=500, raw='{"error":{"code":"SERVER_ERROR"}}')
+                case ResendOutcome.TIMEOUT:
+                    return Timeout(phase=CallPhase.AFTER_SEND, detail="ReadTimeout")
+                case ResendOutcome.CONNECT_ERROR:
+                    return Timeout(phase=CallPhase.CONNECT, detail="ConnectError", attempts=2)
+            # Unreachable while every member is handled. Present so a new member fails loudly
+            # here instead of returning None into a caller expecting one of five results.
+            raise AssertionError(f"unhandled resend outcome {outcome!r}")
+
     def find_payment_links_by_reference_id(
         self, reference_id: str
     ) -> ProviderResult[PaymentLinkList]:
@@ -459,13 +642,19 @@ class FakeRazorpay:
                 return ServerError(http_status=503, raw='{"error":{"code":"SERVER_ERROR"}}')
 
             index = attempt - self._behaviour.payment_unavailable_reads - 1
-            statuses = self._behaviour.payment_statuses or (PaymentStatus.CAPTURED,)
+            # A per-payment script wins over the process-wide sequence. See
+            # :meth:`script_payment` for why a batch needs one.
+            statuses = (
+                self._payment_scripts.get(payment_id)
+                or self._behaviour.payment_statuses
+                or (PaymentStatus.CAPTURED,)
+            )
             status = statuses[min(index, len(statuses) - 1)]
             return Success(
                 entity=_payment_entity(
                     payment_id,
                     status,
-                    self._behaviour.payment_amount,
+                    self._payment_amounts.get(payment_id, self._behaviour.payment_amount),
                     amount_refunded=self._behaviour.payment_amount_refunded,
                 ),
                 http_status=200,
@@ -548,6 +737,16 @@ class FakeRazorpay:
 
     def __repr__(self) -> str:
         return f"FakeRazorpay(calls={self.call_count}, links={len(self._links)})"
+
+
+def _notify_key(payment_link_id: str, medium: NotifyMedium) -> str:
+    """The attempt-count key: one link, one medium.
+
+    Composed with a character no identifier and no medium contains, so two different pairs
+    cannot collide into one count — a collision here would silently satisfy a "no second
+    message was sent" assertion.
+    """
+    return f"{payment_link_id}|{medium.value}"
 
 
 def _link_entity(request: PaymentLinkRequest) -> PaymentLinkEntity:

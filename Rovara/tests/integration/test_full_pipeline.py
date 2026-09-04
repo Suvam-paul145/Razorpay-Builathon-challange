@@ -28,6 +28,7 @@ that column is ``NOT NULL`` precisely so this cannot be faked.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -405,23 +406,41 @@ def test_the_pipeline_runs_with_no_reasoning_layer_at_all(
     """Task 32.2 and P31, in the form the built system permits.
 
     The design asks for a run with the LLM adapter raising on every call, and for the terminal-state
-    distribution to be identical to a run with it available. **There is no adapter.** Task 14 was
-    dropped, ``revora.reasoning`` is an empty package, and no ``REVORA_LLM_CREDENTIAL`` is
-    configured in this tier.
+    distribution to be identical to a run with it available. **No reasoning layer is active here**:
+    no ``REVORA_LLM_CREDENTIAL`` is configured in this tier, so nothing can be called even now that
+    task 49.2 has landed an adapter.
 
     That makes the claim stronger rather than untestable, and this test asserts the stronger form:
     the two runs are not merely identical, there is only one run possible. Every diagnosis is
-    ``DETERMINISTIC``, no ``ai_invocation`` row exists, and a case reaches a terminal state anyway.
-    A distribution comparison between two runs of the same code would be a tautology; this is the
-    thing the comparison was a proxy for.
-    """
-    import revora.reasoning
+    ``DETERMINISTIC``, no ``ai_invocation`` row exists, no recommendation carries AI prose, and a
+    case reaches a terminal state anyway. A distribution comparison between two runs of the same
+    code would be a tautology; this is the thing the comparison was a proxy for.
 
-    # Nothing to call. Asserted rather than assumed, because a later phase adding an adapter should
-    # have to change this test deliberately and think about what it means.
-    assert not [name for name in dir(revora.reasoning) if not name.startswith("_")], (
-        "revora.reasoning has gained a public surface; the no-LLM claim now needs the two-run "
-        "distribution comparison the design originally specified"
+    **What changed, and what deliberately did not.** This test used to open by asserting that
+    ``revora.reasoning`` had no public surface at all, on the grounds that the package was empty.
+    Task 49.2 made that false by design — which is exactly what the previous version of this
+    docstring said would have to happen — so the false half is dropped and nothing else is. The
+    two-run comparison it pointed at now belongs to Properties 49 and 51, where a run with the
+    credential absent is compared against a run with every response rejected.
+
+    What is kept is the narrower structural claim, in the form
+    ``test_authority_and_disclosure.py::test_the_reasoning_package_re_exports_nothing`` settled on:
+    the package's ``__init__`` re-exports nothing, so every consumer names the submodule it depends
+    on and a grep for the adapter finds every component that can reach a model. Read from the
+    source for the reason that test gives — importing any submodule binds it as an attribute of the
+    package, so ``dir()`` would make the assertion depend on test ordering, and in *this* tier the
+    whole application is imported before the first line runs.
+    """
+    init = Path(__file__).resolve().parents[2] / "revora" / "reasoning" / "__init__.py"
+    reexports = [
+        line
+        for line in init.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert reexports == [], (
+        f"revora/reasoning/__init__.py has gained content {reexports}; a re-export makes the set "
+        "of components that can reach a model unreadable from their imports, and this test's "
+        "claim is that none of them is reaching one on this run"
     )
 
     fake = FakeRazorpay(delayed_capture())

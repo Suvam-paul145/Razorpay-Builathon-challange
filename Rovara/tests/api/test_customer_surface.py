@@ -10,13 +10,19 @@ attacker can reach without a credential, and a reader checking the implementatio
 to see the rows next to each other. A row that had its own test would be a row somebody could
 delete without the shape of the table changing.
 
-**Two rows are deferred and named as deferred**: the 422 for a Promise_Date inside
-``PROMISE_MIN_LEAD_TIME`` (R23.C2) and the 409 for a second promise on one case (R23.C7). Both are
-guarantees about the ``promise_to_pay`` row, which task 44 writes; ``PROMISE_MIN_LEAD_TIME`` is not
-in the configuration catalogue yet, and implementing the check against an unconfigured bound would
-mean inventing the number. What *is* implemented is the degenerate half a schema constraint already
-forces — a Promise_Date at or before the submission instant, refused with 422 and no configured
-bound consulted.
+**The two rows that were deferred are now present**: the 422 for a Promise_Date inside
+``PROMISE_MIN_LEAD_TIME`` (R23.C2) and the 409 for a second promise on one case (R23.C7). Both were
+guarantees about the ``promise_to_pay`` row, which had no writer and no configured bound to check
+against; migration ``0016`` seeded the five bounds R23 needs and ``revora.customer.promises`` is
+the writer, so the rows are asserted below rather than named as pending.
+
+They are asserted as two dedicated tests rather than as two more rows in the parametrized table,
+and the reason is the same for both: neither is a function of the request alone. The lead-time
+refusal depends on a configured interval, so its fixture has to derive a date from the bound rather
+than hard-code one; and the 409 depends on a *prior accepted request*, so its fixture has to make
+one — which is a sequence, and the table is a table of single requests. The 409 is also the one
+refusal on this surface that keeps its write, so what it asserts is the ``customer_signal`` count
+*rising* while the promise stays as it was, which no row of a status-code table could express.
 
 **CORS is asserted on both sides of the boundary.** That the customer surface answers a preflight
 from a permitted origin, refuses a write from an unpermitted one, and never returns
@@ -447,6 +453,535 @@ def test_a_promise_date_at_or_before_the_submission_instant_is_422(
             {"c": str(case_id)},
         )
         == 0
+    )
+
+
+def test_a_promise_inside_the_min_lead_time_is_422_and_persists_nothing(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """R23.C2's configured half, and the deferred row it replaces.
+
+    The date is derived from ``PROMISE_MIN_LEAD_TIME`` rather than hard-coded, so lowering the bound
+    changes what this submits instead of turning the test green for the wrong reason. One second
+    inside the bound, because the bound is inclusive at its boundary and the interesting value is
+    the last one refused.
+
+    **The body names the bound key and nothing else.** R23.C2 asks the rejection to name the
+    lead-time rule; the configured interval is a merchant's operational setting and the submitted
+    date is attacker-supplied on an endpoint reachable without a session, so neither appears.
+
+    Nothing is persisted — no promise, no signal, no submission-count increment — which is what
+    separates this refusal from R23.C7's.
+    """
+    slug, case_id, token = _live_case(installed_engine)
+    too_soon = datetime.now(UTC) + _CONFIG.PROMISE_MIN_LEAD_TIME - timedelta(seconds=1)
+    response = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": too_soon.isoformat()},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "rejected": "PROMISE_BELOW_MIN_LEAD_TIME",
+        "detail": "PROMISE_MIN_LEAD_TIME",
+    }
+    assert (
+        _one(
+            installed_engine,
+            "SELECT count(*) FROM promise_to_pay WHERE case_id = :c",
+            {"c": str(case_id)},
+        )
+        == 0
+    )
+    assert (
+        _one(
+            installed_engine,
+            "SELECT count(*) FROM customer_signal WHERE case_id = :c",
+            {"c": str(case_id)},
+        )
+        == 0
+    )
+
+
+def test_an_accepted_promise_writes_the_row_and_the_projection_shows_it(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """The end-to-end claim of task 44: ``promise_to_pay`` has a writer and ``promise`` is non-null.
+
+    Driven over the real HTTP surface and then read back over the real HTTP surface, in that order,
+    because the two halves of the claim are on opposite sides of the router and neither is
+    observable from below it. Before this test the projection's ``promise`` field was ``null`` in
+    every response the system could produce, because nothing wrote the row it renders.
+
+    Four things are asserted, and each is a different clause:
+
+    * **the row exists**, with ``status = 'RECORDED'`` (R23.C3);
+    * **``follow_up_at`` is strictly inside the snapshot**, which is ``follow_up_within_window``
+      holding on a row that actually landed rather than on a plan that was only computed;
+    * **the window end is unchanged** — read straight off ``recovery_case`` and compared to the
+      snapshot, so P41 is checked against the source and not against the copy (R23.C4);
+    * **a ``PROMISE_RECORDED`` audit record carries the three fields R23.C8 names**, with the
+      ``token_id`` as actor, so the clamp is checkable from the audit trail alone.
+
+    Then the read: ``GET .../case`` returns ``promise`` as an object with the submitted date and
+    ``RECORDED``. Deliberately *not* the Follow_Up_Instant — see
+    :class:`revora.customer.projection.PromiseView` for why a customer is shown the date they gave
+    and where it stands, and not a second deadline they did not name.
+    """
+    slug, case_id, token = _live_case(installed_engine)
+    promised = (datetime.now(UTC) + timedelta(days=2)).replace(microsecond=0)
+
+    response = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": promised.isoformat()},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["recorded"] is True
+
+    with installed_engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT status, promise_date, follow_up_at, window_end_at_snapshot, "
+                "received_representation FROM promise_to_pay WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+        window_end_at = connection.execute(
+            text("SELECT window_end_at FROM recovery_case WHERE id = :c"),
+            {"c": str(case_id)},
+        ).scalar_one()
+        audited = connection.execute(
+            text(
+                "SELECT actor, decision FROM audit_record WHERE case_id = :c "
+                "AND event_type = 'PROMISE_RECORDED'"
+            ),
+            {"c": str(case_id)},
+        ).all()
+
+    status, stored_date, follow_up_at, snapshot, representation = row
+    assert status == "RECORDED"
+    assert stored_date == promised
+    # R23.C1: what arrived, not what it parsed to.
+    assert representation == promised.isoformat()
+    # ``follow_up_within_window``, on a row that landed.
+    assert follow_up_at is not None
+    assert follow_up_at < snapshot
+    assert follow_up_at <= snapshot - _CONFIG.PROMISE_WINDOW_SAFETY_MARGIN
+    # P41 against the source rather than the copy.
+    assert snapshot == window_end_at
+
+    assert len(audited) == 1, "R23.C8 asks for exactly one PROMISE_RECORDED record"
+    actor, decision = audited[0]
+    assert actor.startswith("ctk_") or len(actor) > 0
+    for field in ("promise_date", "follow_up_at", "window_end_at"):
+        assert field in decision, f"R23.C8 names {field} and the record must carry it"
+    assert decision["window_end_at"] == window_end_at.isoformat().replace("+00:00", "+00:00")
+
+    read = customer_client.get(f"/customer/{slug}/case", headers=_headers(token))
+    assert read.status_code == 200, read.text
+    promise = read.json()["promise"]
+    assert promise is not None, (
+        "the projection's promise field is still null after a promise was persisted; before task "
+        "44 it was null in every response the system could produce, and this is the assertion "
+        "that it can now be an object"
+    )
+    assert promise["status"] == "RECORDED"
+    assert promise["promise_date"].startswith(promised.isoformat()[:19])
+
+
+def test_a_second_promise_is_409_and_still_records_the_signal(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """R23.C7, the other deferred row, and the one refusal that keeps its write.
+
+    Two requests, because the clause is about a *second* promise and a single request cannot express
+    it. The first is accepted; the second is 409, and what it asserts is the asymmetry: the
+    ``customer_signal`` count rises to two while ``promise_to_pay`` stays at one and the persisted
+    promise's date, status and Follow_Up_Instant are byte-for-byte what they were.
+
+    The signal is kept because a customer revising a promise is evidence about the case whether or
+    not the system will hold a second one — and the ``PROMISE_ALREADY_RECORDED`` audit record is
+    what makes "the promise was refused and the submission was not" readable afterwards.
+
+    The 409 comes from ``SIGNAL_REJECTION_STATUS``, not from a branch in the router. That is
+    asserted structurally in ``tests/properties/test_promise.py``; here it is asserted as the
+    response a customer actually receives.
+    """
+    slug, case_id, token = _live_case(installed_engine)
+    first_date = (datetime.now(UTC) + timedelta(days=2)).replace(microsecond=0)
+    second_date = (datetime.now(UTC) + timedelta(days=3)).replace(microsecond=0)
+
+    accepted = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": first_date.isoformat()},
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    with installed_engine.connect() as connection:
+        before = connection.execute(
+            text(
+                "SELECT promise_date, status, follow_up_at FROM promise_to_pay WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+
+    refused = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": second_date.isoformat()},
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["rejected"] == "PROMISE_ALREADY_RECORDED"
+
+    with installed_engine.connect() as connection:
+        after = connection.execute(
+            text(
+                "SELECT promise_date, status, follow_up_at FROM promise_to_pay WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+        promises = connection.execute(
+            text("SELECT count(*) FROM promise_to_pay WHERE case_id = :c"),
+            {"c": str(case_id)},
+        ).scalar_one()
+        signals = connection.execute(
+            text(
+                "SELECT count(*) FROM customer_signal WHERE case_id = :c "
+                "AND kind = 'PROMISE_TO_PAY'"
+            ),
+            {"c": str(case_id)},
+        ).scalar_one()
+        already = connection.execute(
+            text(
+                "SELECT count(*) FROM audit_record WHERE case_id = :c "
+                "AND event_type = 'PROMISE_ALREADY_RECORDED'"
+            ),
+            {"c": str(case_id)},
+        ).scalar_one()
+
+    assert after == before, (
+        "the persisted promise moved. R23.C7 leaves the Promise_To_Pay, its Promise_Status and its "
+        "Follow_Up_Instant unchanged"
+    )
+    assert promises == 1
+    assert signals == 2, (
+        "the refused submission was discarded. R23.C7 persists it as a Customer_Signal for "
+        "Recovery_Memory, which is the whole asymmetry of the clause"
+    )
+    assert already == 1
+
+
+def test_a_promise_past_the_window_escalates_and_extends_nothing(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """R23.C5. The promise is accepted, the case is queued for a person, the window does not move.
+
+    Accepted with 201, not refused: the customer said something true about themselves and it is
+    recorded. What is refused is the *scheduling* — ``follow_up_at`` is null, which
+    ``escalated_schedules_nothing`` requires, and a ``promise_escalation`` job is queued rather than
+    a transition applied, because R19.C9 forbids a state transition inside the accepting request.
+
+    **The window end is read back and compared to the snapshot**, which is the assertion P41 exists
+    for. A clamp implementation that "made room" by extending the window would produce exactly this
+    request's happy path and would fail exactly this line.
+
+    The case is still at ``POLICY_CHECK`` afterwards because this test never runs the worker. That
+    is the requirement rather than an artefact: the transition to ``ESCALATED`` with
+    ``PROMISE_BEYOND_RECOVERY_WINDOW`` belongs to ``handle_promise_escalation``.
+    """
+    slug, case_id, token = _live_case(installed_engine)
+    with installed_engine.connect() as connection:
+        window_end_at = connection.execute(
+            text("SELECT window_end_at FROM recovery_case WHERE id = :c"),
+            {"c": str(case_id)},
+        ).scalar_one()
+
+    beyond = window_end_at + timedelta(days=30)
+    response = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": beyond.isoformat()},
+    )
+    assert response.status_code == 201, response.text
+
+    with installed_engine.connect() as connection:
+        status, follow_up_at, snapshot = connection.execute(
+            text(
+                "SELECT status, follow_up_at, window_end_at_snapshot FROM promise_to_pay "
+                "WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+        state, window_after = connection.execute(
+            text("SELECT state, window_end_at FROM recovery_case WHERE id = :c"),
+            {"c": str(case_id)},
+        ).one()
+        jobs = connection.execute(
+            text(
+                "SELECT count(*) FROM job WHERE case_id = :c AND kind = 'promise_escalation' "
+                "AND state = 'PENDING'"
+            ),
+            {"c": str(case_id)},
+        ).scalar_one()
+
+    assert status == "BEYOND_WINDOW_ESCALATED"
+    assert follow_up_at is None, "R23.C5 schedules nothing, and the CHECK makes that structural"
+    assert snapshot == window_end_at
+    assert window_after == window_end_at, (
+        "window_end_at moved. R2.C5 makes it immutable and R23.C4 restates that for every promise "
+        "operation; every termination bound in the system is measured against it, so a promise "
+        "able to move it is a customer able to extend their own recovery window"
+    )
+    assert state == "POLICY_CHECK", (
+        "the case transitioned inside the accepting request. R19.C9 forbids it; the escalation is "
+        "handle_promise_escalation's to apply"
+    )
+    assert jobs == 1, "R19.C9 requires the consequence to be enqueued for the worker"
+
+
+def test_the_queued_escalation_is_applied_and_still_extends_nothing(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """The other half of R23.C5: the worker applies what the request queued.
+
+    Lives beside the request that produced its input rather than in a worker-focused file, because
+    the claim spans both and is only readable as one: R19.C9 requires the accepting request to
+    *queue* the escalation, and R23.C5 requires the case to reach ``ESCALATED`` with
+    ``PROMISE_BEYOND_RECOVERY_WINDOW``. Split across two files, each half looks like an incomplete
+    implementation of the other.
+
+    ``handle_promise_escalation`` is called directly rather than through ``run_once``, on the same
+    argument ``test_contact_suppression.py`` makes for the suppression handler: what is under test
+    is this handler's effect, and draining the queue would also run whatever else the submission
+    enqueued, which would make a failure ambiguous about which handler caused it.
+
+    **The window end is compared before and after the transition**, which is P41's driven form. The
+    escalation is the one operation in the whole promise path that could plausibly be implemented by
+    "making room", and this is the assertion that fails if it ever is.
+
+    The audit record is asserted to carry the unresolved amount as an integer of minor units and the
+    submitted Promise_Date, both of which R23.C5 names explicitly.
+    """
+    from revora.jobs.pipeline import handle_promise_escalation
+
+    slug, case_id, token = _live_case(installed_engine)
+    with installed_engine.connect() as connection:
+        window_end_at, amount = connection.execute(
+            text("SELECT window_end_at, payment_amount FROM recovery_case WHERE id = :c"),
+            {"c": str(case_id)},
+        ).one()
+
+    beyond = (window_end_at + timedelta(days=10)).replace(microsecond=0)
+    accepted = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": beyond.isoformat()},
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    with installed_engine.connect() as connection:
+        merchant_id, promise_id, signal_id = connection.execute(
+            text(
+                "SELECT merchant_id, id, customer_signal_id FROM promise_to_pay "
+                "WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+
+    handle_promise_escalation(
+        merchant_id, case_id, promise_id=promise_id, signal_id=signal_id
+    )
+
+    with installed_engine.connect() as connection:
+        state, terminal_reason, window_after = connection.execute(
+            text(
+                "SELECT state, terminal_reason, window_end_at FROM recovery_case WHERE id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+        escalations = connection.execute(
+            text(
+                "SELECT actor, decision FROM audit_record WHERE case_id = :c "
+                "AND event_type = 'CASE_ESCALATED'"
+            ),
+            {"c": str(case_id)},
+        ).all()
+
+    assert state == "ESCALATED"
+    assert terminal_reason == "PROMISE_BEYOND_RECOVERY_WINDOW"
+    assert window_after == window_end_at, (
+        "the escalation moved window_end_at. R23.C4 leaves it unchanged when a promise is "
+        "persisted, when a follow-up is computed, when a status changes and when a follow-up "
+        "executes — and R2.C12's termination bound is measured against it"
+    )
+    assert len(escalations) == 1
+    actor, decision = escalations[0]
+    assert actor == "promise_to_pay", (
+        "the escalation's actor is shared with the suppression's or the arrangement's; the audit "
+        "log is where the three reasons a customer's words end a case are told apart"
+    )
+    assert decision["unresolved_amount"] == int(amount)
+    assert decision["terminal_reason"] == "PROMISE_BEYOND_RECOVERY_WINDOW"
+    assert decision["promise_date"].startswith(beyond.isoformat()[:19])
+
+
+def test_the_sweep_schedules_a_reached_follow_up_and_voids_a_terminated_one(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """R23.C13 and R23.C12, over the two branches that change a row.
+
+    The clock is moved by passing ``moment`` rather than by waiting or by rewriting a timestamp, so
+    the sweep is asked the question it will be asked in production — "what is due *now*" — with a
+    ``now`` the test chooses. Rewriting ``follow_up_at`` into the past would test a row the writer
+    cannot produce.
+
+    Two branches, in two passes on one promise, because they are ordered in reality: a follow-up
+    becomes due while the case is live, and the promise is voided only once the case has ended other
+    than ``RECOVERED``. Asserting them on one row is what shows the second does not require the
+    first not to have happened.
+
+    The window is deliberately *not* elapsed at the moment of the first pass —
+    ``follow_up_at < window_end_at_snapshot`` guarantees such a moment exists, which is the whole
+    practical value of that ``CHECK``.
+    """
+    from revora.customer.promises import sweep_due_promises
+
+    slug, case_id, token = _live_case(installed_engine)
+    promised = (datetime.now(UTC) + timedelta(days=2)).replace(microsecond=0)
+    accepted = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": promised.isoformat()},
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    with installed_engine.connect() as connection:
+        merchant_id, follow_up_at, snapshot = connection.execute(
+            text(
+                "SELECT merchant_id, follow_up_at, window_end_at_snapshot FROM promise_to_pay "
+                "WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+    assert follow_up_at < snapshot, "follow_up_within_window, on the row that landed"
+
+    # One second past the instant, and still inside the window.
+    due_at = follow_up_at + timedelta(seconds=1)
+    first = sweep_due_promises(merchant_id, moment=due_at)
+    assert first.considered == 1
+    assert first.scheduled == 1
+    assert first.voided == 0
+    assert (
+        _one(
+            installed_engine,
+            "SELECT status FROM promise_to_pay WHERE case_id = :c",
+            {"c": str(case_id)},
+        )
+        == "FOLLOW_UP_SCHEDULED"
+    ), "R24.C2 includes the follow-up in the candidate set from this status"
+
+    # The case ends other than RECOVERED. R23.C12's precondition.
+    with installed_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE recovery_case SET state = 'EXPIRED', "
+                "terminal_reason = 'RECOVERY_WINDOW_ELAPSED' WHERE id = :c"
+            ),
+            {"c": str(case_id)},
+        )
+
+    second = sweep_due_promises(merchant_id, moment=due_at)
+    assert second.considered == 1
+    assert second.voided == 1
+    assert second.scheduled == 0
+    with installed_engine.connect() as connection:
+        status, voided_by = connection.execute(
+            text(
+                "SELECT status, voided_by_terminal_state FROM promise_to_pay WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+    assert status == "VOIDED"
+    assert voided_by == "EXPIRED", (
+        "R23.C12 records the Terminal_State that voided it; without it a voided promise cannot be "
+        "distinguished from one voided for a different ending"
+    )
+
+    # And the row has left the scanned set, which is what keeps the sweep's cost bounded.
+    third = sweep_due_promises(merchant_id, moment=due_at)
+    assert third.considered == 0
+
+
+def test_a_due_follow_up_enqueues_a_cycle_for_a_case_waiting_on_an_outcome(
+    installed_engine: Engine, customer_client: TestClient
+) -> None:
+    """R24.C13, on the state every promise-holding case is actually standing in.
+
+    **The case is ``WAITING_FOR_OUTCOME``, and that is the whole test.** A Customer_Access_Token
+    is minted inside the transition into ``EXECUTING``, so a customer can only submit a promise
+    about a case Revora has already acted on — and such a case has left ``POLICY_CHECK`` behind.
+    The sweep used to enqueue a decision cycle only from ``POLICY_CHECK``, which meant it
+    enqueued one for exactly the cases that cannot hold a promise and none for the cases that
+    do. The consequence was not one unspent action: with no cycle, ``PROMISE_TO_PAY_FOLLOW_UP``
+    was never considered, so no follow-up intent reached ``CONFIRMED``, so ``resolve_missed``
+    could never move a promise to ``MISSED``, so ``apply_missed_disposition`` and the
+    ``WAITING_FOR_OUTCOME -> DECISION_PENDING`` re-entry edge had no reachable caller.
+
+    Three assertions: the promise becomes selectable, exactly one cycle is enqueued, and a
+    second sweep pass over the same due promise enqueues no second one — R30.C9's idempotency,
+    delivered by the job table's partial unique index over ``case_review:{case_id}`` and not by
+    a read-then-write here.
+    """
+    from revora.customer.promises import sweep_due_promises
+
+    slug, case_id, token = _live_case(installed_engine, state="WAITING_FOR_OUTCOME")
+    promised = (datetime.now(UTC) + timedelta(days=2)).replace(microsecond=0)
+    accepted = customer_client.post(
+        f"/customer/{slug}/promise",
+        headers=_headers(token, json=True),
+        json={"promise_date": promised.isoformat()},
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    with installed_engine.connect() as connection:
+        merchant_id, follow_up_at = connection.execute(
+            text(
+                "SELECT merchant_id, follow_up_at FROM promise_to_pay WHERE case_id = :c"
+            ),
+            {"c": str(case_id)},
+        ).one()
+
+    due_at = follow_up_at + timedelta(seconds=1)
+    first = sweep_due_promises(merchant_id, moment=due_at)
+    assert first.scheduled == 1, "the promise did not become selectable under R24.C2"
+    assert first.reviews_enqueued == 1, (
+        "no decision cycle was enqueued for a case waiting on an outcome, so the follow-up "
+        "R24.C13 asks for would never be considered and the promise could never be MISSED"
+    )
+
+    pending = _one(
+        installed_engine,
+        "SELECT count(*) FROM job WHERE case_id = :c AND kind = 'case_review' "
+        "AND state = 'PENDING'",
+        {"c": str(case_id)},
+    )
+    assert pending == 1
+
+    second = sweep_due_promises(merchant_id, moment=due_at)
+    assert second.reviews_enqueued == 0, (
+        "a second cycle was enqueued while the first was still pending; R30.C9 holds through "
+        "one dedupe key irrespective of which trigger produced it"
+    )
+    assert (
+        _one(
+            installed_engine,
+            "SELECT count(*) FROM job WHERE case_id = :c AND kind = 'case_review' "
+            "AND state = 'PENDING'",
+            {"c": str(case_id)},
+        )
+        == 1
     )
 
 

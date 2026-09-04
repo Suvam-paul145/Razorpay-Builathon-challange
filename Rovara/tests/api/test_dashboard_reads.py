@@ -36,6 +36,7 @@ from hashlib import sha256
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import IntegrityError
 
 from revora.api.rendering import DATA_UNAVAILABLE, NOT_YET_RECORDED, PRESENT
 from revora.audit.events import (
@@ -755,6 +756,193 @@ def test_the_retention_sweep_redacts_contact_data_and_records_the_bound_it_appli
     again = sweep_customer_data_retention(tenant.merchant_id, config=config)
     assert again.cases_redacted == 0
     assert len(_audit_events(installed_engine, tenant.merchant_id, CUSTOMER_DATA_REDACTED)) == 1
+
+
+def test_the_retention_sweep_deletes_an_aged_note_and_the_check_holds_afterwards(
+    installed_engine: Engine, client: TestClient, tenant: Tenant
+) -> None:
+    """R29.C10. A redacted note is **gone**, not merely marked — and the schema is what says so.
+
+    The requirement permits "delete or irreversibly mask", and this is the test that pins which one
+    happened. ``customer_signal`` carries ``CHECK (note_redacted_at IS NULL OR delay_reason_note IS
+    NULL)`` from migration ``0008``, so the two halves are asserted separately and the second is the
+    load-bearing one:
+
+    * the note column is ``NULL`` and ``note_redacted_at`` and ``retention_config_version`` are set;
+    * an ``UPDATE`` putting text back beside the redaction instant is **refused by the database**.
+
+    Without the second, "irreversible" would be a property of the sweep rather than of the store,
+    and a later code path that wrote a placeholder alongside the timestamp would satisfy every
+    assertion about the sweep while leaving the text in the table.
+
+    **The note's own clock, not the case's.** Three signals are seeded on a case that is *not*
+    terminal, and their ``submitted_at`` values straddle the cutoff: one well past
+    ``CUSTOMER_DATA_RETENTION``, one just inside it, one with no note at all. Only the first is
+    redacted. That combination is what distinguishes R29.C10 from R17.C11: the contact sweep filters
+    on terminal state and measures the case's ``detected_at``, this one filters on neither and
+    measures the signal's ``submitted_at``. A sweep that reused the case pass's predicate would
+    redact nothing here, and one that reused its clock would redact the recent note too — which is
+    deleting data inside its retention period, a worse failure than keeping it too long because it
+    is unrecoverable.
+
+    **The non-identifying fields survive**, which is the requirement's second clause: the kind, the
+    stated Delay_Reason and the submission instant are what Recovery_Memory segments on (R25.C3) and
+    what the Metrics_Engine counts cohorts by (R25.C11), and a sweep that took them would make every
+    historical Delay_Reason cohort irreproducible.
+    """
+    from revora.cases.retention import sweep_customer_data_retention
+    from revora.persistence.repositories.config import ConfigurationRepository
+    from revora.persistence.repositories.session import tenant_transaction
+
+    case_id = insert_case(installed_engine, tenant.merchant_id, state="POLICY_CHECK")
+    aged_id, recent_id, no_note_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    aged_note = "salary is late <script>alert(1)</script>"
+    recent_note = "bank said try tomorrow"
+    with installed_engine.begin() as connection:
+        for signal_id, offset, reason, note in (
+            (aged_id, "400 days", "SALARY_OR_CASHFLOW_TIMING", aged_note),
+            (recent_id, "2 days", "BANK_OR_CARD_PROBLEM", recent_note),
+            (no_note_id, "400 days", "OTHER", None),
+        ):
+            connection.execute(
+                text(
+                    f"""
+                    INSERT INTO customer_signal (
+                        id, merchant_id, case_id, token_id, kind, delay_reason,
+                        delay_reason_note, note_truncated, provenance, submitted_at, created_at
+                    ) VALUES (
+                        :id, :m, :c, :tok, 'DELAY_REASON', :reason, :note, false, 'REAL',
+                        now() - interval '{offset}', now() - interval '{offset}'
+                    )
+                    """
+                ),
+                {
+                    "id": str(signal_id),
+                    "m": str(tenant.merchant_id),
+                    "c": str(case_id),
+                    "tok": f"rvt_{signal_id.hex[:26]}",
+                    "reason": reason,
+                    "note": note,
+                },
+            )
+
+    # R20.C12 and R29.C11, before the sweep and over the real endpoint: all three signals present,
+    # the note labelled, and the escaped copy carrying no unescaped markup. Asserted here rather
+    # than in a test of its own because this is the one fixture that holds all three signal shapes,
+    # and the *same* document is read again after the sweep — which is what makes the redaction
+    # visible as a change to what a merchant sees rather than only as a change to a column.
+    before_sweep = client.get(f"/cases/{case_id}", headers=tenant.auth).json()
+    presented = {row["signal_id"]: row for row in before_sweep["customer_signals"]}
+    assert len(presented) == 3, (
+        f"the case detail view presents {len(presented)} of 3 signals. R20.C12 says every "
+        "persisted Customer_Signal, and the one most likely to be dropped is the silent one"
+    )
+    aged_view = presented[str(aged_id)]["note"]
+    assert aged_view["label"] == "customer-supplied unverified text", (
+        "the note is presented without R20.C12's mark, so on this screen a stranger's assertion "
+        "reads exactly like a finding Revora reached"
+    )
+    assert aged_view["verified"] is False
+    assert aged_view["text"] == aged_note, "the verbatim text a text-node renderer uses is missing"
+    assert "<script>" not in aged_view["text_escaped"], (
+        "the escaped copy still carries a raw tag, so a surface interpolating it into markup would "
+        "execute part of a note a stranger typed on an unauthenticated endpoint (R29.C11)"
+    )
+    assert presented[str(recent_id)]["hard_stop_label"] is None
+    assert presented[str(no_note_id)]["note"] is None
+
+    with tenant_transaction(tenant.merchant_id) as session:
+        config = ConfigurationRepository(session).load(tenant.merchant_id)
+    report = sweep_customer_data_retention(tenant.merchant_id, config=config)
+
+    assert report.notes_redacted == 1, (
+        f"{report.notes_redacted} notes redacted; exactly one is past CUSTOMER_DATA_RETENTION. "
+        "Two would mean the sweep measured the case's age instead of the note's and deleted data "
+        "inside its retention period; zero would mean it inherited the contact pass's "
+        "terminal-state filter, which no note needs"
+    )
+
+    with installed_engine.begin() as connection:
+        rows = {
+            str(row[0]): row
+            for row in connection.execute(
+                text(
+                    "SELECT id, delay_reason_note, note_redacted_at, retention_config_version, "
+                    "kind, delay_reason, submitted_at FROM customer_signal WHERE case_id = :c"
+                ),
+                {"c": str(case_id)},
+            ).all()
+        }
+
+    aged = rows[str(aged_id)]
+    assert aged[1] is None, "the aged note survived the sweep"
+    assert aged[2] is not None, "note_redacted_at was not set, so the redaction is unrecorded"
+    assert aged[3] == config.version, (
+        "the applied retention configuration version was not recorded. R29.C10's last clause is "
+        "that it is, because the bound is per-merchant configurable and 'we deleted it on time' is "
+        "a claim about which bound was in force"
+    )
+    assert aged[4] == "DELAY_REASON", "the signal kind was destroyed with the note"
+    assert aged[5] == "SALARY_OR_CASHFLOW_TIMING", (
+        "the stated Delay_Reason was destroyed with the note. It is one of six enumerated members, "
+        "it identifies nobody, and Recovery_Memory segments and the Metrics_Engine cohort counts "
+        "are computed from it (R25.C3, R25.C11)"
+    )
+    assert aged[6] is not None, "the submission instant was destroyed with the note"
+
+    recent = rows[str(recent_id)]
+    assert recent[1] == recent_note, (
+        "a note inside its retention period was deleted. That is a worse failure than keeping one "
+        "too long, because it cannot be undone"
+    )
+    assert recent[2] is None and recent[3] is None
+
+    untouched = rows[str(no_note_id)]
+    assert untouched[2] is None, (
+        "a signal that never carried a note was marked redacted. It is not in the partial index "
+        "the scan reads, so reaching it means the scan is not using that index"
+    )
+
+    # The load-bearing half: the CHECK, not the sweep, is what makes the erasure irreversible.
+    with pytest.raises(IntegrityError), installed_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE customer_signal SET delay_reason_note = '[redacted]' WHERE id = :s"
+            ),
+            {"s": str(aged_id)},
+        )
+
+    # The same read again. A redaction is a third state on the wire — not an absence — because
+    # "wrote nothing" and "wrote something we may no longer hold" are different histories, and only
+    # one of them lets a reader conclude the customer stayed silent.
+    after_sweep = client.get(f"/cases/{case_id}", headers=tenant.auth).json()
+    redacted_view = {row["signal_id"]: row for row in after_sweep["customer_signals"]}[
+        str(aged_id)
+    ]
+    assert redacted_view["note"]["status"] == "REDACTED"
+    assert "text" not in redacted_view["note"], (
+        "the redacted note document still carries a text key. The column is NULL, so any text here "
+        "would have to have been invented"
+    )
+    assert redacted_view["retention_config_version"] == config.version
+    assert redacted_view["delay_reason"] == "SALARY_OR_CASHFLOW_TIMING", (
+        "the presented Delay_Reason went with the note. It is what a merchant reads to know why "
+        "the payment was late, and it is retained so the redaction does not erase that too"
+    )
+
+    records = _audit_events(installed_engine, tenant.merchant_id, CUSTOMER_DATA_REDACTED)
+    assert records[-1]["notes_redacted"] == 1
+    assert records[-1]["retention_config_version"] == config.version
+    assert "customer_signal.delay_reason" in records[-1]["retained_fields"]
+
+    # Idempotent for the same reason the contact pass is: the redacted row no longer satisfies
+    # ``delay_reason_note IS NOT NULL``, so it leaves the partial index and the scan's set.
+    again = sweep_customer_data_retention(tenant.merchant_id, config=config)
+    assert again.notes_redacted == 0
+    assert len(_audit_events(installed_engine, tenant.merchant_id, CUSTOMER_DATA_REDACTED)) == 1, (
+        "a second sweep with nothing to do wrote a second CUSTOMER_DATA_REDACTED record, so the "
+        "audit trail's count of redactions is a count of sweeps instead"
+    )
 
 
 # ---------------------------------------------------------------------------

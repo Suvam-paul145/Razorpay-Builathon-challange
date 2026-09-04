@@ -600,6 +600,53 @@ def test_a_delayed_capture_reconciles_a_terminal_case_exactly_once(
     assert fake.call_count == calls
 
 
+@pytest.mark.parametrize(
+    "state", [CaseState.DECISION_PENDING, CaseState.EXECUTING], ids=lambda s: s.value
+)
+def test_a_capture_mid_pipeline_recovers_the_case_rather_than_only_the_money(
+    owner_engine: Engine, factory: sessionmaker[Session], state: CaseState
+) -> None:
+    """A customer can pay while the case is still being worked, and the state must follow.
+
+    The regression this pins. ``RECOVERED`` used to be reachable only from
+    ``WAITING_FOR_OUTCOME`` and from the terminal states, so an authoritative captured read
+    taken while the case sat mid-pipeline wrote ``RECOVERY_RECORDED``, counted the money, and
+    then had its transition refused as illegal — leaving a case that expired hours later while
+    its amount was already in the recovery figure. Measured at 23 cases in 150.
+
+    Two states rather than one, and they fail for different reasons. ``DECISION_PENDING`` is
+    before anything has been sent, so nothing about the case explains the capture — the
+    customer simply paid. ``EXECUTING`` is with a provider request in flight, which is the race
+    ``_settle_action_race`` exists for, and it is the state where the refusal was most likely to
+    be mistaken for a normal outcome of that race.
+
+    The absence of ``DELAYED_RECOVERY_RECONCILED`` is asserted, not incidental: this is not a
+    delayed reconciliation of an ended case, and recording it as one would tell a merchant the
+    case had finished and been corrected when it never finished at all.
+    """
+    merchant_id, case_id, _ = _seed_case(owner_engine, state=state)
+    fake = FakeRazorpay(ProviderBehaviour.payment_status(PaymentStatus.CAPTURED))
+
+    assessment = observe_payment_outcome(
+        merchant_id, case_id, provider=fake, factory=factory
+    )
+
+    assert assessment.verdict is OutcomeVerdict.RECOVERED, assessment.verdict.value
+    assert assessment.superseded_state is None
+    assert _case_state(owner_engine, case_id) == CaseState.RECOVERED.value, (
+        f"a verified capture on a case at {state.value} recorded the money but left the case "
+        "out of RECOVERED; the recovery figure and the case list now disagree"
+    )
+    events = _event_types(owner_engine, case_id)
+    assert "RECOVERY_RECORDED" in events
+    assert "DELAYED_RECOVERY_RECONCILED" not in events, (
+        "a case that had not ended was reconciled as a delayed recovery"
+    )
+    row = _outcome_row(owner_engine, case_id)
+    assert row is not None
+    assert row["reconciled_from_terminal_state"] is None
+
+
 def test_the_persisted_read_never_contains_contact_or_email(
     owner_engine: Engine, factory: sessionmaker[Session]
 ) -> None:

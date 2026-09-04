@@ -28,6 +28,7 @@ import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Final
 
 import pytest
 from sqlalchemy import Engine
@@ -192,28 +193,46 @@ def test_a_missing_credential_raises_rather_than_defaulting(
             pytest.fail(f"{label} resolved to a default with nothing configured")
 
 
+_PERMITTED_LLM_CREDENTIAL_CALLERS: Final[frozenset[str]] = frozenset(
+    {"revora/reasoning/adapter.py"}
+)
+"""The only file permitted to resolve the reasoning credential.
+
+This assertion used to be ``== []``, and the change is the record of task 49.2 landing rather
+than a relaxation. The claim it protects has not moved: **one** component may ask for this
+credential, it asks at call time and holds nothing, and its absence is a classified outcome
+rather than an exception. A second entry appearing here would mean some other component had
+grown a reason to reach a model directly, which is the thing the reasoning containment
+contract exists to prevent — and that contract cannot see a credential lookup."""
+
+
 @pytest.mark.pure
-def test_the_llm_credential_is_absent_and_nothing_needs_it(
+def test_only_the_reasoning_adapter_consults_the_llm_credential(
     restore_secret_store: None,
 ) -> None:
-    """This build has no reasoning layer, so this credential must be unnecessary.
+    """Absence is a degradation, and exactly one component may notice it.
 
-    Asserted rather than assumed. A deployment checklist that listed an LLM key would imply the
-    system degrades without one; it does not degrade, because there is nothing to degrade — and the
-    accessor still exists, so the only way to state that is to show it raises and that no code
-    path consults it.
+    Two halves, and both matter. The accessor still raises with nothing configured, so a
+    deployment without an LLM key does not send an unauthenticated request — it takes the
+    deterministic path, which is why this credential is absent from the integration tier's
+    fixture on purpose. And the set of callers is pinned, because a component resolving this
+    credential for itself would be reaching a model outside the adapter's four gates: no
+    prompt contract, no output schema, no invocation row.
     """
     store = SecretStore(_EmptyResolver())
     with pytest.raises(CredentialUnavailableError):
         store.llm_credential()
 
-    callers = [
-        str(path.relative_to(_REPO))
+    callers = {
+        path.relative_to(_REPO).as_posix()
         for path in (_REPO / "revora").rglob("*.py")
         if "llm_credential()" in path.read_text(encoding="utf-8")
         and path.name != "secrets.py"
-    ]
-    assert callers == [], f"something consults the LLM credential: {callers}"
+    }
+    unexpected = sorted(callers - _PERMITTED_LLM_CREDENTIAL_CALLERS)
+    assert unexpected == [], (
+        f"something outside the adapter consults the LLM credential: {unexpected}"
+    )
 
 
 # ---------------------------------------------------------------------------

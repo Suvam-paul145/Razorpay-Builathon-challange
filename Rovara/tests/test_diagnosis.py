@@ -60,7 +60,13 @@ from revora.domain.failure_taxonomy import (
     classify_failure,
     match_evidence,
 )
-from revora.platform.config import default_configuration
+from revora.platform.config import (
+    CATALOGUE,
+    CONFIDENCE_ORDERINGS,
+    Configuration,
+    ConfigurationError,
+    default_configuration,
+)
 
 pytestmark = pytest.mark.pure
 
@@ -487,6 +493,76 @@ def test_the_configured_stated_confidence_sits_between_the_floor_and_the_reserve
     assert configured == STATED_CONFIDENCE
     assert configured >= default_configuration().DIAGNOSIS_CONFIDENCE_FLOOR
     assert configured < DETERMINISTIC_CONFIDENCE
+
+
+def test_a_configuration_below_the_floor_refuses_to_load() -> None:
+    """R20.C7's active half: the ordering is *rejected*, not merely documented.
+
+    The test above asserts that today's catalogue satisfies the ordering, and the one before it
+    asserts what happens if a deployment violates it anyway. Neither is the requirement. R20.C7
+    says the system SHALL *reject* a configuration change that puts
+    ``CUSTOMER_STATED_CAUSE_CONFIDENCE`` below ``DIAGNOSIS_CONFIDENCE_FLOOR``, and this is that
+    rejection: a set of ``app_config`` values in that state does not produce a degraded
+    ``Configuration``, it produces a ``ConfigurationError``.
+
+    **Why refusing to load is the right answer rather than clamping or warning.** The violation is
+    invisible in operation. Every request still succeeds, every diagnosis is still recorded, and
+    every stated cause quietly becomes ``UNKNOWN`` with ``CONFIDENCE_BELOW_FLOOR`` in its evidence
+    — a field nobody reads until they ask why the customer's answer changed nothing, which is
+    months later. A bound that silently disables the feature it configures is worse than a bound
+    that refuses to load.
+
+    Both boundary values are checked, because the requirement is "at or above" and equality is the
+    case a ``>`` would get wrong: exactly at the floor must load.
+    """
+    baseline = default_configuration()
+    raw = dict(baseline.as_raw())
+
+    at_the_floor = {**raw, "CUSTOMER_STATED_CAUSE_CONFIDENCE": str(FLOOR)}
+    equal = Configuration.from_values(at_the_floor, version="test-at-floor")
+    assert equal.CUSTOMER_STATED_CAUSE_CONFIDENCE == FLOOR, (
+        "a stated confidence exactly at the floor must load. R20.C7 says at or above, and a "
+        "validator using > rather than >= would refuse the one configuration the requirement "
+        "explicitly permits"
+    )
+
+    below = {**raw, "CUSTOMER_STATED_CAUSE_CONFIDENCE": "0.500"}
+    with pytest.raises(ConfigurationError) as raised:
+        Configuration.from_values(below, version="test-below-floor")
+    message = str(raised.value)
+    assert "CUSTOMER_STATED_CAUSE_CONFIDENCE" in message
+    assert "DIAGNOSIS_CONFIDENCE_FLOOR" in message
+    assert "inert" in message, (
+        "the refusal names the two bounds but not the consequence. An operator reading this has "
+        "to decide whether to raise the confidence or lower the floor, and the consequence is "
+        "what tells them which"
+    )
+
+
+def test_the_confidence_ordering_is_declared_rather_than_hard_coded() -> None:
+    """The validator reads a declared table, so a second ordering is a row and not new code.
+
+    Asserted because the alternative shape — an ``if`` inside ``from_values`` — is the one that
+    accumulates a second and a third comparison with no shared place to explain any of them. The
+    ``because`` text is what the raised message carries, so it is asserted non-empty here rather
+    than left to be discovered as an empty string in a production error.
+    """
+    assert CONFIDENCE_ORDERINGS, "the ordering table is empty, so nothing is enforced"
+    for ordering in CONFIDENCE_ORDERINGS:
+        assert ordering.at_or_above in CATALOGUE, (
+            f"{ordering.at_or_above} is not a configuration bound, so the validator compares "
+            "something that will never be present and the ordering silently stops being enforced"
+        )
+        assert ordering.floor in CATALOGUE
+        assert ordering.because.strip(), (
+            f"the {ordering.at_or_above} ordering carries no reason. It is copied into the raised "
+            "message, and a refusal that states only the comparison is a refusal nobody can act on"
+        )
+    assert any(
+        ordering.at_or_above == "CUSTOMER_STATED_CAUSE_CONFIDENCE"
+        and ordering.floor == "DIAGNOSIS_CONFIDENCE_FLOOR"
+        for ordering in CONFIDENCE_ORDERINGS
+    ), "R20.C7's ordering is not declared, so nothing enforces it"
 
 
 def test_a_refinement_cannot_switch_off_the_fraud_gate() -> None:
