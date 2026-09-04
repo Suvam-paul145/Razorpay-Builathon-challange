@@ -24,6 +24,17 @@ Two mechanisms enforce this rather than one, and they are independent:
   too. Whether they reject it is unverified (spike 3 exists to find out) and nothing here
   depends on the answer — it is a second lock on a door that is already locked.
 
+**Two effect kinds, and only one of them is re-readable.** ``effect_kind`` on the intent
+row says which external effect an attempt was for, and it is not bookkeeping. A link
+creation returns a ``plink_…`` id and the object can be fetched back by ``reference_id``,
+which is how reconciliation establishes after a crash whether the effect exists. A resend
+returns a success boolean and nothing else, and no endpoint reports whether a notification
+was sent — so an ``UNCERTAIN`` resend is *permanently* unresolvable rather than slow to
+resolve. ``ix_execution_intent_unresolved`` carries ``effect_kind = 'PAYMENT_LINK_CREATE'``
+in its predicate and the sweeper's candidate query carries the same clause, so a resend row
+is not skipped by the sweep — it is absent from the set the sweep reads. See
+:func:`record_resend_result` here and :mod:`revora.execution.resend` for the disposition.
+
 Nothing in this module makes a provider call. It decides whether one is permitted and
 records the answer; the engine makes the call, outside any lock.
 """
@@ -37,7 +48,7 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING
 
 from revora.domain.actions import CandidateAction
-from revora.domain.enums import IntentState
+from revora.domain.enums import ExecutionEffectKind, IntentState
 from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.platform.clock import now
 from revora.providers.classification import (
@@ -55,7 +66,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.orm import Session
 
     from revora.persistence.models import ExecutionIntent
-    from revora.providers.classification import PaymentLinkEntity
+    from revora.providers.classification import PaymentLinkEntity, PaymentLinkResendAck
 
 __all__ = [
     "RESOLVED_STATES",
@@ -64,6 +75,7 @@ __all__ = [
     "ReservedIntent",
     "classify_into_intent_state",
     "existing_intent_disposition",
+    "record_resend_result",
     "record_result",
     "reserve_intent",
     "resolve_from_listing",
@@ -150,6 +162,7 @@ def reserve_intent(
     idempotency_key: str,
     action: CandidateAction,
     attempt_ordinal: int,
+    effect_kind: ExecutionEffectKind = ExecutionEffectKind.PAYMENT_LINK_CREATE,
     moment: datetime | None = None,
 ) -> ReservedIntent:
     """Insert the ``ATTEMPTED`` intent. The caller commits it before calling out.
@@ -163,6 +176,19 @@ def reserve_intent(
     an unresolved state. ``counter_applied`` starts false and is flipped by whichever path
     applies the counters, so a reconciliation that runs after a partial crash cannot count
     the same attempt twice.
+
+    ``effect_kind`` is written explicitly rather than left to the column's server default,
+    even though the default is the correct value for a link creation. The default exists to
+    have made every pre-``0008`` row right; relying on it for new rows would mean the resend
+    path is correct only because it remembers to override, and the reconciliation sweep reads
+    its whole candidate set through this column's value. Passing it always is one line and
+    removes the question.
+
+    Args:
+        effect_kind: which external effect this attempt is for. ``PAYMENT_LINK_RESEND``
+            keeps the row out of ``ix_execution_intent_unresolved``'s predicate, and
+            therefore out of the reconciliation sweep entirely — correct, because a resend
+            has no provider object to read.
     """
     intent_id = ExecutionIntentRepository(session).reserve(
         merchant_id,
@@ -174,6 +200,7 @@ def reserve_intent(
             "attempt_ordinal": attempt_ordinal,
             "state": IntentState.ATTEMPTED.value,
             "attempt_started_at": moment or now(),
+            "effect_kind": effect_kind.value,
         },
     )
     return ReservedIntent(
@@ -183,7 +210,7 @@ def reserve_intent(
     )
 
 
-def classify_into_intent_state(result: ProviderResult[PaymentLinkEntity]) -> IntentState:
+def classify_into_intent_state(result: ProviderResult[object]) -> IntentState:
     """Map a provider result onto the state that describes it honestly.
 
     Branches on :func:`effect_certainty`, not on the result variant, and the difference
@@ -195,6 +222,14 @@ def classify_into_intent_state(result: ProviderResult[PaymentLinkEntity]) -> Int
     ``ClientError`` is the only failure that becomes ``FAILED`` here, because a parsed 4xx
     is the provider stating it did not act. Everything uncertain becomes ``UNCERTAIN``,
     which halts external calls for the case until a read resolves it.
+
+    **Entity-agnostic, and that is the whole of the resend's state mapping.** The parameter is
+    ``ProviderResult[object]`` because this function reads certainty and never the entity, so
+    the resend's table needs no second copy of it: a rate-limited resend arrives here as a
+    ``ClientError`` and becomes ``FAILED``, an unparseable acknowledgement arrives as
+    ``Unclassifiable`` and becomes ``UNCERTAIN``. What differs for a resend is not the mapping
+    but what ``UNCERTAIN`` *means* — for a create it means "reconciliation owns it", for a
+    resend it means "no read can answer, escalate once and stop" (:mod:`revora.execution.resend`).
     """
     certainty = effect_certainty(result)
     if certainty is EffectCertainty.EXISTS:
@@ -243,6 +278,67 @@ def record_result(
     intent.state = state.value
     # The `resolved_at_iff_resolved` check is an equality of booleans, so this has to be
     # set for exactly the resolved states and left null otherwise.
+    intent.resolved_at = when if state in RESOLVED_STATES else None
+    return state
+
+
+def record_resend_result(
+    intent: ExecutionIntent,
+    result: ProviderResult[PaymentLinkResendAck],
+    *,
+    provider_response_id: str,
+    provider_short_url: str | None = None,
+    moment: datetime | None = None,
+) -> IntentState:
+    """Write a resend's outcome onto the intent row. Returns the state it settled in.
+
+    The same shape as :func:`record_result` and deliberately a separate function, because the
+    two differ in the one place a shared one would have to branch: **where the identifier comes
+    from.** A create's ``provider_response_id`` is read off the entity the provider returned. A
+    resend's cannot be, because the response carries no identifier at all — so the caller
+    supplies the Revora-composed token from
+    :func:`revora.providers.payment_link.resend_response_id`, and it is written on **every**
+    outcome, not only on success.
+
+    Writing it on failure too is deliberate. For a create, a null ``provider_response_id`` means
+    "no effect was confirmed"; for a resend the column can never hold a provider value, so
+    leaving it null would make a resend row unreadable — a person looking at it could not tell
+    which link the attempt was against or which medium it used. The token is derived from the
+    request, not the response, so it is equally true whatever the provider said.
+
+    ``provider_short_url`` is the link's existing URL, unchanged by a resend. Passed through so
+    the dashboard shows the same link it showed before; a resend does not mint a new one and
+    must not appear to.
+
+    Idempotent by refusal, exactly as :func:`record_result` is: a resolved intent keeps the
+    state it has. For a resend that guard is doing more work than for a create, because the
+    resend's ``UNCERTAIN`` is terminal — a later pass overwriting it would re-open a case that
+    was escalated to a person precisely because nothing can establish what happened.
+    """
+    current = IntentState(intent.state)
+    if current in RESOLVED_STATES:
+        return current
+
+    state = classify_into_intent_state(result)
+    when = moment or now()
+
+    intent.provider_response_id = provider_response_id
+    if provider_short_url is not None:
+        # A payment link URL is a bearer capability. Stored because the dashboard shows it,
+        # never written to a log line or an audit field — and this is the link that already
+        # existed, since a resend creates none.
+        intent.provider_short_url = provider_short_url
+
+    if isinstance(result, ClientError):
+        intent.provider_failure_code = result.code
+    elif isinstance(result, ServerError):
+        intent.provider_failure_code = f"HTTP_{result.http_status}"
+    elif isinstance(result, Timeout):
+        intent.provider_failure_code = f"TIMEOUT_{result.phase.value}"
+    elif isinstance(result, Unclassifiable):
+        intent.provider_failure_code = "UNCLASSIFIABLE"
+
+    intent.state = state.value
     intent.resolved_at = when if state in RESOLVED_STATES else None
     return state
 

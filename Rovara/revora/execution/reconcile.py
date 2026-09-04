@@ -42,20 +42,17 @@ from datetime import datetime
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING
 
-from revora.audit.events import (
-    EXECUTION_INTENT_PROMOTED,
-    EXECUTION_RESULT_UNVERIFIABLE,
-)
+from revora.audit.events import EXECUTION_INTENT_PROMOTED
 from revora.audit.writer import AuditEntry, AuditWriter
 from revora.cases.manager import apply_locked_transition
 from revora.domain.actions import CandidateAction
-from revora.domain.enums import CaseState, IntentState, TerminalReason
+from revora.domain.enums import CaseState, IntentState
+from revora.execution.escalation import escalate_unverifiable
 from revora.execution.intents import (
     RESOLVED_STATES,
     resolve_from_listing,
     stale_attempted_cutoff,
 )
-from revora.memory.store import observation_writer
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.persistence.repositories.session import (
@@ -379,46 +376,27 @@ def _escalate(
 ) -> None:
     """Hand an unverifiable intent to a human. No further external call, ever.
 
-    The intent is deliberately left ``UNCERTAIN`` rather than forced to ``FAILED``. Marking
-    it failed would be a claim we cannot support, and would make the case eligible for
-    another attempt — which is precisely what must not happen when a payment link may be
-    live and unaccounted for.
+    The disposition lives in :func:`revora.execution.escalation.escalate_unverifiable`, shared
+    with the resend path — which reaches the same conclusion for a different reason and with a
+    bound of zero attempts instead of six. What is local to reconciliation is only the
+    *evidence*: the reads ran out. The intent is deliberately left ``UNCERTAIN`` rather than
+    forced to ``FAILED``, because ``FAILED`` licenses another attempt under a new key and a
+    payment link may be live and unaccounted for.
     """
-    writer.write_for_case(
+    escalate_unverifiable(
+        session,
         merchant_id,
-        case.id,
-        AuditEntry(
-            event_type=EXECUTION_RESULT_UNVERIFIABLE,
-            actor=_ACTOR,
-            action=str(intent.action),
-            idempotency_key=idempotency_key,
-            decision={
-                "detail": "reconciliation attempts exhausted without establishing the effect",
-                "attempts": int(intent.reconciliation_attempts),
-            },
-        ),
+        case,
+        action=CandidateAction(intent.action),
+        idempotency_key=idempotency_key,
+        detail="reconciliation attempts exhausted without establishing the effect",
+        attempts=int(intent.reconciliation_attempts),
+        actor=_ACTOR,
+        config=config,
         correlation_id=correlation_id,
-        occurred_at=moment,
+        moment=moment,
+        writer=writer,
     )
-
-    if CaseState(case.state) not in {CaseState.ESCALATED}:
-        apply_locked_transition(
-            session,
-            merchant_id,
-            case,
-            expected_version=int(case.version),
-            target_state=CaseState.ESCALATED,
-            reason="execution result unverifiable",
-            actor=_ACTOR,
-            action=CandidateAction(intent.action),
-            terminal_reason=TerminalReason.EXECUTION_RESULT_UNVERIFIABLE,
-            correlation_id=correlation_id,
-            # The observation is written in this transaction, not a follow-on job. A case that
-            # ends without one never gets a second chance — nothing revisits a terminal case.
-            on_success=observation_writer(config, correlation_id=correlation_id),
-            disclosure_length=config.MASK_DISCLOSURE_LENGTH,
-            max_field_length=config.MAX_AUDIT_FIELD_LENGTH,
-        )
 
 
 def promote_stale_intents(

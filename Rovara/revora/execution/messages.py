@@ -96,6 +96,20 @@ sent."""
 
 _BY_ACTION: Final[dict[CandidateAction, MessageTemplate]] = {
     CandidateAction.PAYMENT_LINK: PAYMENT_LINK_NEUTRAL,
+    # Also the same approved sentence, and for a narrower reason than the two below it. A
+    # `PROMISE_TO_PAY_FOLLOW_UP` normally authors *nothing*: it re-notifies the link the case
+    # already has, Razorpay composes that message, and the execution records
+    # `PROVIDER_HOSTED_LINK_NOTIFICATION` to say so. This entry is for the other branch —
+    # R24.C11's fallback, where no live link exists and the follow-up has to create one. That
+    # creation is a payment link with notification enabled, which is exactly what `PAYMENT_LINK`
+    # is, so the customer reads the identical words and no new copy was written for it.
+    #
+    # A follow-up-flavoured sentence was considered and rejected. "As promised, here is your
+    # payment link" would be new customer-visible copy that states back to a customer what they
+    # said, and it would be wrong on the one path that matters: the fallback fires precisely when
+    # the original link is gone, so a reader of the case cannot be sure the promise and the link
+    # were ever connected in the customer's mind. The neutral sentence is true in both cases.
+    CandidateAction.PROMISE_TO_PAY_FOLLOW_UP: PAYMENT_LINK_NEUTRAL,
     # The same approved sentence, and deliberately not a second one. `CUSTOMER_MESSAGE` *is* a
     # payment link with the provider's notification enabled — there is no separate messaging
     # vendor and no separate content — so the customer reads the identical words either way and

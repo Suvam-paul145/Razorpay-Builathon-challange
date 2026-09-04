@@ -70,11 +70,13 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter, is_case_blocked
 from revora.cases.manager import apply_locked_transition
+from revora.customer.promises import mark_follow_up_scheduled
 from revora.customer.tokens import TokenService
 from revora.domain.actions import CandidateAction, is_customer_visible
 from revora.domain.enums import (
     SUPPRESSED_BY_CONTROL_ARM,
     CaseState,
+    ExecutionEffectKind,
     ExperimentGroup,
     IntentState,
     PolicyVerdict,
@@ -89,6 +91,7 @@ from revora.execution.intents import (
     reserve_intent,
 )
 from revora.execution.messages import description_for
+from revora.execution.resend import ResendTarget, settle_resend_result
 from revora.persistence.models import Merchant
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.execution import ExecutionIntentRepository
@@ -103,9 +106,11 @@ from revora.platform.clock import now
 from revora.platform.config import default_configuration
 from revora.platform.logging import get_logger
 from revora.providers.payment_link import (
+    NotifyMedium,
     PaymentLinkRequest,
     PaymentLinkRequestError,
     build_payment_link_request,
+    is_resend_response_id,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -113,7 +118,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from revora.persistence.models import PolicyDecision, RecoveryCase
     from revora.platform.config import Configuration
-    from revora.providers.classification import PaymentLinkEntity, ProviderResult
+    from revora.providers.classification import (
+        PaymentLinkEntity,
+        PaymentLinkResendAck,
+        ProviderResult,
+    )
     from revora.providers.razorpay import PaymentProviderClient
 
 __all__ = [
@@ -292,6 +301,30 @@ def execute_approved_action(
 
     # tx-A has committed. A durable ATTEMPTED intent exists and the lock is gone. From
     # here, a crash is recoverable by reading — never by calling again.
+    #
+    # Exactly one of the two branches below issues exactly one request, and which one was
+    # decided under the lock and written down as ``effect_kind`` on the committed intent. So the
+    # question "what did this key do" is answerable from the row rather than from re-deriving the
+    # branch, which matters because for a resend the row is the *only* thing that will ever
+    # answer it. Neither branch is wrapped in anything that could run it twice: there is no
+    # retry decorator anywhere in this module and the two exception types that would tempt one
+    # (``AmbiguousExternalError``, ``TransientInfraError``) are deliberately separate so a
+    # decorator cannot be attached to both.
+    if reservation.resend is not None:
+        resend_result = provider.notify_by(
+            reservation.resend.payment_link_id, reservation.resend.medium
+        )
+        return _record_resend_under_lock(
+            merchant_id,
+            case_id,
+            idempotency_key=reservation.idempotency_key,
+            result=resend_result,
+            target=reservation.resend,
+            factory=factory,
+            config=configuration,
+            correlation_id=correlation_id,
+        )
+
     assert reservation.request is not None
     result = provider.create_payment_link(reservation.request)
 
@@ -313,11 +346,22 @@ def execute_approved_action(
 
 @dataclass(frozen=True, slots=True)
 class _Reservation:
-    """Either a finished attempt (no call permitted) or a request to issue."""
+    """Either a finished attempt (no call permitted) or one call to issue.
+
+    ``request`` and ``resend`` are mutually exclusive and at most one is ever set. Two fields
+    rather than a union because the two calls take different arguments and settle through
+    different code, and because a caller reading ``resend is not None`` is asking the question
+    that decides everything downstream: whether this key's effect is re-readable afterwards.
+    """
 
     attempt: ExecutionAttempt | None
     idempotency_key: str
     request: PaymentLinkRequest | None = None
+    resend: ResendTarget | None = None
+    """Set only for a ``PROMISE_TO_PAY_FOLLOW_UP`` against a case that already holds a live
+    payment link. ``None`` for every other action, and for a follow-up on a case with no live
+    link — which falls back to creating one under R24.C11 and is therefore an ordinary
+    ``request``, reconcilable like any other create."""
 
 
 def _reserve_under_lock(
@@ -488,6 +532,26 @@ def _reserve_under_lock(
             )
 
         attempt_ordinal = int(case.executed_action_count) + 1
+
+        # Which external effect this key is for, decided under the lock and committed on the
+        # intent row before anything leaves the process. R24.C10 and R24.C11 are the two branches:
+        # a case holding a live payment link gets that link re-notified and **no second link**; a
+        # case holding none has one created, and that creation *is* the effect of this key. Only
+        # the second is reconcilable, which is why the choice is persisted rather than recomputed
+        # in tx-B — a resend row is absent from the reconciliation sweep's set by virtue of this
+        # column, and a column written from a re-derivation could disagree with the call that
+        # actually went out.
+        resend_target = (
+            _live_link_target(session, merchant_id, case_id)
+            if action is CandidateAction.PROMISE_TO_PAY_FOLLOW_UP
+            else None
+        )
+        effect_kind = (
+            ExecutionEffectKind.PAYMENT_LINK_RESEND
+            if resend_target is not None
+            else ExecutionEffectKind.PAYMENT_LINK_CREATE
+        )
+
         reserved = reserve_intent(
             session,
             merchant_id,
@@ -496,6 +560,7 @@ def _reserve_under_lock(
             idempotency_key=key,
             action=action,
             attempt_ordinal=attempt_ordinal,
+            effect_kind=effect_kind,
             moment=moment,
         )
         if not reserved.may_call:
@@ -537,52 +602,64 @@ def _reserve_under_lock(
         # Contact and copy, both resolved before the intent is relied upon. A failure in
         # either is a refusal in a window where nothing has been sent — which is why they
         # are built here rather than after the commit.
-        resolution = resolve_customer_contact(session, merchant_id, case)
-        if not resolution.resolved or resolution.contact is None:
-            session.rollback()
-            return _refused(
-                case_id,
-                ExecutionOutcome.CONTACT_UNAVAILABLE,
-                key=key,
-                detail=resolution.reason,
-            )
+        #
+        # **All three are skipped for a resend, and skipping them is the point rather than an
+        # optimization.** A resend composes nothing: the provider re-notifies the link it already
+        # holds, against the contact that link was created with, using wording the provider
+        # authored — which is exactly what R24.C17 makes the execution record say. There is no
+        # request to validate, no description to approve, and no contact to decrypt. Refusing a
+        # follow-up because Revora could not decrypt a contact it never sends would be a refusal
+        # with no cause, and it would cost the customer the nudge they asked for; worse, it would
+        # decrypt PII on a path that has no use for it, which is the one thing
+        # ``revora.execution.contact``'s whole docstring is arranged against.
+        request: PaymentLinkRequest | None = None
+        if resend_target is None:
+            resolution = resolve_customer_contact(session, merchant_id, case)
+            if not resolution.resolved or resolution.contact is None:
+                session.rollback()
+                return _refused(
+                    case_id,
+                    ExecutionOutcome.CONTACT_UNAVAILABLE,
+                    key=key,
+                    detail=resolution.reason,
+                )
 
-        merchant_name = _merchant_name(session, merchant_id)
-        description = description_for(action, merchant_name=merchant_name)
-        if description is None:
-            session.rollback()
-            return _refused(
-                case_id,
-                ExecutionOutcome.NO_APPROVED_MESSAGE,
-                key=key,
-                detail=f"no approved template for {action.value}",
-            )
+            merchant_name = _merchant_name(session, merchant_id)
+            description = description_for(action, merchant_name=merchant_name)
+            if description is None:
+                session.rollback()
+                return _refused(
+                    case_id,
+                    ExecutionOutcome.NO_APPROVED_MESSAGE,
+                    key=key,
+                    detail=f"no approved template for {action.value}",
+                )
 
-        try:
-            request = build_payment_link_request(
-                case_id=case_id,
-                action=action,
-                attempt_ordinal=attempt_ordinal,
-                amount=Minor(int(case.payment_amount)),
-                currency=str(case.currency),
-                description=description,
-                customer=resolution.contact,
-                window_end=case.window_end_at,
-                now=moment,
-                max_message_length=config.MAX_MESSAGE_LENGTH,
-            )
-        except PaymentLinkRequestError as exc:
-            # A request that cannot be built correctly is not sent at all. Rolling back
-            # discards the reserved intent, which is right: no call happened.
-            session.rollback()
-            _logger.warning(
-                "payment link request rejected before send",
-                case_id=str(case_id),
-                rule=exc.rule,
-            )
-            return _refused(
-                case_id, ExecutionOutcome.REQUEST_INVALID, key=key, detail=exc.rule
-            )
+            try:
+                request = build_payment_link_request(
+                    case_id=case_id,
+                    action=action,
+                    attempt_ordinal=attempt_ordinal,
+                    amount=Minor(int(case.payment_amount)),
+                    currency=str(case.currency),
+                    description=description,
+                    customer=resolution.contact,
+                    window_end=case.window_end_at,
+                    now=moment,
+                    max_message_length=config.MAX_MESSAGE_LENGTH,
+                )
+            except PaymentLinkRequestError as exc:
+                # A request that cannot be built correctly is not sent at all. Rolling back
+                # discards the reserved intent, which is right: no call happened.
+                session.rollback()
+                _logger.warning(
+                    "payment link request rejected before send",
+                    case_id=str(case_id),
+                    rule=exc.rule,
+                )
+                return _refused(
+                    case_id, ExecutionOutcome.REQUEST_INVALID, key=key, detail=exc.rule
+                )
 
         # The Customer_Access_Token, minted here (R18.C1). Three things about the placement.
         #
@@ -640,6 +717,13 @@ def _reserve_under_lock(
                     detail=reason,
                 )
 
+        # ``EXECUTION_STARTED``, and for a resend it carries more than a detail line. The record
+        # has to say that the identifier beside it is Revora's own composition rather than the
+        # provider's, and that the content about to reach the customer was authored by the
+        # provider (R24.C17) — both of which are true at the moment this is written and neither of
+        # which a later reader could work out. ``ResendTarget.started_audit_fields`` is the payload;
+        # it deliberately omits ``short_url``, because a payment link URL is a bearer capability
+        # and is never an audit field.
         _audit_case(
             session,
             merchant_id,
@@ -650,9 +734,16 @@ def _reserve_under_lock(
             correlation_id=correlation_id,
             action=action,
             idempotency_key=key,
+            decision=(
+                None
+                if resend_target is None
+                else resend_target.started_audit_fields(attempt_ordinal=attempt_ordinal)
+            ),
         )
         _ = transition
-        return _Reservation(attempt=None, idempotency_key=key, request=request)
+        return _Reservation(
+            attempt=None, idempotency_key=key, request=request, resend=resend_target
+        )
 
 
 def _structural_refusal(
@@ -695,6 +786,144 @@ def _structural_refusal(
 # ---------------------------------------------------------------------------
 # tx-B — recording the result
 # ---------------------------------------------------------------------------
+
+
+def _live_link_target(
+    session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID
+) -> ResendTarget | None:
+    """The live payment link this case already holds, as a resend target, or ``None``.
+
+    R24.C10's condition, answered from Revora's own record and **without a provider call**. The
+    condition itself is
+    :meth:`~revora.persistence.repositories.execution.ExecutionIntentRepository.live_payment_link`
+    and it is asked rather than restated here, because it has a second reader:
+    :mod:`revora.estimation.candidates` excludes ``PAYMENT_LINK`` from the candidate set with
+    ``LIVE_PAYMENT_LINK_EXISTS`` on the same ground, and the two must agree exactly. If they
+    disagreed in the loose direction the optimizer would exclude a link the engine then went on to
+    create anyway; in the strict direction it would rank a link the engine turned into a resend,
+    and a merchant would read a decision that did not happen. What this function adds is the
+    *target*: which medium, and which URL to keep showing.
+
+    **Read rather than fetched, deliberately.** A provider read here would be a second external
+    call on the path whose whole discipline is one call per idempotency key, and it would be a call
+    made *before* the intent is committed, in the window where a crash costs nothing precisely
+    because nothing has gone out. It would also be answering a question the record already answers.
+
+    ``None`` is not a failure. It routes the follow-up to R24.C11's fallback — create one link,
+    ``accept_partial`` false, expiry clamped to the window end, notification enabled — and that
+    creation becomes the effect of this idempotency key, with ``PAYMENT_LINK_CREATE`` on the row,
+    so it *is* reconcilable. Which is the whole reason the two branches are distinguished here
+    rather than downstream: only one of them can be resolved by reading afterwards.
+
+    A composed resend token is refused rather than used, and that check stays here rather than
+    moving into the shared query. It is not part of "is this link live" — ``effect_kind`` already
+    excludes resend rows, so the query cannot return one — it is a guard on *using* the stored
+    identifier as a link id, which is the specific mistake the token's marker exists to make
+    detectable, and a defence that only lives in the client is a defence one caller can route
+    around. A refusal here yields ``None`` and so the create fallback, which is still exactly one
+    link.
+    """
+    intent = ExecutionIntentRepository(session).live_payment_link(merchant_id, case_id)
+    if intent is None:
+        return None
+    link_id = str(intent.provider_response_id)
+    if is_resend_response_id(link_id):  # pragma: no cover - effect_kind excludes resend rows
+        _logger.error(
+            "confirmed link creation carries a composed resend token; refusing to resend it",
+            case_id=str(case_id),
+            intent_id=str(intent.id),
+        )
+        return None
+    # SMS, always. ``resolve_customer_contact`` refuses an action outright when the
+    # originating payment carried no phone number — it is the channel the provider always
+    # has and ``CustomerContact`` rejects a blank one — so a case that ever produced a link
+    # has a phone, while email is optional and may be absent. Choosing the medium from the
+    # contact would mean decrypting PII to answer a question whose answer is fixed by that
+    # earlier refusal. The provider's rate limit is documented as per link *and* per medium,
+    # so a future second medium is a real option; it is not one this action needs.
+    return ResendTarget(
+        payment_link_id=link_id,
+        medium=NotifyMedium.SMS,
+        short_url=intent.provider_short_url,
+    )
+
+
+def _record_resend_under_lock(
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    *,
+    idempotency_key: str,
+    result: ProviderResult[PaymentLinkResendAck],
+    target: ResendTarget,
+    factory: sessionmaker[Session] | None,
+    config: Configuration,
+    correlation_id: uuid.UUID | None,
+) -> ExecutionAttempt:
+    """tx-B for a resend. Records the outcome, moves the case, schedules the promise.
+
+    Thin, because :func:`revora.execution.resend.settle_resend_result` owns the disposition and
+    this must not hold a second opinion about it. That function records the classification, applies
+    R24.C12's confirmed transition to ``WAITING_FOR_OUTCOME``, returns a definitively-refused case
+    to ``DECISION_PENDING`` where the bounds still permit, and escalates an ``UNCERTAIN`` one
+    exactly once with ``EXECUTION_RESULT_UNVERIFIABLE`` — issuing **no** further external call,
+    because ``RESEND_RECONCILIATION_ATTEMPT_BOUND`` is zero and no read can answer.
+
+    **Nothing here retries and nothing here reads the provider back.** A crash before this commits
+    leaves the ``ATTEMPTED`` resend intent behind, and that row is *absent* from the reconciliation
+    sweep's candidate set by virtue of its ``effect_kind`` — not skipped by it. A later engine pass
+    on the same key finds an unresolved intent and returns ``HANDED_TO_RECONCILIATION`` without
+    calling, which for a resend means the case waits for the stale-intent promotion to make it
+    ``UNCERTAIN`` and then for the escalation a person picks up. That is the accepted cost of Fact
+    two and it is the reason a lost nudge is preferred to a possible second message.
+
+    The promise's own status is R24.C12's remaining clause and it is applied here rather than in
+    the settlement, because the settlement is shared with any future resend and a promise is
+    specific to this action. In the same transaction as the confirmation, so a promise recorded as
+    followed-up and an intent recorded as confirmed cannot disagree.
+    """
+    with tenant_transaction(merchant_id, factory) as session:
+        case = RecoveryCaseRepository(session).lock_for_update(merchant_id, case_id)
+        intent = ExecutionIntentRepository(session).get_by_idempotency_key(
+            merchant_id, idempotency_key
+        )
+        if case is None or intent is None:  # pragma: no cover - both committed in tx-A
+            _logger.error(
+                "resend result with no intent to record it on", case_id=str(case_id)
+            )
+            return ExecutionAttempt(
+                outcome=ExecutionOutcome.UNCERTAIN,
+                case_id=case_id,
+                idempotency_key=idempotency_key,
+                intent_state=IntentState.UNCERTAIN,
+            )
+
+        settlement = settle_resend_result(
+            session,
+            merchant_id,
+            case,
+            intent,
+            result,
+            target=target,
+            config=config,
+            correlation_id=correlation_id,
+        )
+
+        if settlement.intent_state is IntentState.CONFIRMED:
+            # R24.C12's last clause. Conditional on CONFIRMED and on nothing else: a refused or
+            # unverifiable follow-up did not reach the customer, so recording their promise as
+            # followed-up would be recording a message Revora cannot say went out — and
+            # ``resolve_missed`` would then be free to blame them for not paying after it.
+            mark_follow_up_scheduled(session, merchant_id, case_id)
+
+        return ExecutionAttempt(
+            outcome=ExecutionOutcome[settlement.intent_state.value],
+            case_id=case_id,
+            idempotency_key=idempotency_key,
+            intent_id=intent.id,
+            intent_state=settlement.intent_state,
+            provider_response_id=intent.provider_response_id,
+            detail=settlement.disposition.value,
+        )
 
 
 def _record_under_lock(
@@ -902,8 +1131,15 @@ def _audit_case(
     action: CandidateAction | None = None,
     idempotency_key: str | None = None,
     policy_result: dict[str, object] | None = None,
+    decision: dict[str, object] | None = None,
 ) -> None:
-    """Append a case-attached record. The caller holds the case row ``FOR UPDATE``."""
+    """Append a case-attached record. The caller holds the case row ``FOR UPDATE``.
+
+    ``decision`` overrides the default ``{"detail": detail}`` payload for the one caller that
+    needs a richer one — a resend's ``EXECUTION_STARTED``, which has to carry the composed
+    identifier and the content classification. ``detail`` stays required rather than becoming
+    optional, so every record still has one and the richer payload includes it.
+    """
     AuditWriter(
         session,
         disclosure_length=config.MASK_DISCLOSURE_LENGTH,
@@ -916,7 +1152,7 @@ def _audit_case(
             actor=_ACTOR,
             action=None if action is None else action.value,
             idempotency_key=idempotency_key,
-            decision={"detail": detail},
+            decision={"detail": detail} if decision is None else decision,
             policy_result=policy_result,
         ),
         correlation_id=correlation_id,

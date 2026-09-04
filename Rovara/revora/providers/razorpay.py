@@ -5,7 +5,7 @@ responses, which erases the difference between "the effect definitely did not ha
 and "the effect might have happened". That difference is the only thing exactly-once
 execution can be built on. A ~250-line client with an explicit ``Unclassifiable`` case
 is worth more here than SDK convenience, and the cost — maintaining the surface
-ourselves — is small because the surface is three endpoints.
+ourselves — is small because the surface is five endpoints.
 
 **The single most important line in this module** is that a read timeout is never
 retried. A read timeout means the request reached the server and the response did not
@@ -58,29 +58,37 @@ from revora.platform.logging import get_logger
 from revora.platform.secrets import CredentialUnavailableError, get_secret_store
 from revora.providers.classification import (
     MAX_RETAINED_RAW_BODY,
+    PAYMENT_LINK_ID_PREFIX,
     CallPhase,
     ClientError,
     PaymentEntity,
     PaymentLinkEntity,
     PaymentLinkList,
+    PaymentLinkResendAck,
     PaymentList,
     ProviderResult,
     ServerError,
     Success,
     Timeout,
     Unclassifiable,
+    classify_resend_response,
     classify_response,
     effect_certainty,
     parse_payment,
     parse_payment_link,
     parse_payment_link_list,
+    parse_payment_link_resend,
     parse_payment_list,
     refused_for_concurrency_cap,
     refused_for_credential,
     refused_for_invalid_request,
     truncate_raw,
 )
-from revora.providers.payment_link import PaymentLinkRequest
+from revora.providers.payment_link import (
+    NotifyMedium,
+    PaymentLinkRequest,
+    is_resend_response_id,
+)
 
 __all__ = [
     "CONNECT_ATTEMPT_LIMIT",
@@ -94,8 +102,10 @@ __all__ = [
     "OPERATION_FETCH_PAYMENT",
     "OPERATION_FIND_PAYMENT_LINKS",
     "OPERATION_LIST_PAYMENTS",
+    "OPERATION_NOTIFY_BY",
     "PATH_PAYMENTS",
     "PATH_PAYMENT_LINKS",
+    "PATH_PAYMENT_LINK_NOTIFY",
     "PaymentProviderClient",
     "RazorpayClient",
     "split_timeout",
@@ -112,10 +122,19 @@ correction is a configuration change rather than an edit here."""
 PATH_PAYMENT_LINKS: Final[str] = "/v1/payment_links"
 PATH_PAYMENTS: Final[str] = "/v1/payments"
 
+PATH_PAYMENT_LINK_NOTIFY: Final[str] = "/v1/payment_links/{payment_link_id}/notify_by/{medium}"
+"""**[VERIFIED]** — the resend endpoint, ``medium`` in ``{sms, email}``.
+
+A template rather than a joined prefix so the whole path is greppable as one string. It is
+the fact that makes ``PROMISE_FOLLOW_UP_FINANCIAL_COST = 0`` a figure rather than a guess:
+re-notifying an existing link creates no second link, so a promise follow-up costs no
+provider fee."""
+
 OPERATION_CREATE_PAYMENT_LINK: Final[str] = "create_payment_link"
 OPERATION_FIND_PAYMENT_LINKS: Final[str] = "find_payment_links_by_reference_id"
 OPERATION_FETCH_PAYMENT: Final[str] = "fetch_payment"
 OPERATION_LIST_PAYMENTS: Final[str] = "list_payments"
+OPERATION_NOTIFY_BY: Final[str] = "notify_by"
 """Operation names as they appear in log fields and in the fake's call log. Constants
 rather than inline strings so a test asserting "zero calls of this operation" cannot
 pass because of a typo."""
@@ -192,6 +211,12 @@ class PaymentProviderClient(Protocol):
         self, request: PaymentLinkRequest
     ) -> ProviderResult[PaymentLinkEntity]:
         """Create a Payment Link. Never raises; the result carries the certainty."""
+        ...
+
+    def notify_by(
+        self, payment_link_id: str, medium: NotifyMedium
+    ) -> ProviderResult[PaymentLinkResendAck]:
+        """Re-notify a customer about an existing link. Creates no second link."""
         ...
 
     def find_payment_links_by_reference_id(
@@ -337,6 +362,67 @@ class RazorpayClient:
             log_fields={"reference_id": request.reference_id, "case_id": request.case_id},
         )
 
+    def notify_by(
+        self, payment_link_id: str, medium: NotifyMedium
+    ) -> ProviderResult[PaymentLinkResendAck]:
+        """Re-notify a customer about a link that already exists. The second external effect.
+
+        ``POST /v1/payment_links/:id/notify_by/:medium``, **verified**. No second payment link
+        is created, which is the fact behind ``PROMISE_FOLLOW_UP_FINANCIAL_COST = 0`` — the one
+        figure in the cost prior table that is measured rather than assumed.
+
+        **This call is weaker than the create in the one way that matters.** The response is a
+        success boolean with no provider object in it, and no endpoint reports whether a
+        notification was sent. So there is nothing to read back: an outcome that lands
+        ``UNCERTAIN`` here is not slow to resolve, it is unresolvable, and reconciliation is
+        not the answer to it. :func:`~revora.providers.classification.classify_resend_response`
+        carries the table, and ``revora.execution.resend`` carries the disposition — one
+        escalation, zero further external calls, no read attempted.
+
+        The two local refusals below are definitive ``ClientError`` results: nothing is sent,
+        so nothing is uncertain. Both catch a Revora-side mistake before it can become a
+        provider outcome:
+
+        * a **composed resend token** handed back in. ``execution_intent.provider_response_id``
+          holds ``"<plink_id>#notify_by:<medium>"`` for a resend, and a future reader who
+          assumes that column always holds a provider id would otherwise put it in this path.
+          Refusing is the enforcement of the claim that the composed form cannot be fed to an
+          endpoint believing it is an identifier.
+        * anything that is **not a payment link id**. The provider would answer 404, which
+          classifies as a definitive rejection and is therefore harmless — but it would be a
+          rejection recorded against a case, with a provider error code, for a request Revora
+          should never have made.
+
+        Uses the shared request path, so the connect-only retry, the concurrency cap, the
+        credential resolution and the masking-aware logger are the same ones the create gets.
+        The only difference is the classifier.
+
+        Never raises.
+        """
+        if is_resend_response_id(payment_link_id):
+            return refused_for_invalid_request(
+                OPERATION_NOTIFY_BY,
+                "a composed resend token is not a payment link id",
+            )
+        identifier = payment_link_id.strip()
+        if not identifier.startswith(PAYMENT_LINK_ID_PREFIX):
+            return refused_for_invalid_request(
+                OPERATION_NOTIFY_BY,
+                f"payment link id must begin {PAYMENT_LINK_ID_PREFIX!r}",
+            )
+        return self._call(
+            operation=OPERATION_NOTIFY_BY,
+            method="POST",
+            path=PATH_PAYMENT_LINK_NOTIFY.format(
+                payment_link_id=identifier, medium=medium.value
+            ),
+            parse=parse_payment_link_resend,
+            classifier=classify_resend_response,
+            # The link id, not the link URL. The id is an opaque handle; the URL is a bearer
+            # capability and is never a log field anywhere in this module.
+            log_fields={"payment_link_id": identifier, "medium": medium.value},
+        )
+
     def find_payment_links_by_reference_id(
         self, reference_id: str
     ) -> ProviderResult[PaymentLinkList]:
@@ -453,6 +539,7 @@ class RazorpayClient:
         method: str,
         path: str,
         parse: Callable[[object], EntityT],
+        classifier: Callable[..., ProviderResult[EntityT]] = classify_response,
         params: dict[str, str] | None = None,
         json_body: dict[str, object] | None = None,
         log_fields: dict[str, str],
@@ -498,6 +585,7 @@ class RazorpayClient:
                 method=method,
                 path=path,
                 parse=parse,
+                classifier=classifier,
                 params=params,
                 json_body=json_body,
                 headers=headers,
@@ -515,6 +603,7 @@ class RazorpayClient:
         method: str,
         path: str,
         parse: Callable[[object], EntityT],
+        classifier: Callable[..., ProviderResult[EntityT]],
         params: dict[str, str] | None,
         json_body: dict[str, object] | None,
         headers: dict[str, str],
@@ -584,11 +673,27 @@ class RazorpayClient:
                     detail="unanticipated transport failure",
                 )
 
-            return self._classify(response, parse)
+            return self._classify(response, parse, classifier)
 
     def _classify[EntityT](
-        self, response: httpx.Response, parse: Callable[[object], EntityT]
+        self,
+        response: httpx.Response,
+        parse: Callable[[object], EntityT],
+        classifier: Callable[..., ProviderResult[EntityT]],
     ) -> ProviderResult[EntityT]:
+        """Classify one response with the table this operation uses.
+
+        ``classifier`` is a parameter rather than a fixed call, and it is a parameter *here*
+        rather than a branch in :meth:`notify_by`, so that the resend's table is applied by the
+        same code path that issues the request. A per-operation branch would leave the resend's
+        table reachable only through a second path, and the two paths would then differ in the
+        retry rule, the cap and the logging — which are the parts that must not differ.
+
+        Typed ``Callable[..., ...]`` deliberately. The two classifiers are keyword-only and
+        generic, and spelling that as a callback protocol buys nothing here: both are named in
+        this module, neither is caller-supplied, and the return type — the part a mistake would
+        actually escape through — is checked.
+        """
         try:
             body_text = response.text
         except Exception:
@@ -596,7 +701,7 @@ class RazorpayClient:
             # will not decode is still evidence that a response arrived, so this is
             # unclassifiable rather than a transport failure.
             body_text = ""
-        return classify_response(
+        return classifier(
             http_status=response.status_code,
             body_text=body_text,
             parse=parse,

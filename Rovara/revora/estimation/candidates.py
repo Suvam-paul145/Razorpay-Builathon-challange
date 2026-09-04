@@ -75,6 +75,7 @@ from revora.audit.events import (
     INVALID_ESTIMATE,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
+from revora.customer.promises import follow_up_reached
 from revora.domain.actions import (
     ACTION_PRECEDENCE,
     NULL_ACTIONS,
@@ -87,6 +88,7 @@ from revora.domain.enums import (
     ActionAvailability,
     EstimationMethod,
     ExclusionReason,
+    PromiseStatus,
     Provenance,
     RiskCause,
 )
@@ -95,11 +97,13 @@ from revora.domain.probability import Probability
 from revora.domain.segments import FEATURE_KEYS, FEATURE_RISK_CAUSE
 from revora.persistence.models.estimates import BaselineEstimate
 from revora.persistence.repositories.cases import RecoveryCaseRepository
+from revora.persistence.repositories.customer import PromiseToPayRepository
 from revora.persistence.repositories.estimates import (
     BaselineEstimateRepository,
     CandidateEstimateRepository,
     SegmentObservationRepository,
 )
+from revora.persistence.repositories.execution import ExecutionIntentRepository
 from revora.platform.clock import now
 from revora.platform.config import Configuration, money_default
 from revora.platform.logging import get_logger
@@ -114,6 +118,7 @@ __all__ = [
     "PAYMENT_LINK_FINANCIAL_COST",
     "PROMISE_FOLLOW_UP_COMMUNICATION_COST",
     "PROMISE_FOLLOW_UP_FINANCIAL_COST",
+    "PROMISE_FOLLOW_UP_PRIOR_PROBABILITY",
     "REJECTION_METHOD_NOT_RECORDED",
     "REJECTION_OUT_OF_RANGE",
     "UPLIFT_PRIORS",
@@ -121,11 +126,13 @@ __all__ = [
     "CandidateOutcome",
     "CandidateSet",
     "CostPrior",
+    "PromiseFollowUpFacts",
     "RawFigures",
     "RejectedFigure",
     "build_candidate_set",
     "candidate_figures",
     "cost_prior_for",
+    "promise_follow_up_exclusion",
     "run_candidate_estimation",
     "validate_figures",
     "wait_probability",
@@ -210,6 +217,30 @@ PROMISE_FOLLOW_UP_COMMUNICATION_COST: Final[Minor] = Minor(50)
 Higher than ``MESSAGE_COMMUNICATION_COST`` because a follow-up is priced against the
 provider's re-notification rather than against the notification bundled with a new
 link. Nothing has measured either, so the ordering between them is a guess too."""
+
+PROMISE_FOLLOW_UP_PRIOR_PROBABILITY: Final[Decimal] = Decimal("0.0600")
+"""How much following up on a promise is assumed to add to the recovery probability.
+**[ASSUMPTION]**, and R24.C5's figure.
+
+**An uplift over the baseline, not an absolute probability, and the reading matters.** R24.C5
+says "SHALL produce the intervention_recovery_probability PROMISE_FOLLOW_UP_PRIOR_PROBABILITY",
+which read literally would make this the whole probability. It is not read literally, for the
+same reason R6's identically-shaped clause is not read literally for ``PAYMENT_LINK``: every
+figure in :data:`UPLIFT_PRIORS` is an addition to the baseline posterior, the optimizer's
+incremental probability is ``candidate - baseline``, and an action whose probability ignored the
+baseline would produce a *negative* incremental probability on exactly the cases where the
+customer was most likely to pay anyway. R24.C6 asks for this action to be ranked "on the same
+terms as every other Candidate_Action", and the same terms are an uplift. So the requirement's
+figure is the uplift, and this is it.
+
+Between ``CUSTOMER_MESSAGE``'s 0.0500 and ``PAYMENT_LINK``'s 0.0800, and the position is the
+guess rather than the number. Above a cold message because the recipient has already said they
+intend to pay, which is the strongest stated intent Revora ever has; below a fresh link because
+a resend mints no new payable object and carries whatever the original link's wording was. Like
+every other entry in that table it is what the experiment exists to test, and everything derived
+from it is labelled ``UNCALIBRATED`` — which in this system is not a threshold that lifts once a
+segment reaches ``MIN_SEGMENT_SAMPLE_SIZE`` but the permanent label until something is actually
+fitted. See :func:`candidate_figures` and :data:`UPLIFT_PRIORS`."""
 
 HUMAN_ESCALATION_FINANCIAL_COST: Final[Minor] = Minor(25_000)
 """Staff time for one escalation. **[ASSUMPTION]**.
@@ -329,17 +360,23 @@ def cost_prior_for(action: CandidateAction, config: Configuration) -> CostPrior:
 UPLIFT_PRIORS: Final[Mapping[CandidateAction, Decimal]] = {
     CandidateAction.PAYMENT_LINK: Decimal("0.0800"),
     CandidateAction.CUSTOMER_MESSAGE: Decimal("0.0500"),
+    CandidateAction.PROMISE_TO_PAY_FOLLOW_UP: PROMISE_FOLLOW_UP_PRIOR_PROBABILITY,
     CandidateAction.HUMAN_ESCALATION: Decimal("0.1000"),
 }
 """How much each executable action is assumed to add to the recovery probability.
 
-**[ASSUMPTION] on all three, and they are the numbers the experiment exists to test.**
+**[ASSUMPTION] on all four, and they are the numbers the experiment exists to test.**
 They are uniform across risk causes, which is certainly wrong — a payment link should
 help an insufficient-funds failure differently from an expired card — and it is
 deliberately wrong in the direction of admitting ignorance rather than inventing a
 cause-by-action matrix of guesses that would look like knowledge. Every figure derived
 from these is marked ``UNCALIBRATED``, which is what carries that admission to the
 dashboard.
+
+The promise follow-up's entry is named rather than inline, because R24.C5 gives that one figure a
+name of its own and the requirement is satisfied by the name existing where a reader looks for
+it — see :data:`PROMISE_FOLLOW_UP_PRIOR_PROBABILITY`, which also records why the clause's
+"produce the intervention_recovery_probability X" is an uplift here and not an absolute.
 
 An action absent from this mapping gets no uplift at all, which is the correct default:
 the three MVP-unavailable actions cannot be performed, so claiming they would raise the
@@ -508,6 +545,86 @@ class RawFigures:
 
 
 @dataclass(frozen=True, slots=True)
+class PromiseFollowUpFacts:
+    """The promise facts ``PROMISE_TO_PAY_FOLLOW_UP``'s membership depends on, plus the instant.
+
+    Three fields, and the third is here rather than as a separate argument on purpose: the
+    comparison R23.C9 asks for has two operands, and carrying them together means
+    :func:`build_candidate_set` and :func:`candidate_figures` stay **pure** — no clock is read
+    below this object, so two calls with equal arguments still return equal sets, which is what
+    the neutrality properties rest on.
+
+    ``None`` in place of this object means *no pending promise*, not *the caller forgot*. That
+    conflation is deliberate and it fails in the safe direction: every caller that has no promise
+    to describe gets ``NO_PROMISE_RECORDED`` and an excluded candidate, which is the same answer
+    it would get from a correctly-constructed object describing an absent promise. The opposite
+    default — assume a promise until told otherwise — would put a follow-up on cases where no
+    customer said anything.
+
+    A separate shape from the ORM row for the reason
+    :class:`revora.customer.promises.PromiseWindowFacts` is: it states the complete list of
+    columns this decision reads. Two, and neither is money.
+    """
+
+    status: PromiseStatus
+    follow_up_at: datetime | None
+    instant: datetime
+    """The moment the candidate set is being built for. The floor R23.C9 compares
+    ``follow_up_at`` against, passed in rather than read, for the purity reason above."""
+
+    @property
+    def pending(self) -> bool:
+        """Whether the promise is in one of the two statuses that can still carry a follow-up.
+
+        The same pair ``promise_to_pay``'s partial index is built over. A ``KEPT``, ``MISSED``,
+        ``VOIDED`` or ``BEYOND_WINDOW_ESCALATED`` promise is not pending — the last of those is
+        the one worth naming, because it *exists* and answering ``True`` for it would schedule a
+        nudge against the promise that was the reason its case escalated.
+        """
+        return self.status in (PromiseStatus.RECORDED, PromiseStatus.FOLLOW_UP_SCHEDULED)
+
+
+def promise_follow_up_exclusion(
+    promise: PromiseFollowUpFacts | None, *, capability_verified: bool = True
+) -> ExclusionReason | None:
+    """Why ``PROMISE_TO_PAY_FOLLOW_UP`` is not selectable for this case, or ``None``.
+
+    The three grounds of Property 46, asked in the order that makes each one meaningful:
+
+    1. **The resend capability is gone** — ``PROVIDER_CAPABILITY_UNVERIFIED`` (R24.C16). First,
+       because an action the provider cannot perform is not made performable by a promise. This is
+       the withdrawal-degradation path: the capability *is* verified today (the design's Fact 1),
+       so ``capability_verified`` is true in production, and the parameter exists so the
+       degradation is expressed and tested rather than only described in prose.
+    2. **No pending promise** — ``NO_PROMISE_RECORDED`` (R24.C2). Covers both "the customer never
+       said anything" and "the promise exists and is no longer pending", which are one answer from
+       the candidate set's side: there is nothing to follow up on.
+    3. **The Follow_Up_Instant has not been reached** — ``PROMISE_DATE_NOT_REACHED`` (R23.C9).
+       Delegated to :func:`revora.customer.promises.follow_up_reached` rather than recomputed,
+       which is the whole reason that predicate lives in the module that owns the promise's
+       statuses: the exclusion and the sweep's own "is this due" question are one comparison, so
+       they cannot disagree by a second. ``FOLLOW_UP_SCHEDULED`` answers reached unconditionally
+       there, because the sweep only moves a promise into that status once the instant has passed.
+
+    ``None`` means the follow-up competes on its economics like anything else, which is R24.C6:
+    nothing below this line reads whether a promise exists.
+
+    Ordering note: the cause-eligibility ground of R24.C3 is *not* here, because it is not a
+    property of the action's figures. A cause that does not permit the follow-up never puts it in
+    the set at all — it lands in :attr:`CandidateSet.excluded_by_cause` with
+    ``CAUSE_NOT_ELIGIBLE``, which is where every cause exclusion in this system is recorded, and
+    R6.C1 caps membership at what the eligibility table permits.
+    """
+    if not capability_verified:
+        return ExclusionReason.PROVIDER_CAPABILITY_UNVERIFIED
+    if promise is None or not promise.pending:
+        return ExclusionReason.NO_PROMISE_RECORDED
+    if not follow_up_reached(promise.status, promise.follow_up_at, instant=promise.instant):
+        return ExclusionReason.PROMISE_DATE_NOT_REACHED
+    return None
+
+
+@dataclass(frozen=True, slots=True)
 class RejectedFigure:
     """A figure that failed validation, named precisely enough to fix.
 
@@ -656,6 +773,9 @@ def candidate_figures(
     window: timedelta,
     config: Configuration,
     memory_available: bool = True,
+    promise: PromiseFollowUpFacts | None = None,
+    resend_capability_verified: bool = True,
+    live_payment_link: bool = False,
 ) -> RawFigures:
     """Produce one action's five raw figures.
 
@@ -693,10 +813,48 @@ def candidate_figures(
     that it changes nothing — but the method stays ``UNCALIBRATED`` so nothing reads
     those figures as measured.
 
+    ``PROMISE_TO_PAY_FOLLOW_UP`` is unavailable on a **fourth** ground and it is the only action
+    whose availability depends on a row rather than on a capability: R24.C2 admits it only where a
+    pending Promise_To_Pay exists and R23.C9 only once that promise's Follow_Up_Instant has
+    passed. :func:`promise_follow_up_exclusion` decides which of the three reasons applies, and
+    the shape of the answer is the same as for the three MVP-unavailable actions — ``UNAVAILABLE``,
+    probability equal to the baseline, retained in the set. **All five figures are still
+    produced**, none of them unset, because R24.C4 asks for five figures whenever the action is in
+    a candidate set and being in the set is not the same as being selectable.
+
+    ``PAYMENT_LINK`` is unavailable on a **fifth** ground, and it is the one that stops the system
+    doing real damage. A case that already holds a live payment link cannot be sent a second one:
+    two live links for one debt, each with its own ``reference_id`` and nothing cancelling the
+    first, is a customer who can pay twice. R24.C10 forbids the second link and this is that
+    clause read at system scope rather than only on the follow-up's own execution path — because
+    the path that produced the duplicate was a second decision cycle *choosing* ``PAYMENT_LINK``
+    again, which is a decision the follow-up's branch never sees. The shape is the same as every
+    other retained exclusion: ``UNAVAILABLE`` with ``LIVE_PAYMENT_LINK_EXISTS``, probability equal
+    to the baseline, all five figures produced, kept in the set so "why did nobody send a link"
+    has an answer.
+
+    **Nothing is re-priced to make this happen.** No uplift, cost or threshold moves; an action
+    that must not be performed simply stops being available, which is the only honest way to
+    remove it from a comparison it would otherwise win.
+
     ``config`` is required rather than defaulted, and that is R31.C11 rather than style:
     the two configured cost rows are resolved through :func:`cost_prior_for`, and a
     default here would be a second silent source of the two figures that a caller could
     reach by forgetting an argument.
+
+    Args:
+        promise: the case's pending promise, or ``None`` where it has none. Read only for
+            ``PROMISE_TO_PAY_FOLLOW_UP``; every other action ignores it entirely, which is R24.C6
+            stated as a property of what this function reads rather than as a discipline.
+        resend_capability_verified: whether the provider's re-notification capability still
+            exists. R24.C16's withdrawal path — see :func:`promise_follow_up_exclusion`.
+        live_payment_link: whether the case already holds a live payment link. Read only by
+            ``PAYMENT_LINK``; every other action ignores it. Defaults to ``False`` because that is
+            the answer for a case on its first cycle and because a default of ``True`` would
+            suppress the action a case most often needs. The fact itself is *not* computed here —
+            see :meth:`~revora.persistence.repositories.execution.ExecutionIntentRepository
+            .live_payment_link`, which is also what the execution engine routes R24.C10's resend
+            branch on, so the exclusion and the resend cannot disagree about what "live" means.
     """
     if action is CandidateAction.DO_NOTHING:
         return RawFigures(
@@ -735,7 +893,27 @@ def candidate_figures(
             customer_cost_method=EstimationMethod.DEFINITIONAL,
         )
 
-    unavailable = action in UNAVAILABLE_IN_MVP
+    # Three grounds for unavailability: the MVP capability, the promise's, and the duplicate
+    # link. A single ``ExclusionReason | None`` rather than a boolean plus a lookup, because the
+    # reason has to reach ``unavailable_reason`` — the optimizer carries the estimation layer's
+    # own reason through rather than re-deriving it, so a boolean here would arrive there as
+    # ``PROVIDER_CAPABILITY_UNVERIFIED`` whatever the truth was.
+    #
+    # Mutually exclusive branches on the action, so the order is a reading order rather than a
+    # precedence: no action is both in ``UNAVAILABLE_IN_MVP`` and one of the other two.
+    reason: ExclusionReason | None = None
+    if action in UNAVAILABLE_IN_MVP:
+        reason = ExclusionReason.PROVIDER_CAPABILITY_UNVERIFIED
+    elif action is CandidateAction.PROMISE_TO_PAY_FOLLOW_UP:
+        reason = promise_follow_up_exclusion(
+            promise, capability_verified=resend_capability_verified
+        )
+    elif action is CandidateAction.PAYMENT_LINK and live_payment_link:
+        # R24.C10 at system scope. The case already holds a live link, so creating another would
+        # leave the customer holding two payable objects for one debt.
+        reason = ExclusionReason.LIVE_PAYMENT_LINK_EXISTS
+
+    unavailable = reason is not None
     if unavailable:
         probability = baseline.value
     else:
@@ -764,9 +942,7 @@ def candidate_figures(
         availability=(
             ActionAvailability.UNAVAILABLE if unavailable else ActionAvailability.AVAILABLE
         ),
-        unavailable_reason=(
-            ExclusionReason.PROVIDER_CAPABILITY_UNVERIFIED.value if unavailable else None
-        ),
+        unavailable_reason=None if reason is None else reason.value,
     )
 
 
@@ -804,6 +980,9 @@ def build_candidate_set(
     window: timedelta,
     config: Configuration,
     memory_available: bool = True,
+    promise: PromiseFollowUpFacts | None = None,
+    resend_capability_verified: bool = True,
+    live_payment_link: bool = False,
 ) -> CandidateSet:
     """Build the whole candidate set for one case. Pure.
 
@@ -824,10 +1003,25 @@ def build_candidate_set(
     substitute claims nothing — probability equal to the baseline, all costs zero — so
     it cannot be selected on its merits either.
 
-    Still pure, and ``config`` does not change that: it is a frozen value the caller
-    already holds, read for the two R31.C11 cost rows and for nothing else. Two calls
-    with equal arguments still return equal sets, which is what the neutrality
-    properties rest on.
+    Still pure, and neither ``config`` nor ``promise`` nor ``live_payment_link`` changes that: all
+    three are frozen values the caller already holds — ``config`` read for the two R31.C11 cost
+    rows and for nothing else, ``promise`` read only by ``PROMISE_TO_PAY_FOLLOW_UP`` and carrying
+    its own comparison instant so no clock is consulted below this line, ``live_payment_link`` a
+    single boolean the caller resolved from a committed row. Two calls with equal arguments still
+    return equal sets, which is what the neutrality properties rest on.
+
+    **A promise changes membership and never ranking.** It can turn the follow-up from
+    ``UNAVAILABLE`` into a competing candidate, and that is the whole of its influence: the
+    figures every candidate is ranked by are produced without reference to it, so R24.C6's "no
+    ranking input from the existence of a Promise_To_Pay" is a property of where this argument is
+    read rather than a rule anybody has to keep.
+
+    **A live payment link does the same in the other direction**, and on exactly the same terms:
+    it takes ``PAYMENT_LINK`` out of the competition by marking it ``UNAVAILABLE`` with
+    ``LIVE_PAYMENT_LINK_EXISTS``, and it changes no figure of any candidate — its own included,
+    which keeps the baseline probability and the priced costs a reader can compare against. So
+    what the flag removes is an *action that must not be performed*, not a number that was
+    inconvenient. R24.C10 is the requirement; see :func:`candidate_figures`.
     """
     members = candidate_set_for(cause)
     ordered = [action for action in ACTION_PRECEDENCE if action in members]
@@ -842,6 +1036,9 @@ def build_candidate_set(
             window=window,
             config=config,
             memory_available=memory_available,
+            promise=promise,
+            resend_capability_verified=resend_capability_verified,
+            live_payment_link=live_payment_link,
         )
         validated = validate_figures(raw)
         if isinstance(validated, RejectedFigure):
@@ -994,6 +1191,8 @@ def run_candidate_estimation(
         return CandidateOutcome(baseline.id, None, (), None, already_recorded=True)
 
     cause = _cause_from_baseline(baseline)
+    promise = _promise_facts(session, merchant_id, case_id, moment=moment)
+    live_link = _holds_live_payment_link(session, merchant_id, case_id)
     memory_available = _segment_readable(session, merchant_id, baseline)
     if not memory_available:
         writer.write_for_case(
@@ -1020,6 +1219,8 @@ def run_candidate_estimation(
         window=config.RECOVERY_WINDOW_DURATION,
         config=config,
         memory_available=memory_available,
+        promise=promise,
+        live_payment_link=live_link,
     )
 
     provenance = Provenance(baseline.provenance)
@@ -1099,6 +1300,67 @@ def _cause_from_baseline(baseline: BaselineEstimate) -> RiskCause:
         return RiskCause(raw)
     except ValueError:
         return RiskCause.UNKNOWN
+
+
+def _promise_facts(
+    session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID, *, moment: datetime
+) -> PromiseFollowUpFacts | None:
+    """The case's promise as the two columns membership depends on, or ``None``.
+
+    Read here rather than passed in by the pipeline, for the reason
+    :func:`_cause_from_baseline` is read off the baseline: the row that decides whether the
+    follow-up is selectable and the row the exclusion reason is recorded against must be the same
+    read, and a value carried through a job payload can be a cycle out of date. ``MAX_PROMISES_PER
+    _CASE`` is 1 and ``UNIQUE (merchant_id, case_id)`` enforces it, so ``for_case`` answers
+    completely — there is no "which of the case's promises" to get wrong.
+
+    ``moment`` is the same instant the rest of this run uses, not a fresh clock read. So the
+    Follow_Up_Instant comparison, the remaining-window figure ``WAIT`` is derived from and the
+    audit record's ``occurred_at`` all describe one moment, and a run that straddles a
+    Follow_Up_Instant cannot record a set built on both sides of it.
+
+    **No error is swallowed here**, unlike :func:`_segment_readable`. A memory aggregate that
+    cannot be read degrades a *label* and R6.C11 says so; a promise row that cannot be read would
+    change *membership*, and defaulting that to "no promise" would silently drop a follow-up the
+    customer asked for. A database error on this read fails the transaction, which is the loud
+    outcome — the case keeps its decision cycle and the next attempt reads the row again.
+    """
+    promise = PromiseToPayRepository(session).for_case(merchant_id, case_id)
+    if promise is None:
+        return None
+    return PromiseFollowUpFacts(
+        status=PromiseStatus(str(promise.status)),
+        follow_up_at=promise.follow_up_at,
+        instant=moment,
+    )
+
+
+def _holds_live_payment_link(
+    session: Session, merchant_id: uuid.UUID, case_id: uuid.UUID
+) -> bool:
+    """Whether the case already holds a live payment link (R24.C10's condition).
+
+    One line, and the line is the point: the condition is *not* defined here. It is
+    :meth:`revora.persistence.repositories.execution.ExecutionIntentRepository.live_payment_link`,
+    which is the same read :func:`revora.execution.engine._live_link_target` routes the follow-up's
+    resend branch on. Those two packages sit on opposite sides of the layering contract and cannot
+    import each other, which is exactly why the definition lives in the repository rather than in
+    either of them — a second, subtly different notion of "live" is how the optimizer comes to
+    exclude a link the engine then creates, or rank one the engine turns into a resend.
+
+    Narrowed to a boolean deliberately. Which link it is, which medium to use and which URL to keep
+    showing are the execution engine's questions; the candidate set only needs to know whether
+    creating another one would leave a customer holding two payable objects for one debt.
+
+    **No error is swallowed here**, on :func:`_promise_facts`' terms and for the same reason: a
+    read that failed and defaulted to ``False`` would answer "no live link" for a case that has
+    one, and the consequence of that particular wrong answer is a duplicate payable link. A
+    database error fails the transaction, the case keeps its decision cycle, and the next attempt
+    reads the row again.
+    """
+    return (
+        ExecutionIntentRepository(session).live_payment_link(merchant_id, case_id) is not None
+    )
 
 
 def _segment_readable(

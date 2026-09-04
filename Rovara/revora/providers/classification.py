@@ -43,6 +43,30 @@ here — the provider never saw the request. Callers read
 :func:`effect_certainty` rather than pattern-matching on the phase, so the definitive
 set can grow without every caller needing to learn about it.
 
+**The resend has its own table, and it is the create's table plus two deliberate
+overrides.** ``POST /v1/payment_links/:id/notify_by/:medium`` answers with a success
+boolean and no provider object, so there is no identifier to confirm against — and, the
+part that decides everything downstream, **no endpoint that reports whether a
+notification was sent.** An ``UNCERTAIN`` resend is therefore not slow to resolve; it is
+unresolvable, because no read answers the question. :func:`classify_resend_response` is
+that table. It reuses :func:`classify_response` for every band and changes exactly two
+things:
+
+* the entity is :class:`PaymentLinkResendAck`, which validates ``{"success": true}`` and
+  nothing else, so ``success`` absent, false or non-boolean lands in ``Unclassifiable``
+  rather than being read as a message that reached somebody;
+* **429 is a definitive** ``ClientError``, not the ``Unclassifiable`` an unparseable 4xx
+  would otherwise become. A 429 is the provider's own gateway stating that it declined to
+  act, and a rejection delivered nothing. The classification therefore does not read the
+  429 body at all — its shape is unverified, and not depending on it is the point.
+
+Everything below that is unchanged, which is why there is no second certainty function:
+``ServerError`` and a post-send ``Timeout`` are unknown for a resend for the same reason
+they are unknown for a create, and a connect-phase failure is definitive for a resend for
+the same reason too. :func:`effect_certainty` already maps the whole resend table onto the
+three certainties, and :func:`revora.execution.intents.classify_into_intent_state` already
+maps those onto the three intent states.
+
 Nothing in this module raises. ``ValidationError`` from Pydantic is caught at the one
 boundary that produces a classification, because a caller that has to wrap a provider
 call in ``try`` is a caller that will one day forget, and a crash mid-execution is the
@@ -71,6 +95,9 @@ __all__ = [
     "PAYMENT_LINK_ID_PREFIX",
     "PAYMENT_LINK_STATUSES",
     "PAYMENT_STATUSES",
+    "RATE_LIMITED",
+    "RATE_LIMITED_REASON",
+    "RATE_LIMITED_STATUS",
     "TRUNCATION_MARKER",
     "CallPhase",
     "ClientError",
@@ -78,6 +105,7 @@ __all__ = [
     "PaymentEntity",
     "PaymentLinkEntity",
     "PaymentLinkList",
+    "PaymentLinkResendAck",
     "PaymentList",
     "ProviderResult",
     "ResultSource",
@@ -85,6 +113,7 @@ __all__ = [
     "Success",
     "Timeout",
     "Unclassifiable",
+    "classify_resend_response",
     "classify_response",
     "effect_certainty",
     "extract_entity_list",
@@ -92,6 +121,7 @@ __all__ = [
     "parse_payment",
     "parse_payment_link",
     "parse_payment_link_list",
+    "parse_payment_link_resend",
     "parse_payment_list",
     "refused_for_concurrency_cap",
     "refused_for_credential",
@@ -124,6 +154,25 @@ letting an unrecognized state be reported as a working link."""
 PAYMENT_STATUSES: Final[frozenset[str]] = frozenset(member.value for member in PaymentStatus)
 """The verified payment status enumeration, reused from ``domain.payment_event`` so
 the provider adapter and the detection path cannot disagree about what a status is."""
+
+RATE_LIMITED_STATUS: Final[int] = 429
+"""The one status code this module treats differently for a resend than for a create.
+
+Named rather than inlined because the difference it makes is a policy decision, not a
+band boundary: see :func:`classify_resend_response`."""
+
+RATE_LIMITED: Final[str] = "RATE_LIMITED"
+"""``ClientError.code`` on a 429 answering a resend.
+
+Minted here rather than taken from the response body, and deliberately *not* in
+:data:`LOCAL_REFUSAL_CODES`: the provider really did reject the request, so the source is
+``PROVIDER`` and a merchant reading this code is reading a fact about the provider. What is
+not read from the provider is the *body* — the 429 body shape is unverified, so a
+classification that parsed it would be a guarantee resting on an assumption."""
+
+RATE_LIMITED_REASON: Final[str] = "provider declined the notification: rate limited"
+"""The recorded reason for a rate-limited resend. A fixed string, because the alternative
+is provider-controlled prose from an unverified body in a merchant-visible field."""
 
 CREDENTIAL_UNAVAILABLE_CODE: Final[str] = CREDENTIAL_UNAVAILABLE
 """Code on a refusal caused by an unresolvable credential (R17.C4).
@@ -303,6 +352,46 @@ class PaymentEntity(BaseModel):
     def _status_is_verified(cls, value: str) -> str:
         if value not in PAYMENT_STATUSES:
             raise ValueError(f"unverified payment status {value!r}")
+        return value
+
+
+class PaymentLinkResendAck(BaseModel):
+    """The entire verified resend response: one boolean, and no provider object.
+
+    ``{"success": true}`` is the whole documented body of
+    ``POST /v1/payment_links/:id/notify_by/:medium``. There is no notification identifier
+    in it, and no endpoint reports whether a notification was sent — which is why a resend
+    intent persists a Revora-composed token in ``provider_response_id`` and why an
+    ``UNCERTAIN`` resend is never reconciled by reading.
+
+    **Strict, unlike every other model here, and the strictness is most of the model.** A
+    create response carries ten fields and an ``id`` whose prefix is checked, so a body
+    that is nearly right is still recognizably a payment link. This response carries one
+    field. If that field is not a JSON boolean — ``"true"``, ``1``, ``"yes"``, all of which
+    pydantic's lax mode accepts — then the body is not the verified shape, and reading it as
+    a delivered message would confirm an intent on the strength of a coercion. ``strict``
+    routes it to ``Unclassifiable`` instead, and for a resend that means the case escalates
+    to a person. That is the expensive direction; the cheap direction is a customer who
+    never received the message being recorded as messaged.
+
+    ``success: false`` is refused by the validator rather than accepted as a parsed
+    negative, because it is not one. No ``false`` response is documented, so a ``false``
+    body is unverified surface — and "the provider says it did not send" is only different
+    from "we do not know what the provider did" if the field can be trusted, which is
+    exactly what an undocumented value cannot be. Both therefore become ``Unclassifiable``,
+    the honest answer, at the cost of escalating a case that may well have delivered
+    nothing.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    success: bool
+
+    @field_validator("success")
+    @classmethod
+    def _success_is_true(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("resend response reports success false")
         return value
 
 
@@ -674,6 +763,17 @@ def parse_payment_link_list(payload: object) -> PaymentLinkList:
     return PaymentLinkList(tuple(PaymentLinkEntity.model_validate(item) for item in items))
 
 
+def parse_payment_link_resend(payload: object) -> PaymentLinkResendAck:
+    """Validate a decoded body as a resend acknowledgement.
+
+    Raises:
+        ValidationError: on anything that is not ``{"success": true}`` — an absent field, a
+            false one, a coercible non-boolean, or a body that is not an object at all. The
+            caller turns this into ``Unclassifiable``, which for a resend is terminal.
+    """
+    return PaymentLinkResendAck.model_validate(payload)
+
+
 # ---------------------------------------------------------------------------
 # The classifier
 # ---------------------------------------------------------------------------
@@ -757,6 +857,81 @@ def classify_response[EntityT](
         raw=truncate_raw(body_text, raw_limit),
         detail=f"unexpected http status {http_status}",
         http_status=http_status,
+    )
+
+
+def classify_resend_response[EntityT](
+    *,
+    http_status: int,
+    body_text: str,
+    parse: Callable[[object], EntityT],
+    raw_limit: int = MAX_RETAINED_RAW_BODY,
+) -> ProviderResult[EntityT]:
+    """Turn one resend response into exactly one of the five results. Never raises.
+
+    Signature-compatible with :func:`classify_response` on purpose: the client threads one
+    of the two through its single request path, so the resend's table is exercised by the
+    same code that issues the call rather than by a branch beside it.
+
+    The table, outcome by outcome, with the intent state each certainty produces:
+
+    ===================================== ==================== =============
+    Provider outcome                      ``ProviderResult``   Intent state
+    ===================================== ==================== =============
+    200, body validates ``success: true``  ``Success``          ``CONFIRMED``
+    200, ``success`` absent/false/other    ``Unclassifiable``   ``UNCERTAIN``
+    200, body unparseable                  ``Unclassifiable``   ``UNCERTAIN``
+    **429**                                ``ClientError``      ``FAILED``
+    4xx with a parseable error object       ``ClientError``      ``FAILED``
+    4xx without one                         ``Unclassifiable``   ``UNCERTAIN``
+    5xx                                    ``ServerError``      ``UNCERTAIN``
+    Read timeout / reset (``AFTER_SEND``)   ``Timeout``          ``UNCERTAIN``
+    Connect-phase failure                   ``Timeout``          ``FAILED``
+    ===================================== ==================== =============
+
+    Only the 429 row is written here. Every other row is :func:`classify_response`
+    unchanged, and the intent-state column is :func:`effect_certainty` unchanged — the
+    resend does not get a second certainty function, because the question "did the effect
+    happen" has the same answer shape for both effects.
+
+    **Why 429 is definitive when an unparseable 4xx is not.** The generic rule sends an
+    unparseable 4xx to ``Unclassifiable`` because a 4xx whose body is an HTML page from an
+    intermediary says nothing about whether the provider ever saw the request. A 429 is
+    different in kind: it is the provider's own gateway stating that it declined to act, and
+    a rejection delivered nothing. So the body is not consulted — its shape is unverified,
+    and a classification that depended on it would be resting a customer-facing guarantee on
+    an assumption.
+
+    **What a 429 costs.** The customer-message counter moves on the single
+    ``ACTION_SCHEDULED -> EXECUTING`` edge, before the request, and a definitive failure does
+    not give it back. A rate-limited resend therefore spends one message increment for
+    nothing. That is a recorded deviation from R24.C12's "increment on ``CONFIRMED``", and it
+    is the deliberate direction: a design in which a rejected attempt is free is a design in
+    which a loop against a rate limit burns no budget until the window closes.
+
+    **``UNCERTAIN`` here is terminal.** Every ``UNCERTAIN`` row above names an outcome no
+    read can settle, because the resend response carries no identifier and no endpoint
+    reports whether a notification was sent. See
+    :func:`revora.execution.resend.settle_resend_result`, which escalates once with
+    ``EXECUTION_RESULT_UNVERIFIABLE`` and issues no further external call.
+
+    Args:
+        http_status: the response status code.
+        body_text: the response body as text, decoded by the caller.
+        parse: normally :func:`parse_payment_link_resend`. A parameter rather than a
+            hard-coded call so this stays substitutable for :func:`classify_response`.
+        raw_limit: retention limit for a body kept as evidence.
+    """
+    if http_status == RATE_LIMITED_STATUS:
+        return ClientError(
+            code=RATE_LIMITED,
+            reason=RATE_LIMITED_REASON,
+            source=ResultSource.PROVIDER,
+            http_status=http_status,
+            raw=truncate_raw(body_text, raw_limit),
+        )
+    return classify_response(
+        http_status=http_status, body_text=body_text, parse=parse, raw_limit=raw_limit
     )
 
 

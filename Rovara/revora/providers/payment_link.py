@@ -7,6 +7,12 @@ key** — the same string is the ``Idempotency_Key`` on the intent row, the
 to ask "does this effect already exist?". If those three ever disagree, exactly-once
 stops holding and nothing else in the system notices.
 
+A third thing joined them with the promise follow-up: :func:`resend_response_id`, the
+composed token that stands in for a provider identifier a resend does not return. It lives
+beside the reference-id derivation because both answer the same question — *what string
+identifies this attempt?* — and because the two must never be confusable. One is a real
+provider ``reference_id``; the other is deliberately not a provider identifier at all.
+
 **The key format**, from the design's Outbound Contract:
 
     ``rv_`` + the first 16 hex characters of ``SHA-256(case_id ‖ action ‖ ordinal)``
@@ -31,6 +37,16 @@ switches somebody could flip later without realizing what they cost:
   be inside their bounds while the customer received messages the system never
   authorized. Nothing in the codebase would fail. The only defence is that this stays
   false and that this paragraph explains why.
+
+  **The promise follow-up made this more load-bearing, not less.** Before it, every
+  provider-delivered message was one Revora never asked for. Now Revora deliberately
+  triggers provider-delivered messages of its own, through ``notify_by``, and counts each
+  one against ``MAX_CUSTOMER_MESSAGES``. Both kinds travel the same channel and look
+  identical to the customer; only one is counted. Enabling reminders would put uncounted
+  provider messages alongside counted Revora ones **on the same link** — Property 9 would
+  still pass, the counters would still be inside their bounds, and a customer would be
+  receiving messages nothing authorized. No test in the codebase would fail, which is why
+  this stays a paragraph rather than an assertion: there is nothing to assert against.
 * ``accept_partial: false`` — a partial payment must not be mistakable for recovery.
   ``payment_link.partially_paid`` exists precisely because partial payment is
   possible, and Revora has no notion of partial recovery, so it does not accept one.
@@ -52,6 +68,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import StrEnum, unique
 from typing import Final
 
 from revora.domain.actions import CandidateAction
@@ -67,6 +84,7 @@ from revora.domain.keys import (
 from revora.domain.money import Minor
 from revora.platform.clock import ensure_utc
 from revora.platform.masking import sensitive
+from revora.providers.classification import PAYMENT_LINK_ID_PREFIX
 
 __all__ = [
     "KEY_HEX_LENGTH",
@@ -76,12 +94,17 @@ __all__ = [
     "NOTES_KEY_FIELD",
     "PROVIDER_EXPIRY_CEILING",
     "REFERENCE_ID_PREFIX",
+    "RESEND_RESPONSE_ID_MARKER",
+    "RESEND_RESPONSE_ID_SEPARATOR",
     "CustomerContact",
+    "NotifyMedium",
     "PaymentLinkRequest",
     "PaymentLinkRequestError",
     "build_payment_link_request",
     "clamp_expire_by",
+    "is_resend_response_id",
     "reference_id_for",
+    "resend_response_id",
     "validate_description",
 ]
 
@@ -151,6 +174,90 @@ def reference_id_for(case_id: object, action: CandidateAction, attempt_ordinal: 
         return execution_key(case_id, action.value, attempt_ordinal)
     except ExecutionKeyError as exc:
         raise PaymentLinkRequestError(exc.rule, str(exc)) from exc
+
+
+RESEND_RESPONSE_ID_SEPARATOR: Final[str] = "#"
+"""Separates the link id from the notification marker in a composed resend token.
+
+Chosen because **no Razorpay identifier contains it**. That is the whole requirement: the
+composed token has to be unmistakable for a provider id, so that nothing can later hand it
+to a fetch endpoint believing it is one. A character the provider's own id alphabet uses
+would have made the token merely unlikely to be misread."""
+
+RESEND_RESPONSE_ID_MARKER: Final[str] = "notify_by:"
+"""Names the operation inside the composed token, matching the endpoint path segment.
+
+Present so a person reading ``provider_response_id`` on an intent row can tell what the
+row records without consulting ``effect_kind`` — the two agree, and a reader who has only
+one of them is not stuck."""
+
+
+@unique
+class NotifyMedium(StrEnum):
+    """The channel a resend goes out on. The verified ``:medium`` path segment.
+
+    ``POST /v1/payment_links/:id/notify_by/:medium`` documents exactly ``sms`` and
+    ``email``, and the values here are the wire values rather than a Revora vocabulary
+    mapped onto them, because there is nothing to map: this enumeration exists to make the
+    path segment un-typo-able, not to abstract it.
+    """
+
+    SMS = "sms"
+    EMAIL = "email"
+
+
+def resend_response_id(payment_link_id: str, medium: NotifyMedium) -> str:
+    """The identifier persisted for a resend, composed by Revora because the provider sends none.
+
+    ``"<plink_id>#notify_by:<medium>"``. A resend response carries a success boolean and
+    nothing else — no notification id, and no endpoint that reports whether a notification
+    was sent — so ``execution_intent.provider_response_id`` cannot hold a provider value for
+    a resend. Leaving it null was the alternative and it is worse: the column is what a
+    reader looks at to find out what an intent did, and a null there is indistinguishable
+    from an intent that never got a result.
+
+    **The composed form is deliberately not a valid Razorpay identifier**, and that is the
+    property doing the work rather than a naming preference. A token that merely *looked*
+    unusual could still be passed to a fetch endpoint by a future reader who assumed the
+    column always holds a provider id; this one cannot be, because
+    :data:`RESEND_RESPONSE_ID_SEPARATOR` never occurs in a provider identifier. The same
+    property is checked in the other direction by :func:`is_resend_response_id`, which the
+    client uses to refuse a composed token handed back to it as a link id.
+
+    The link id is validated on the way in for the same reason a description is: the failure
+    belongs where the defect is. A blank id, an id that is not a payment link id, or a token
+    that has already been composed once are all Revora-side mistakes discoverable before any
+    call, so they raise here rather than becoming a provider outcome later.
+
+    Raises:
+        PaymentLinkRequestError: if ``payment_link_id`` is blank, already composed, or not a
+            payment link id.
+    """
+    identifier = payment_link_id.strip()
+    if not identifier:
+        raise PaymentLinkRequestError("payment_link_id_blank", "payment link id is empty")
+    if RESEND_RESPONSE_ID_SEPARATOR in identifier:
+        raise PaymentLinkRequestError(
+            "payment_link_id_composed",
+            f"already carries {RESEND_RESPONSE_ID_SEPARATOR!r}; a composed token is not a link id",
+        )
+    if not identifier.startswith(PAYMENT_LINK_ID_PREFIX):
+        raise PaymentLinkRequestError(
+            "payment_link_id_not_a_link_id",
+            f"expected an id beginning {PAYMENT_LINK_ID_PREFIX!r}",
+        )
+    return f"{identifier}{RESEND_RESPONSE_ID_SEPARATOR}{RESEND_RESPONSE_ID_MARKER}{medium.value}"
+
+
+def is_resend_response_id(value: str) -> bool:
+    """True if ``value`` is a Revora-composed resend token rather than a provider identifier.
+
+    The guard that makes the composed form's un-fetchability enforced rather than merely
+    intended. Read by the client before it builds a resend URL, so a stored
+    ``provider_response_id`` fed back in is refused locally — nothing sent, nothing
+    uncertain — instead of being pasted into a path the provider would 404.
+    """
+    return f"{RESEND_RESPONSE_ID_SEPARATOR}{RESEND_RESPONSE_ID_MARKER}" in value
 
 
 def validate_description(description: str, *, max_length: int) -> str:

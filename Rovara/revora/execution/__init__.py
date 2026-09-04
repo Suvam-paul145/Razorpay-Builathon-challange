@@ -25,11 +25,20 @@ The modules, in the order a request moves through them:
 * :mod:`~revora.execution.engine` — the two transactions and the call between them.
 * :mod:`~revora.execution.reconcile` — resolves an unresolved intent by **reading**. The
   only provider operation reachable from it is a read; it can never repeat a create.
+* :mod:`~revora.execution.resend` — the second external effect, and the one that cannot be
+  read back. A resend response carries a success boolean and no identifier, so an
+  ``UNCERTAIN`` resend is escalated once and never reconciled.
+* :mod:`~revora.execution.escalation` — the single disposition for an execution whose outcome
+  cannot be established, shared by the two paths that can conclude it.
 
 Two invariants to hold onto when reading any of it. An unresolved intent
 (``ATTEMPTED``/``UNCERTAIN``) never permits another call — only a read may resolve it. And a
 resolved intent is never rewritten, because the stability of the record, not the call count,
 is what the guarantee actually rests on.
+
+The resend qualifies the first invariant in one direction only, and it is the safe one: for a
+resend there is no read that can resolve it either, so the intent stays unresolved and the case
+goes to a person. Nothing anywhere gains permission to call again.
 """
 
 from __future__ import annotations
@@ -51,8 +60,16 @@ from revora.execution.reconcile import (
     reconcile_intents,
     unresolved_intent_count,
 )
+from revora.execution.resend import (
+    RESEND_RECONCILIATION_ATTEMPT_BOUND,
+    ResendDisposition,
+    ResendSettlement,
+    ResendTarget,
+    settle_resend_result,
+)
 
 __all__ = [
+    "RESEND_RECONCILIATION_ATTEMPT_BOUND",
     "RESOLVED_STATES",
     "UNRESOLVED_STATES",
     "ExecutionAttempt",
@@ -60,8 +77,12 @@ __all__ = [
     "IntentDisposition",
     "ReconcileOutcome",
     "ReconcileResult",
+    "ResendDisposition",
+    "ResendSettlement",
+    "ResendTarget",
     "execute_approved_action",
     "promote_stale_intents",
     "reconcile_intents",
+    "settle_resend_result",
     "unresolved_intent_count",
 ]
