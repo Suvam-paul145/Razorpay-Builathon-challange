@@ -354,6 +354,72 @@ class CustomerSignalRepository(MerchantScopedRepository[CustomerSignal]):
         )
         return self.session.execute(statement).scalar_one_or_none()
 
+    def first_of_kind(
+        self,
+        merchant_id: uuid.UUID,
+        case_id: uuid.UUID,
+        *,
+        kind: CustomerSignalKind,
+    ) -> CustomerSignal | None:
+        """The earliest signal of one kind on a case, or ``None``.
+
+        **Earliest, and the contrast with :meth:`latest_delay_reason` is deliberate.** A second
+        stated reason corrects the first, so that read takes the last one. The kinds this read
+        serves carry no value to revise — a repeated Partial_Arrangement_Request is the same
+        customer asking the same thing again, not a correction — so the instant that matters is
+        the one the request was *first* made, which is when the case became a person's problem.
+
+        Served by ``ix_customer_signal_merchant_id_case_id_submitted_at``, read forward, with
+        ``created_at`` breaking a tie on ``submitted_at`` exactly as the reverse read does: the
+        instant is the request's, so two submissions inside one clock tick sort by insertion
+        rather than arbitrarily.
+
+        ``LIMIT 1`` rather than a list plus an index, so the caller needs no bound argument and
+        the query cannot read a row it will discard.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                CustomerSignal.case_id == case_id,
+                CustomerSignal.kind == kind.value,
+            )
+            .order_by(CustomerSignal.submitted_at, CustomerSignal.created_at)
+            .limit(1)
+        )
+        return self.session.execute(statement).scalar_one_or_none()
+
+    def first_with_delay_reason_in(
+        self,
+        merchant_id: uuid.UUID,
+        case_id: uuid.UUID,
+        *,
+        reasons: Sequence[str],
+    ) -> CustomerSignal | None:
+        """The earliest signal on a case whose stated reason is one of ``reasons``.
+
+        The membership set is **passed in** rather than named here, and that is the layering
+        rather than a convenience. Which Delay_Reasons are Hard_Stop_Reasons is decided by
+        ``revora.customer.suppression.HARD_STOP_FOR``, which sits above this package — a
+        repository that held its own copy of the classification would be a second place the
+        answer lives, and the direction that copy would fail in is a hard stop nobody found.
+
+        An empty ``reasons`` is refused rather than silently matching nothing. "Ask whether this
+        case holds any of no reasons" is not a question a caller means to ask, and answering
+        ``None`` to it would make a mis-derived set look like a clean absence.
+        """
+        if not reasons:
+            raise ValueError("reasons must name at least one Delay_Reason value")
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                CustomerSignal.case_id == case_id,
+                CustomerSignal.delay_reason.in_(list(reasons)),
+            )
+            .order_by(CustomerSignal.submitted_at, CustomerSignal.created_at)
+            .limit(1)
+        )
+        return self.session.execute(statement).scalar_one_or_none()
+
     def count_for_case(self, merchant_id: uuid.UUID, case_id: uuid.UUID) -> int:
         """How many signals a case holds, for the ``MAX_CUSTOMER_SIGNALS_PER_CASE``
         check of R19.C7.

@@ -24,7 +24,7 @@ from datetime import datetime
 from sqlalchemy import Select, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
-from revora.domain.enums import CaseState
+from revora.domain.enums import CaseState, TerminalReason
 from revora.domain.payment_event import RECOVERY_SIGNAL_EVENTS, PaymentStatus
 from revora.domain.transitions import TERMINAL_STATES
 from revora.persistence.models import DetectionVerdictRecord, RecoveryCase, WebhookEvent
@@ -343,6 +343,37 @@ class RecoveryCaseRepository(MerchantScopedRepository[RecoveryCase]):
         statement = (
             self.scoped(merchant_id)
             .where(RecoveryCase.state == state.value)
+            .order_by(RecoveryCase.detected_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.execute(statement).scalars())
+
+    def list_by_terminal_reason(
+        self,
+        merchant_id: uuid.UUID,
+        reason: TerminalReason,
+        *,
+        limit: int,
+    ) -> Sequence[RecoveryCase]:
+        """Cases that ended for one reason, newest first, within one merchant.
+
+        Distinct from :meth:`list_by_state`, and the ``ESCALATED`` grouping is exactly why both
+        exist. Five Terminal_States share fourteen terminal reasons between them, so "escalated"
+        and "escalated *because the customer asked to pay differently*" are different questions
+        with different answers and different queues behind them. A caller that had only
+        :meth:`list_by_state` would have to read every escalated case and filter in Python, which
+        is a scan that grows with the merchant rather than with the answer.
+
+        ``terminal_reason`` is ``NULL`` on every non-terminal case, so the equality predicate
+        excludes them without a second clause naming the terminal states — and it stays correct if
+        a fifteenth terminal reason is added, which a state list would not.
+
+        Newest first by ``detected_at``, matching :meth:`list_by_state`, so two lists rendered
+        beside each other on one screen are ordered the same way.
+        """
+        statement = (
+            self.scoped(merchant_id)
+            .where(RecoveryCase.terminal_reason == reason.value)
             .order_by(RecoveryCase.detected_at.desc())
             .limit(limit)
         )

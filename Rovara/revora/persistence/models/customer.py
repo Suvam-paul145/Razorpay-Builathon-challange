@@ -74,6 +74,7 @@ from revora.persistence.models.base import TIMESTAMPTZ, RowBase, enum_check
 __all__ = [
     "DELAY_NOTE_MAX_LENGTH",
     "FOLLOW_UP_PENDING_STATUS_SQL",
+    "MAX_PROMISES_PER_CASE",
     "SECRET_HASH_BYTES",
     "ContactSuppression",
     "CustomerAccessToken",
@@ -90,6 +91,26 @@ DELAY_NOTE_MAX_LENGTH: int = 500
 """``DELAY_NOTE_MAX_LENGTH`` as a backstop, and the one configurable bound on
 ``customer_signal`` that is encoded in the schema. Encoded because the truncation R20.C2
 performs is lossy anyway, so raising the bound only ever affects future rows."""
+
+MAX_PROMISES_PER_CASE: int = 1
+"""``MAX_PROMISES_PER_CASE`` as the schema holds it: ``UNIQUE (merchant_id, case_id)`` on
+:class:`PromiseToPay` permits exactly one row per case, so the encoded value is 1.
+
+The second of the two configurable bounds encoded in this module's schema, and the *opposite*
+call to :data:`DELAY_NOTE_MAX_LENGTH`'s in one respect worth stating. That one is encoded
+because the truncation it governs is lossy anyway, so a raised bound only affects future rows.
+This one is encoded because two concurrent submissions on one case have to be resolved by
+something that cannot be raced, and an index is the only thing available: an application count
+under a row lock bounds submissions on one *token*, and a case can hold a second token.
+
+Exported so :mod:`revora.customer.promises` can take the smaller of this and the configured
+row, on exactly the terms :func:`revora.customer.signals.effective_note_limit` takes the
+smaller of ``DELAY_NOTE_MAX_LENGTH`` and its column. Lowering the configured bound to 0 takes
+effect on the next write; raising it above this 1 cannot, and attempting it would refuse the
+second promise with a constraint violation — a 503 — instead of R23.C7's 409. So the writer
+takes the ``min`` and the two can never contradict each other in the direction that breaks a
+request. Raising the bound for real needs a migration that drops the index first, and this
+constant is what that migration also has to change."""
 
 FOLLOW_UP_PENDING_STATUS_SQL: str = ", ".join(
     f"'{member.value}'"
@@ -389,10 +410,13 @@ class PromiseToPay(RowBase):
         ),
         enum_check("promise_to_pay", "status", PromiseStatus),
         enum_check("promise_to_pay", "voided_by_terminal_state", CaseState),
-        # MAX_PROMISES_PER_CASE = 1. This encodes today's value of a configurable
-        # bound, which is a deliberate coupling and is recorded as one: R23.C7's
-        # rejection is checked in application code against the configured value, and
-        # this is the backstop behind it. Raising the bound needs a later migration.
+        # MAX_PROMISES_PER_CASE = 1, and the number is MAX_PROMISES_PER_CASE above
+        # rather than a literal here, so the constant the writer clamps against and the
+        # index that backstops it cannot come to disagree. This encodes today's value of
+        # a configurable bound, which is a deliberate coupling and is recorded as one:
+        # R23.C7's rejection is checked in application code against the *smaller* of the
+        # configured value and this one, and this is the backstop behind it. Raising the
+        # bound needs a later migration to drop the index.
         UniqueConstraint(
             "merchant_id", "case_id", name="uq_promise_to_pay_merchant_id_case_id"
         ),

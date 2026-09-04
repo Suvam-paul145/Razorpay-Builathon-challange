@@ -30,7 +30,7 @@ __all__ = [
     "verify_schema_revision",
 ]
 
-EXPECTED_REVISION: Final[str] = "0015"
+EXPECTED_REVISION: Final[str] = "0018"
 """The head this build expects. Bump in the same commit as a new migration.
 
 ``0005`` added ``experiment_result`` and ``memory_observation.diagnosis_method``; ``0006``
@@ -79,6 +79,36 @@ ticker would not start. Which is the correct outcome and the reason to bump — 
 started and silently ran three of its seven sweeps on a guessed interval is exactly the failure
 the whole role exists to remove, and it would present as "the retention sweep is late" rather
 than as "the database was not migrated".
+
+``0016`` seeds the five bounds the Promise_To_Pay capture needs —
+``PROMISE_MIN_LEAD_TIME``, ``PROMISE_FOLLOW_UP_OFFSET``, ``PROMISE_WINDOW_SAFETY_MARGIN``,
+``MAX_PROMISES_PER_CASE`` and ``PROMISE_SWEEP_INTERVAL`` (R23.C2, C3, C7, C13) — and is
+data-only like the six seeds before it. The consequence of not bumping here is the sharpest of
+the set, because two of the five decide what is *storable* rather than what is permitted:
+``follow_up_at < window_end_at_snapshot`` is a ``CHECK`` from ``0008``, and the safety margin is
+what keeps the computed Follow_Up_Instant inside it. A build that loaded the margin from a
+placeholder would be computing a clamp against a number nobody configured on the one endpoint
+reachable without a session, and the failure would present as a 503 to a well-formed promise
+rather than as "the database was not migrated". ``load_strict`` refuses first, which is why the
+bump is the fix.
+
+``0017`` widens ``ck_recommendation_candidate_exclusion_reason_enum`` with
+``NO_PROMISE_RECORDED`` and ``PROMISE_DATE_NOT_REACHED``, the two grounds R24 excludes
+``PROMISE_TO_PAY_FOLLOW_UP`` on. It is the first schema-changing revision since ``0015`` and it
+is *not* data-only, which changes the failure mode rather than only the message: a build
+expecting ``0017`` against an ``0016`` database would rank the follow-up, exclude it correctly,
+and then fail the ``INSERT`` that records why — inside the decision cycle's transaction, so a
+case holding a promise would stall its whole cycle. Refusing at startup is the difference
+between that and one loud message naming the missing revision.
+
+``0018`` widens the same ``CHECK`` once more, with ``LIVE_PAYMENT_LINK_EXISTS`` — the ground on
+which ``PAYMENT_LINK`` is withheld from a case that already holds a live link (R24.C10 read at
+system scope). Schema-changing like ``0017`` and with the same failure mode, but reachable on a
+much wider set of cases: *every* case on its second decision cycle after a confirmed link asks
+this question, not only the ones holding a promise. A build expecting ``0018`` against an ``0017``
+database would exclude the duplicate correctly and then fail the ``INSERT`` recording why, inside
+the decision cycle's transaction — so the cycle stalls on exactly the cases where the alternative
+to stalling is sending a customer a second payable link.
 
 ``0008`` is the bump that matters most so far, because the ``action_cost`` drop makes the
 schemas mutually incompatible in both directions: a build expecting ``0007`` writing
