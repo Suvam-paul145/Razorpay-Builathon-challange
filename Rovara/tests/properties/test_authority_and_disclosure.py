@@ -319,33 +319,68 @@ def test_the_reasoning_package_re_exports_nothing() -> None:
     )
 
 
-@pytest.mark.pure
-def test_no_module_in_the_decision_path_imports_the_reasoning_layer() -> None:
-    """The diagnosis, optimizer and policy layers must not depend on a model being there.
+SANCTIONED_REASONING_CALLERS: frozenset[str] = frozenset({"jobs/pipeline.py"})
+"""The complete set of modules permitted to import the reasoning layer.
 
-    ``import-linter`` already forbids policy and the optimizer from reaching the AI layer, and that
-    contract is the authority. This adds the one thing a contract cannot express: that *no* module
-    imports ``revora.reasoning`` at all, so the package being empty cannot break anything. A stray
-    import would make an empty package an ``ImportError`` at startup rather than a no-op.
+One module. Task 49.3 put all three invocation sites in ``revora/jobs/pipeline.py``, and this
+set is the assertion that a fourth caller cannot appear without somebody editing this line.
+Adding a name here is the review step: it means a new component can now reach a model, and
+the question "which components can" stops being answerable by reading one entry."""
+
+
+@pytest.mark.pure
+def test_only_the_job_pipeline_imports_the_reasoning_layer() -> None:
+    """The decision-*making* components still cannot depend on a model being there.
+
+    **This test changed in task 49.3 and the change is a narrowing, not a relaxation.** It used
+    to assert that *no* module imported ``revora.reasoning`` at all, which was the right claim
+    while the package was declared and unwired: a stray import would have turned an empty
+    package into an ``ImportError`` at startup. The package now has three invocation sites, so
+    that form of the claim is no longer available — and asserting it would mean deleting the
+    wiring rather than checking it.
+
+    What replaces it is the stronger, more specific statement. ``revora.jobs.pipeline`` is the
+    single sanctioned caller, named in :data:`SANCTIONED_REASONING_CALLERS`, and every other
+    module in ``revora`` is still unable to import the layer. That keeps the property the
+    original test existed for — no component that *decides* anything can reach a model — while
+    making the one component that may reach one enumerable rather than implicit.
+
+    ``import-linter`` carries the half a test cannot: ``policy-isolation`` and
+    ``optimizer-isolation`` forbid two named packages, and the ``layering`` band makes
+    ``revora.reasoning`` a sibling of ``revora.diagnosis``, ``revora.estimation`` and
+    ``revora.memory``, so none of the four can import each other. Those contracts are the
+    authority. This test adds what a contract cannot express: that the set of callers *above*
+    that band is exactly one, so ``revora.api``, ``revora.execution``, ``revora.outcome``,
+    ``revora.metrics``, ``revora.experiment`` and ``revora.timeline`` — every one of which the
+    layering would permit to import reasoning — do not.
+
+    ``revora.execution`` is the interesting member of that list. It composes the customer-visible
+    description, so it is the module a reader would expect to hold the adapter; it does not, and
+    receives the validated draft as ``execute_approved_action``'s ``ai_description`` argument
+    instead. That is what makes "the engine cannot tell a model's sentence from a template" true
+    of the signature rather than of the current code.
     """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2] / "revora"
-    offenders = [
+    # A docstring mentioning it is fine; an import is not.
+    importing = sorted(
         path.relative_to(root).as_posix()
         for path in root.rglob("*.py")
-        if "reasoning" not in path.parts and "revora.reasoning" in path.read_text(encoding="utf-8")
-    ]
-    # A docstring mentioning it is fine; an import is not.
-    importing = [
-        name
-        for name in offenders
-        if any(
+        if "reasoning" not in path.parts
+        and any(
             line.strip().startswith(("import revora.reasoning", "from revora.reasoning"))
-            for line in (root / name).read_text(encoding="utf-8").splitlines()
+            for line in path.read_text(encoding="utf-8").splitlines()
         )
-    ]
-    assert importing == [], f"modules import the empty reasoning package: {importing}"
+    )
+    unsanctioned = [name for name in importing if name not in SANCTIONED_REASONING_CALLERS]
+    assert unsanctioned == [], (
+        f"modules outside the sanctioned caller set import the reasoning layer: {unsanctioned}"
+    )
+    assert importing == sorted(SANCTIONED_REASONING_CALLERS), (
+        "the sanctioned caller set no longer matches reality; a name listed there that imports "
+        f"nothing makes the set read as permission nobody uses. Found {importing}"
+    )
 
 
 @pytest.mark.pure

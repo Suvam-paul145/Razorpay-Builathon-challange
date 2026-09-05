@@ -55,6 +55,8 @@ import pytest
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
+from revora.persistence.repositories.config import invalidate_configuration_cache
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 APP_ROLE = "revora_app"
@@ -133,6 +135,12 @@ def migrated_url(owner_url: str) -> str:
             os.environ.pop("REVORA_DATABASE_URL", None)
         else:
             os.environ["REVORA_DATABASE_URL"] = previous
+
+    # The seed migrations write ``app_config``, and unlike a deployment — where Alembic runs as
+    # its own process and there is no cache to stale — here they run inside the test process,
+    # alongside the memoization in ``persistence.repositories.config``. Every writer of
+    # configuration invalidates; this is one of them.
+    invalidate_configuration_cache()
     return owner_url
 
 

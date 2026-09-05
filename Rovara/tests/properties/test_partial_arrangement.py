@@ -803,13 +803,58 @@ def test_p48_an_absent_request_adds_no_key_to_the_observation() -> None:
     Which is what keeps the pg test asserting the exact five-key feature set on an expired case
     honest, and it is the reason the writer returns an empty mapping rather than the key with a
     ``None`` value: a present-but-null key is a key a containment probe can match on.
+
+    Asserted by calling the writer rather than by reading its source. The source form of this test
+    checked that the string ``return {}`` appeared in a named private function, which stopped
+    being true when task 48 folded the arrangement key in beside the Customer_Signal keys R25.C1
+    added — while the claim it was protecting was still perfectly true. A source assertion fails
+    on a rename and passes on a rewrite that keeps the shape; calling the function fails on the
+    thing that matters.
     """
     from revora.memory import store as store_module
 
-    source = inspect.getsource(store_module._arrangement_features)
-    assert "return {}" in source, (
-        "the arrangement feature writer no longer has an empty-mapping path, so every observation "
-        "in the system now carries the key"
+    nothing_said = store_module.CustomerSignalFacts(
+        signal_count=0,
+        delay_reason=None,
+        promise_status=None,
+        promise_seconds_to_payment=None,
+        arrangement=None,
+        contact_suppressed=False,
+        any_synthetic=False,
+        signal_after_action=False,
+        first_action_at=None,
+        latest_signal_at=None,
+    )
+    assert nothing_said.has_content is False
+    assert store_module._signal_features(nothing_said) == {}, (
+        "a case that said nothing now carries a Customer_Signal key, so every observation in the "
+        "system gained a key a containment probe can match on"
+    )
+
+    asked = store_module.CustomerSignalFacts(
+        signal_count=1,
+        delay_reason=None,
+        promise_status=None,
+        promise_seconds_to_payment=None,
+        arrangement=ArrangementRequest(
+            signal_id=_SOME_CASE_ID,
+            requested_at=_NOW,
+            note=None,
+            note_truncated=False,
+            note_redacted_at=None,
+        ),
+        contact_suppressed=False,
+        any_synthetic=False,
+        signal_after_action=False,
+        first_action_at=None,
+        latest_signal_at=_NOW,
+    )
+    written = store_module._signal_features(asked)
+    assert FEATURE_PARTIAL_ARRANGEMENT in written
+    assert not set(written).intersection(FEATURE_KEYS), (
+        "a Customer_Signal feature key collided with a segment feature, which would overwrite "
+        "the segment value the estimator matches on and move every baseline in this merchant's "
+        "history without failing anything else"
     )
 
 

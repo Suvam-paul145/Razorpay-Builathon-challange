@@ -22,7 +22,9 @@ assertion that at most one create is ever issued per idempotency key.
 **Contact details are never recorded.** The call log stores identifiers, amounts and
 the two correctness-critical flags — not the customer contact, even though the request
 object carries it. A test fixture is still somewhere a PII habit can form, and the
-recorded arguments are the part of a fake most likely to be printed on a failure.
+recorded arguments are the part of a fake most likely to be printed on a failure. The
+customer-visible ``description`` is held for the same reason *outside* the call log,
+reachable only through :meth:`FakeRazorpay.sent_description_for`.
 
 **The resend has its own outcome set**, and one member of it exists for a reason worth
 naming: ``RATE_LIMITED``. A 429 is the only outcome whose classification differs between the
@@ -361,8 +363,8 @@ class FakeRazorpay:
     one create per key" from a failed assertion into an intermittent one.
     """
 
-    __slots__ = ("_behaviour", "_calls", "_create_attempts", "_fetch_attempts", "_links",
-                 "_listing_attempts", "_lock", "_notify_attempts", "_payment_amounts",
+    __slots__ = ("_behaviour", "_calls", "_create_attempts", "_descriptions", "_fetch_attempts",
+                 "_links", "_listing_attempts", "_lock", "_notify_attempts", "_payment_amounts",
                  "_payment_scripts", "_sequence", "_window_attempts")
 
     def __init__(self, behaviour: ProviderBehaviour | None = None) -> None:
@@ -376,6 +378,8 @@ class FakeRazorpay:
         self._notify_attempts: dict[str, int] = {}
         self._window_attempts = 0
         self._links: dict[str, PaymentLinkEntity] = {}
+        # Kept out of the call log deliberately; see ``sent_description_for``.
+        self._descriptions: dict[str, str] = {}
         # Per-payment overrides. Empty for every existing test, which is why the read path
         # below falls through to the behaviour object when a payment is not in here.
         self._payment_amounts: dict[str, int] = {}
@@ -418,6 +422,24 @@ class FakeRazorpay:
         """
         with self._lock:
             return self._notify_attempts.get(_notify_key(payment_link_id, medium), 0)
+
+    def sent_description_for(self, reference_id: str) -> str | None:
+        """The customer-visible description sent under one idempotency key, or ``None``.
+
+        **Recorded outside :attr:`calls` on purpose**, which is why this is a method rather
+        than another key in ``arguments``. ``PaymentLinkRequest.__repr__`` deliberately omits
+        the description because it is customer-visible text that may name an order or an
+        amount, and the recorded ``arguments`` mapping is the part of this fake most likely to
+        be printed by a failing assertion. Holding it here keeps that stance while still giving
+        a test the one oracle the degradation ladder needs: "the approved template carried the
+        load" is a claim about *which sentence went out*, and nothing else can answer it.
+
+        Overwritten per ``reference_id`` rather than appended, because an idempotency key is
+        permitted at most one create — a second entry would mean a defect the count assertions
+        already own.
+        """
+        with self._lock:
+            return self._descriptions.get(reference_id)
 
     def created_link_exists(self, reference_id: str) -> bool:
         """Whether the external effect exists on the fake provider side.
@@ -481,6 +503,7 @@ class FakeRazorpay:
         with self._lock:
             attempt = self._create_attempts.get(request.reference_id, 0) + 1
             self._create_attempts[request.reference_id] = attempt
+            self._descriptions[request.reference_id] = request.description
             self._record(
                 OPERATION_CREATE_PAYMENT_LINK,
                 {

@@ -16,9 +16,11 @@ import base64
 import hmac
 import json
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
+from types import MappingProxyType
+from typing import Final
 
 import pytest
 from fastapi import FastAPI
@@ -94,27 +96,64 @@ def installed_engine(migrated_url: str) -> Iterator[Engine]:
         dispose_engine()
 
 
+INTEGRATION_SECRETS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "REVORA_PAYLOAD_ENCRYPTION_KEYS": "1:" + base64.b64encode(b"I" * 32).decode(),
+        "REVORA_CUSTOMER_KEY_SECRET": base64.b64encode(b"J" * 32).decode(),
+        "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS": "1:" + base64.b64encode(b"J" * 32).decode(),
+        "REVORA_SESSION_TOKEN_SECRET": base64.b64encode(b"K" * 32).decode(),
+        "REVORA_RAZORPAY_KEY_ID": "rzp_test_integration",
+        "REVORA_RAZORPAY_KEY_SECRET": "integration-secret",
+    }
+)
+"""Every credential the pipeline needs, and deliberately **not** an LLM one.
+
+``REVORA_LLM_CREDENTIAL`` is absent on purpose, and its absence is now load-bearing rather
+than merely historical: it is the *default* rung of the reasoning row of the degradation
+ladder, so a value here would make "runs fully with the model unavailable" untestable by
+making the unavailability invisible.
+
+The two 32-byte keys are not arbitrary. ``REVORA_PAYLOAD_ENCRYPTION_KEYS`` is what the stored
+webhook ciphertext was written under and ``REVORA_CUSTOMER_KEY_SECRET`` is what every
+``customer_key`` in the database was derived from, so a test that installs a *different* store
+mid-run has to carry both of these forward unchanged or it is no longer testing the same
+system. :func:`secret_store_without` exists so that is done by omission rather than by
+copying the literals."""
+
+
+def secret_store_without(*absent: str) -> SecretStore:
+    """A store holding :data:`INTEGRATION_SECRETS` minus ``absent``.
+
+    How a test stages the loss of exactly one credential. Subtractive rather than additive so
+    the *other* five keep their values by construction — an unresolvable token signing secret
+    is supposed to break the token mint and nothing else, and a hand-built store that also
+    dropped the payload encryption key would fail earlier, for a different reason, and look
+    like the same result.
+
+    A name absent from :data:`INTEGRATION_SECRETS` is accepted without complaint: the point is
+    what the store cannot answer, and ``REVORA_LLM_CREDENTIAL`` was never in there.
+    """
+    return SecretStore(
+        _Resolver({k: v for k, v in INTEGRATION_SECRETS.items() if k not in absent})
+    )
+
+
+def secret_store_with(**extra: str) -> SecretStore:
+    """A store holding :data:`INTEGRATION_SECRETS` plus ``extra``.
+
+    The one caller passes ``REVORA_LLM_CREDENTIAL``. A reasoning fault that is *not* the absent
+    credential — a timeout, a schema rejection — is unreachable without one: the adapter
+    resolves the credential before it touches its transport, so with none configured every
+    call returns ``Unavailable(CREDENTIAL_ABSENT)`` and an injected ``MockTransport`` is never
+    consulted.
+    """
+    return SecretStore(_Resolver({**INTEGRATION_SECRETS, **extra}))
+
+
 @pytest.fixture
 def installed_secrets() -> Iterator[None]:
-    """Every credential the pipeline needs, and deliberately **not** an LLM one.
-
-    ``REVORA_LLM_CREDENTIAL`` is absent on purpose. Task 14 was dropped, so there is no reasoning
-    layer to credential — and a fixture that supplied a key for a component that does not exist
-    would make the "runs fully with the model unavailable" claim untestable by making the
-    unavailability invisible.
-    """
-    resolver = _Resolver(
-        {
-            "REVORA_PAYLOAD_ENCRYPTION_KEYS": "1:" + base64.b64encode(b"I" * 32).decode(),
-            "REVORA_CUSTOMER_KEY_SECRET": base64.b64encode(b"J" * 32).decode(),
-            "REVORA_CUSTOMER_TOKEN_SIGNING_SECRETS": "1:"
-            + base64.b64encode(b"J" * 32).decode(),
-            "REVORA_SESSION_TOKEN_SECRET": base64.b64encode(b"K" * 32).decode(),
-            "REVORA_RAZORPAY_KEY_ID": "rzp_test_integration",
-            "REVORA_RAZORPAY_KEY_SECRET": "integration-secret",
-        }
-    )
-    previous = set_secret_store(SecretStore(resolver))
+    """:data:`INTEGRATION_SECRETS`, installed process-wide and restored afterwards."""
+    previous = set_secret_store(secret_store_without())
     crypto.reset_cached_material()
     try:
         yield
@@ -196,12 +235,20 @@ def failed_payment_body(
     amount: int = 2_000_000,
     contact: str = "+919876543210",
     reason: str = "insufficient_funds",
+    order_id: str | None = None,
 ) -> bytes:
     """A verified-shape ``payment.failed`` envelope.
 
     ``insufficient_funds`` maps deterministically to ``INSUFFICIENT_FUNDS``, whose eligibility row
     permits ``PAYMENT_LINK`` — so the optimizer has a real action to weigh against the null ones
     rather than falling through for lack of a candidate.
+
+    ``order_id`` defaults to one derived from the event id, so two deliveries are two orders unless
+    a caller says otherwise. Overridable because the Suppression_Scope is
+    ``sha256(customer_key ‖ order_id)`` where the Payment_Event carried an order — so "a dispute
+    about one order suppresses that order and not the customer's next one" is only testable by two
+    failures that agree about the order, and the default makes that agreement impossible to reach
+    by accident.
     """
     payload = {
         "entity": "event",
@@ -215,7 +262,7 @@ def failed_payment_body(
                     "amount": amount,
                     "currency": "INR",
                     "status": "failed",
-                    "order_id": f"order_{event_id}",
+                    "order_id": f"order_{event_id}" if order_id is None else order_id,
                     "method": "card",
                     "contact": contact,
                     "email": "buyer@example.invalid",
@@ -401,6 +448,7 @@ def drive_to_case(
     amount: int = LINK_PATH_AMOUNT,
     opted_out: bool = False,
     registry: dict[str, Handler] | None = None,
+    order_id: str | None = None,
 ) -> tuple[uuid.UUID, str]:
     """Record the consent decision, deliver a failure, and let detection open the case.
 
@@ -437,7 +485,9 @@ def drive_to_case(
 
     payment_id = f"pay_{uuid.uuid4().hex[:16]}"
     event_id = f"evt_{uuid.uuid4().hex[:16]}"
-    body = failed_payment_body(payment_id, event_id, amount=amount, contact=_CONTACT)
+    body = failed_payment_body(
+        payment_id, event_id, amount=amount, contact=_CONTACT, order_id=order_id
+    )
     assert deliver(client, tenant.slug, body, event_id) == 200
 
     handlers = registry_for(fake) if registry is None else registry
@@ -459,6 +509,7 @@ def drive_to_case(
 __all__ = [
     "DASHBOARD_KEY",
     "ESCALATION_PATH_AMOUNT",
+    "INTEGRATION_SECRETS",
     "LINK_PATH_AMOUNT",
     "MAX_WORKER_PASSES",
     "WEBHOOK_SECRET",
@@ -478,5 +529,7 @@ __all__ = [
     "record_opt_out",
     "registry_for",
     "registry_without_executor",
+    "secret_store_with",
+    "secret_store_without",
     "sign",
 ]
