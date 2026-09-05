@@ -28,6 +28,14 @@ claim, and the label travels with it into every export.
 **All money is integer minor units, all rates are ``Decimal``.** Sums are ``BIGINT`` in the
 database and ``int`` here. The only division is a rate, computed in ``Decimal`` at four places, so
 a total always equals the sum of its rows.
+
+**The Customer_Signal cohort counts are counts, and deliberately not rates** (R25.C11). See
+:class:`SignalCohortCounts`. They are segmented on R12.C10's terms by construction rather than by
+a second filter: :func:`_cohort` has already applied the :class:`SegmentKey`, so the counts
+describe exactly the cases the money figures beside them describe, and a segment's signal counts
+and the aggregate's are produced by one function. That is the same argument that has segments and
+the aggregate share :func:`compute_metrics` — a count defined differently from the total it rolls
+into is worse than no count.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import func, select
 
+from revora.customer.suppression import scope_key_for_case
 from revora.domain.attribution import attribution_refusals
 from revora.domain.enums import (
     DEMONSTRATION_ONLY,
@@ -47,22 +56,28 @@ from revora.domain.enums import (
     RECOVERY_GROSS_OF_REFUNDS,
     UNDEFINED,
     CaseState,
+    CustomerSignalKind,
+    DelayReason,
     ExperimentGroup,
     ExperimentLabel,
     ExperimentState,
     IntentState,
     OutcomeClass,
+    PromiseStatus,
     Provenance,
     RiskCause,
 )
 from revora.domain.money import Minor
 from revora.domain.segments import AmountBand, amount_band_for
 from revora.persistence.models import (
+    ContactSuppression,
+    CustomerSignal,
     Diagnosis,
     ExecutionIntent,
     ExperimentAssignment,
     MemoryObservation,
     PolicyDecision,
+    PromiseToPay,
     RecommendationCandidate,
     RecoveryCase,
     RecoveryOutcome,
@@ -77,7 +92,7 @@ from revora.platform.clock import now
 from revora.platform.logging import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from sqlalchemy.orm import Session
 
@@ -89,6 +104,7 @@ __all__ = [
     "IncrementalFinding",
     "ReportingPeriod",
     "SegmentKey",
+    "SignalCohortCounts",
     "compute_metrics",
     "demonstration_finding",
     "incremental_finding",
@@ -348,6 +364,75 @@ class DemonstrationFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class SignalCohortCounts:
+    """How many Recovery_Cases in this cohort held each Customer_Signal consequence (R25.C11).
+
+    Counts of *cases*, not of signals, which is what R25.C11 asks for and what a merchant can
+    act on: "eleven customers said their salary was late" is a fact about eleven people, while
+    "fourteen delay-reason submissions" is a fact about a form.
+
+    Every mapping holds only the values that occur. The empty mapping for a cohort where nobody
+    submitted anything is the honest answer, and it is distinguishable from a cohort with no
+    cases at all by :attr:`~CohortMetrics.case_count` sitting beside it.
+
+    **No rates.** A signal rate would divide a customer's choice to speak by a cohort size, and
+    the resulting figure moves when detection volume moves — which is the wrong denominator for
+    every question anybody asks of it. The counts are reported next to ``case_count`` and any
+    ratio a reader wants is theirs to form deliberately.
+    """
+
+    by_delay_reason: Mapping[str, int] = field(default_factory=dict)
+    """Cases per Delay_Reason value.
+
+    Keyed on the **latest** reason each case holds, matching
+    :meth:`~revora.persistence.repositories.customer.CustomerSignalRepository.latest_delay_reason`
+    — which is the reason R20.C4 diagnoses on and the reason Recovery_Memory records. So this
+    mapping sums to at most :attr:`~CohortMetrics.case_count` and describes the same population
+    the training-set composition report describes.
+
+    The alternative reading of "cases holding each Delay_Reason value" counts a case that
+    corrected itself under both values, and sums to more than the cohort. It is defensible as
+    English and indefensible as a figure beside a money total: a reader who adds the column up
+    and gets more cases than exist has been given a report they cannot trust, and there is no
+    footnote that fixes that."""
+
+    by_promise_status: Mapping[str, int] = field(default_factory=dict)
+    """Cases per Promise_Status. ``MAX_PROMISES_PER_CASE`` is 1 and a partial unique index
+    enforces it, so there is one status per promising case and no latest-versus-first question
+    to answer here."""
+
+    arrangement_request_count: int = 0
+    """Cases holding at least one Partial_Arrangement_Request. At least one rather than exactly
+    one: a customer can ask twice before the escalation is applied, and both asks are the same
+    case needing the same person."""
+
+    contact_suppression_count: int = 0
+    """Cases covered by a Contact_Suppression in force.
+
+    Scope-keyed, not case-keyed (R21.C8), so a case that inherited a suppression written by a
+    sibling case of the same customer and order is counted. That is what makes the figure mean
+    "how many cases Revora may not contact" — the operational question — rather than "how many
+    cases produced a hard stop", which would undercount every case that inherited one."""
+
+    signalling_case_count: int = 0
+    """Cases holding at least one Customer_Signal of any kind, ``PAGE_VIEWED`` included.
+
+    The denominator a reader actually wants for the mappings above, and the one figure here that
+    answers "did the response page get used at all" — which is the first question about this
+    whole feature and is otherwise buried under four more specific counts."""
+
+    def as_document(self) -> dict[str, object]:
+        """The counts as a JSON-ready document, under one key of the cohort report."""
+        return {
+            "by_delay_reason": dict(self.by_delay_reason),
+            "by_promise_status": dict(self.by_promise_status),
+            "arrangement_request_count": self.arrangement_request_count,
+            "contact_suppression_count": self.contact_suppression_count,
+            "signalling_case_count": self.signalling_case_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CohortMetrics:
     """Every figure for one cohort, with the labels that qualify them.
 
@@ -404,6 +489,13 @@ class CohortMetrics:
     Defaulted to an absent figure so every existing construction of this class keeps meaning
     what it meant: a merchant with no demonstration experiment has no demonstration figure,
     which is the honest answer and not a zero."""
+
+    signals: SignalCohortCounts = field(default_factory=SignalCohortCounts)
+    """R25.C11's cohort counts, as their own field for :attr:`demonstration`'s reason.
+
+    Defaulted to all-zero counts so every existing construction of this class stays valid, and
+    zero is the correct default here rather than a sentinel: "no case in this cohort held a
+    Delay_Reason" is a measurement, unlike an unestablished revenue figure."""
 
     @property
     def net_recovered_revenue(self) -> int:
@@ -476,6 +568,11 @@ class CohortMetrics:
             "escalated_case_count": self.escalated_case_count,
             "unnecessary_action_count": self.unnecessary_action_count,
             "cycles_without_action_count": self.cycles_without_action_count,
+            # R25.C11, under one key rather than five flattened onto the top level. Five more
+            # sibling keys would put counts of what customers said in the same namespace as the
+            # money figures, and the one thing this feature must not do is let a signal count be
+            # mistaken for a recovery figure.
+            "customer_signal_cohorts": self.signals.as_document(),
             "labels": list(self.labels),
         }
 
@@ -539,6 +636,10 @@ def compute_metrics(
     actions = _action_figures(session, merchant_id, case_ids)
     cost = _realized_cost(session, merchant_id, case_ids)
     split = _estimated_action_cost(session, merchant_id, case_ids)
+    # R25.C11. Computed from the same ``case_ids`` every figure above is computed from, which is
+    # what makes "segmented on the same terms R12.C10 requires" a fact about the call rather
+    # than a second filter that could be applied differently.
+    signals = _signal_cohorts(session, merchant_id, case_ids)
 
     finding = (
         incremental if incremental is not None else _incremental_finding(session, merchant_id)
@@ -588,6 +689,7 @@ def compute_metrics(
         incremental=finding,
         labels=labels,
         demonstration=demo,
+        signals=signals,
     )
 
     _logger.info(
@@ -656,6 +758,166 @@ def _cohort(
         case_ids.append(row.id)
         provenances.add(str(row.provenance or Provenance.REAL.value))
     return case_ids, provenances
+
+
+def _signal_cohorts(
+    session: Session, merchant_id: uuid.UUID, case_ids: Sequence[uuid.UUID]
+) -> SignalCohortCounts:
+    """R25.C11's five counts over one already-segmented cohort.
+
+    Four aggregate reads and one Python-side join, and the split is worth stating.
+
+    The Delay_Reason, Promise_Status, arrangement and any-signal counts are ``GROUP BY``\\ s in
+    SQL, because each is a count over rows keyed by ``case_id`` and the database is where a count
+    belongs.
+
+    The Contact_Suppression count is not, and cannot be. A Suppression_Scope is
+    ``sha256(customer_key ‖ order_id or case_id)`` — see
+    :func:`~revora.customer.suppression.suppression_scope_key` — so matching a case to a
+    suppression means computing that digest, and computing it in SQL would be a second
+    implementation of the scope derivation. The direction that second implementation fails in is
+    the worst one available: a scope a write and a read disagree about is a suppression that was
+    persisted and is never found. So the digests are computed by the one function every other
+    caller uses and matched in Python, on exactly the terms :func:`_cohort` bands amounts in
+    Python. The cohort is bounded by a reporting period, so the row count is manageable.
+
+    Empty input returns zero counts rather than querying with ``IN ()``, which means "everything"
+    in some dialects and "nothing" in others.
+    """
+    if not case_ids:
+        return SignalCohortCounts()
+
+    ids = list(case_ids)
+
+    # DISTINCT ON, ordered so the row kept per case is the latest stated reason — the same row
+    # ``latest_delay_reason`` returns and the same one Recovery_Memory records, down to the
+    # ``created_at`` tie-break. Two reports of one case must not disagree about what its customer
+    # said, and matching the ordering exactly is what guarantees they cannot.
+    latest_reason = (
+        select(
+            CustomerSignal.case_id.label("case_id"),
+            CustomerSignal.delay_reason.label("delay_reason"),
+        )
+        .where(
+            CustomerSignal.merchant_id == merchant_id,
+            CustomerSignal.case_id.in_(ids),
+            CustomerSignal.kind == CustomerSignalKind.DELAY_REASON.value,
+            CustomerSignal.delay_reason.is_not(None),
+        )
+        .order_by(
+            CustomerSignal.case_id,
+            CustomerSignal.submitted_at.desc(),
+            CustomerSignal.created_at.desc(),
+        )
+        .distinct(CustomerSignal.case_id)
+        .subquery()
+    )
+    by_delay_reason = {
+        str(row[0]): int(row[1])
+        for row in session.execute(
+            select(latest_reason.c.delay_reason, func.count()).group_by(
+                latest_reason.c.delay_reason
+            )
+        )
+        if row[0] in _DELAY_REASON_VALUES
+    }
+
+    by_promise_status = {
+        str(row[0]): int(row[1])
+        for row in session.execute(
+            select(PromiseToPay.status, func.count(func.distinct(PromiseToPay.case_id)))
+            .where(
+                PromiseToPay.merchant_id == merchant_id,
+                PromiseToPay.case_id.in_(ids),
+            )
+            .group_by(PromiseToPay.status)
+        )
+        if row[0] in _PROMISE_STATUS_VALUES
+    }
+
+    arrangements = int(
+        session.execute(
+            select(func.count(func.distinct(CustomerSignal.case_id))).where(
+                CustomerSignal.merchant_id == merchant_id,
+                CustomerSignal.case_id.in_(ids),
+                CustomerSignal.kind
+                == CustomerSignalKind.PARTIAL_ARRANGEMENT_REQUEST.value,
+            )
+        ).scalar_one()
+    )
+    signalling = int(
+        session.execute(
+            select(func.count(func.distinct(CustomerSignal.case_id))).where(
+                CustomerSignal.merchant_id == merchant_id,
+                CustomerSignal.case_id.in_(ids),
+            )
+        ).scalar_one()
+    )
+
+    return SignalCohortCounts(
+        by_delay_reason=by_delay_reason,
+        by_promise_status=by_promise_status,
+        arrangement_request_count=arrangements,
+        contact_suppression_count=_suppressed_case_count(session, merchant_id, ids),
+        signalling_case_count=signalling,
+    )
+
+
+def _suppressed_case_count(
+    session: Session, merchant_id: uuid.UUID, case_ids: Sequence[uuid.UUID]
+) -> int:
+    """How many of these cases a Contact_Suppression in force covers (R21.C8, R25.C11).
+
+    Two reads and a set intersection. The first reads the three columns a Suppression_Scope is
+    derived from; the second reads every scope key this merchant currently has suppressed, and it
+    filters on ``released_at IS NULL`` because a released suppression is history and must not
+    count toward "cases Revora may not contact".
+
+    Counted per case rather than per suppression row. One suppression can cover several cases of
+    one customer and one order, and the figure beside a money total has to be a case count or it
+    cannot be compared with anything else in the report.
+    """
+    rows = session.execute(
+        select(
+            RecoveryCase.id,
+            RecoveryCase.customer_key,
+            RecoveryCase.provider_order_id,
+        ).where(
+            RecoveryCase.merchant_id == merchant_id,
+            RecoveryCase.id.in_(list(case_ids)),
+        )
+    ).all()
+    if not rows:
+        return 0
+
+    scopes = {row.id: scope_key_for_case(row) for row in rows}
+    suppressed = {
+        str(key)
+        for key in session.execute(
+            select(ContactSuppression.scope_key).where(
+                ContactSuppression.merchant_id == merchant_id,
+                ContactSuppression.scope_key.in_(sorted(set(scopes.values()))),
+                ContactSuppression.released_at.is_(None),
+            )
+        ).scalars()
+    }
+    return sum(1 for scope in scopes.values() if scope in suppressed)
+
+
+_DELAY_REASON_VALUES: Final[frozenset[str]] = frozenset(
+    member.value for member in DelayReason
+)
+_PROMISE_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    member.value for member in PromiseStatus
+)
+"""The two vocabularies the grouped values are filtered against.
+
+A stored value outside its enumeration is dropped rather than reported. Both columns carry an
+``enum_check`` so this cannot happen in a consistent database, and the filter is here for the one
+case where it can: a build reading rows written by a *later* build that admits a value this one
+has never heard of. Reporting such a value would put an unrecognized string in a merchant-facing
+count with no way to explain it; dropping it makes the mapping sum smaller than
+``signalling_case_count``, which is visible."""
 
 
 @dataclass(frozen=True, slots=True)

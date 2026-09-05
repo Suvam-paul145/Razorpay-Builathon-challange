@@ -10,9 +10,19 @@ structural, not a promise: this module imports ``domain.failure_taxonomy``,
 ``persistence`` and ``audit``, and nothing from ``revora.reasoning`` or
 ``revora.providers``. It reads ``error_code``, ``error_reason``, ``error_source``,
 ``error_step`` and ``method`` off the canonical event that ingestion already persisted.
-``ai_invocation_id`` on the row it writes is always ``NULL``, which is the queryable
-form of the same claim. The reasoning path (task 14) is a separate, optional caller of
-the same substitution gate below — it does not go through this function.
+``ai_invocation_id`` on the row it writes is ``NULL`` on every path this module can reach
+by itself, which is the queryable form of the same claim.
+
+**The optional reasoning path arrives as an argument, not as a dependency** (R27.C4,
+R27.C16). ``run_diagnosis`` takes ``ai_proposal: AiCauseProposal | None``, and
+:class:`AiCauseProposal` names a cause, a confidence and a method in this package's own
+vocabulary — there is no ``ReasoningResult`` in this signature, because the ``layering``
+contract makes ``revora.reasoning`` a sibling of this package and therefore unreachable
+from it. The job pipeline is the one layer that can see both, so it is the layer that
+translates. Two consequences worth stating: "identical with every model response removed"
+is a call with ``None`` rather than a mocked provider, and
+:func:`plan_cause_hypothesis` — which decides whether a call is warranted at all — is a
+read that cannot itself issue one.
 
 **Exactly one active diagnosis per ``(case_id, decision_cycle)``** is the database's
 guarantee, via the ``one_active_diagnosis_per_cycle`` partial unique index, not this
@@ -99,6 +109,7 @@ from revora.domain.failure_taxonomy import (
     match_evidence,
 )
 from revora.domain.payment_event import CanonicalPaymentEvent
+from revora.domain.probability import AI_CONFIDENCE_CEILING
 from revora.persistence.models import Diagnosis
 from revora.persistence.repositories.cases import (
     RecoveryCaseRepository,
@@ -112,6 +123,7 @@ from revora.platform.logging import get_logger
 
 __all__ = [
     "DETERMINISTIC_CONFIDENCE",
+    "EVIDENCE_AI_PROPOSAL_UNUSED",
     "EVIDENCE_CAUSE_REFINED",
     "EVIDENCE_CUSTOMER_SIGNAL_ID",
     "EVIDENCE_ORIGINAL_CAUSE",
@@ -124,8 +136,13 @@ __all__ = [
     "SUBSTITUTION_METHOD_UNTRUSTED",
     "UNKNOWN_CONFIDENCE",
     "UNTRUSTED_METHODS",
+    "AiCauseProposal",
+    "CauseHypothesisInputs",
     "DiagnosisOutcome",
     "RecordedDiagnosis",
+    "capped_ai_confidence",
+    "plan_cause_hypothesis",
+    "resolve_ai_diagnosis",
     "resolve_recorded_diagnosis",
     "resolve_stated_reason_diagnosis",
     "run_diagnosis",
@@ -167,6 +184,17 @@ EVIDENCE_ORIGINAL_CAUSE: Final = "original_cause"
 EVIDENCE_SUBSTITUTION_REASON: Final = "substitution_reason"
 EVIDENCE_SUBSTITUTED: Final = "substituted_to_unknown"
 EVIDENCE_REASONING_INVOKED: Final = "reasoning_layer_invoked"
+
+EVIDENCE_AI_PROPOSAL_UNUSED: Final = "ai_proposal_unused"
+"""Present and ``True`` where a reasoning proposal arrived and a deterministic cause won.
+
+R27.C16 says a deterministic diagnosis issues no ``CAUSE_HYPOTHESIS`` call at all, and
+:func:`plan_cause_hypothesis` is what makes that true in the ordinary case. This key records
+the residual: a proposal built from a read that has since been overtaken — a Delay_Reason
+submitted between the plan and the write — arrives for a cycle the deterministic table can
+now answer. The deterministic answer wins, because 1.0 confidence is reserved for "the
+provider told us" (R3.C10), and this key is how the discarded proposal stays visible instead
+of looking like a call nobody made."""
 
 EVIDENCE_CUSTOMER_SIGNAL_ID: Final = "customer_signal_id"
 EVIDENCE_STATED_REASON: Final = "delay_reason"
@@ -268,6 +296,97 @@ def resolve_recorded_diagnosis(
         method=method,
         substituted_to_unknown=False,
         substitution_reason=None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AiCauseProposal:
+    """A reasoning invocation's outcome, in this package's vocabulary rather than that layer's.
+
+    Not a ``ReasoningResult``. The ``layering`` import contract makes ``revora.reasoning`` a
+    sibling of this package, so a signature naming one of its types would not import-check —
+    and that is the desired shape rather than an obstacle. The job pipeline is the one layer
+    that can see both, so it maps the five result variants onto the three fields below and
+    this package stays unable to tell a model from a table.
+
+    ``method`` carries the whole mapping, and R27.C4, R27.C5 and R27.C9 each pin one member:
+    ``AI_ASSISTED`` for an accepted response, ``REJECTED_AI_OUTPUT`` for one that failed the
+    output schema, ``FALLBACK_UNKNOWN`` for a timeout or an unreachable provider.
+    ``DETERMINISTIC`` is not a legal value here and :meth:`__post_init__` refuses it — a
+    proposal claiming the deterministic method would put a model's answer at the confidence
+    R3.C10 reserves for the provider's own error field.
+    """
+
+    cause: RiskCause
+    confidence: Decimal
+    method: DiagnosisMethod
+    invoked: bool
+    """Whether a request actually left the process (R3.C7).
+
+    A fact, not a derivation. ``FALLBACK_UNKNOWN`` means "the model timed out" here and "the
+    table did not resolve it" on the deterministic path, so the method cannot distinguish one
+    invocation from none; and a payload refused by the Prompt_Contract's allow-list produces
+    the same method with nothing sent at all. Only the component that issued the request
+    knows, so it says so."""
+
+    invocation_id: uuid.UUID | None = None
+    """The ``ai_invocation`` row this proposal came from, written before this call (R27.C12).
+
+    ``None`` where no row exists because no request was issued. Recorded on the Diagnosis so
+    "which invocation produced this cause" is a join rather than a reconstruction."""
+
+    def __post_init__(self) -> None:
+        if self.method is DiagnosisMethod.DETERMINISTIC:
+            raise ValueError(
+                "an AiCauseProposal may not claim DiagnosisMethod.DETERMINISTIC; that "
+                "method and its 1.0 confidence are reserved for the provider's own error "
+                "field and the Delay_Reason mapping table (R3.C10)"
+            )
+
+
+def capped_ai_confidence(confidence: Decimal) -> Decimal:
+    """R27.C4's ceiling: ``min(returned, 0.99)``. Pure.
+
+    Applied to what the model returned rather than enforced in the output schema, and the
+    difference matters. ``schemas.CauseHypothesisOutput`` accepts ``1.0`` because R27.C5's
+    permitted range is 0 to 1 inclusive, so a model claiming certainty is *recorded* and then
+    capped — rather than hidden behind a validation error that would report a confident answer
+    as a malformed one.
+
+    The cap is the only thing standing between an ``AI_ASSISTED`` row and a confidence of
+    exactly 1.000, which is the value R3.C10 reserves for "the provider told us". A reader of
+    the ``diagnosis`` table can therefore read the method off the confidence, and P54 checks
+    both halves.
+    """
+    ceiling = AI_CONFIDENCE_CEILING.value
+    return ceiling if confidence > ceiling else confidence
+
+
+def resolve_ai_diagnosis(
+    proposal: AiCauseProposal, *, confidence_floor: Decimal
+) -> RecordedDiagnosis:
+    """Apply R27.C4's ceiling and then R3.C8's substitution gate. Pure, no I/O.
+
+    Two callers, deliberately: :func:`run_diagnosis` uses it to decide what to write, and the
+    job pipeline uses it to decide whether the invocation row may claim
+    ``influenced_recommendation``. One implementation means the row and the diagnosis cannot
+    disagree about whether the model's answer was used — which is the whole point of that
+    column.
+
+    The ceiling is applied only to ``AI_ASSISTED``. The other two permitted methods carry
+    zero confidence and are substituted to ``UNKNOWN`` by the gate anyway, so capping them
+    would be arithmetic with no effect dressed up as a rule.
+    """
+    confidence = (
+        capped_ai_confidence(proposal.confidence)
+        if proposal.method is DiagnosisMethod.AI_ASSISTED
+        else proposal.confidence
+    )
+    return resolve_recorded_diagnosis(
+        cause=proposal.cause,
+        confidence=confidence,
+        method=proposal.method,
+        confidence_floor=confidence_floor,
     )
 
 
@@ -375,6 +494,105 @@ class DiagnosisOutcome:
     way; ``evidence_source`` is what says whether it changed the cause."""
 
 
+@dataclass(frozen=True, slots=True)
+class CauseHypothesisInputs:
+    """The six field values a ``CAUSE_HYPOTHESIS`` call may see, and nothing else.
+
+    Exactly the field names ``reasoning.contracts.CAUSE_HYPOTHESIS_CONTRACT`` declares — but
+    the contract is the authority and this is a struct that happens to match it, because this
+    package cannot import that one to check. The Prompt_Contract's own allow-list is what
+    stops an undeclared field reaching the wire; a mismatch here fails as a
+    ``PROMPT_CONTRACT_VIOLATION`` with nothing transmitted rather than as a leak.
+
+    Every field is optional, and each of them describes the failure rather than the person who
+    suffered it. There is no case id, no contact, no instrument and no token — not filtered
+    out, never gathered.
+    """
+
+    provider_error_code: str | None = None
+    provider_error_reason: str | None = None
+    provider_error_source: str | None = None
+    provider_error_step: str | None = None
+    delay_reason: str | None = None
+    delay_reason_note: str | None = None
+    """Free text a customer typed, untruncated here on purpose.
+
+    ``DELAY_NOTE_MAX_LENGTH`` truncation happens in the adapter (R20.C11), which is the
+    component holding both the value and the bound. Truncating here as well would give two
+    places for the limit to be wrong and would make the recorded request disagree with the
+    stored note."""
+
+
+def plan_cause_hypothesis(
+    session: Session,
+    merchant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    config: Configuration,
+) -> CauseHypothesisInputs | None:
+    """The inputs for a ``CAUSE_HYPOTHESIS`` call, or ``None`` where none is warranted.
+
+    **R27.C16, as a read that cannot issue a request.** ``None`` means "do not ask a model",
+    and it is returned whenever a deterministic cause already exists — from the provider
+    failure taxonomy *or* from the Delay_Reason mapping table, which are R27.C16's "either
+    mapping table". A well-mapped provider error therefore costs nothing at all: no
+    credential resolution, no payload, no wait, no ``ai_invocation`` row.
+
+    Read-only and lock-free. It takes no row lock, writes nothing and allocates no audit
+    sequence number, which is why the caller can run it in its own short transaction, close
+    it, and make the network call holding no database resource. Holding the case row under
+    ``FOR UPDATE`` across a provider request is the mistake ``execution.engine``'s whole
+    docstring is arranged against, and it would be no better here.
+
+    Its answer can be overtaken — a Delay_Reason can be submitted between this read and the
+    write — so :func:`run_diagnosis` re-derives the deterministic answer under the lock and
+    lets it win. That is a duplicated table lookup, which is cheap, rather than a duplicated
+    decision, which would be two answers.
+
+    Returns:
+        The inputs where a model may be asked, or ``None`` where one may not be. ``None``
+        also covers the cases where asking would be pointless: no case row, or a diagnosis
+        already active for this cycle, which a retried job returns idempotently.
+    """
+    case = RecoveryCaseRepository(session).get(merchant_id, case_id)
+    if case is None:
+        return None
+
+    diagnoses = DiagnosisRepository(session)
+    if diagnoses.active_for_cycle(merchant_id, case_id, case.decision_cycle_count) is not None:
+        return None
+
+    canonical = _canonical_for_case(session, merchant_id, case.source_event_id)
+    match = classify_failure(
+        error_reason=canonical.error_reason,
+        error_source=canonical.error_source,
+        error_step=canonical.error_step,
+        error_code=canonical.error_code,
+        risk_reason_codes=config.RISK_REASON_CODES,
+    )
+    if match.cause is not None:
+        # The provider's own error field resolved it. R27.C16.
+        return None
+
+    signal = CustomerSignalRepository(session).latest_delay_reason(merchant_id, case_id)
+    stated: str | None = None
+    note: str | None = None
+    if signal is not None:
+        stated = str(signal.delay_reason)
+        note = signal.delay_reason_note
+        if cause_for_delay_reason(DelayReason(stated)) is not None:
+            # The Delay_Reason mapping table resolved it. R27.C16's second table.
+            return None
+
+    return CauseHypothesisInputs(
+        provider_error_code=canonical.error_code,
+        provider_error_reason=canonical.error_reason,
+        provider_error_source=canonical.error_source,
+        provider_error_step=canonical.error_step,
+        delay_reason=stated,
+        delay_reason_note=note,
+    )
+
+
 def run_diagnosis(
     session: Session,
     merchant_id: uuid.UUID,
@@ -382,8 +600,21 @@ def run_diagnosis(
     config: Configuration,
     *,
     correlation_id: uuid.UUID | None = None,
+    ai_proposal: AiCauseProposal | None = None,
 ) -> DiagnosisOutcome:
     """Determine and record the risk cause for one case's current decision cycle.
+
+    ``ai_proposal`` is the optional reasoning path (R27.C4). With ``None`` — the default, and
+    the only value reachable without a configured credential — this function behaves exactly
+    as it did before the reasoning layer existed: the deterministic tables decide, the
+    recorded ``ai_invocation_id`` stays ``NULL`` and ``reasoning_layer_invoked`` stays
+    ``False``. That is what makes "identical with every model response removed" a call with
+    ``None`` rather than a mocked provider.
+
+    A proposal is consulted **only** where the deterministic tables produce no cause. Where
+    they do, the deterministic answer wins and the proposal is recorded as unused under
+    :data:`EVIDENCE_AI_PROPOSAL_UNUSED` — see :func:`plan_cause_hypothesis` on why that
+    residual exists at all.
 
     Must be called inside a transaction; it commits nothing itself. The worker's job
     handler owns the transaction so the diagnosis row and its audit records are atomic
@@ -424,7 +655,19 @@ def run_diagnosis(
         error_code=canonical.error_code,
         risk_reason_codes=config.RISK_REASON_CODES,
     )
-    provider_recorded = _resolve_from_match(match, config.DIAGNOSIS_CONFIDENCE_FLOOR)
+    # The deterministic answer is computed first and unconditionally, whatever the reasoning
+    # path produced. It is the value a proposal has to beat, and on the two paths where a
+    # proposal is discarded it is also the value that gets recorded.
+    deterministic = _resolve_from_match(match, config.DIAGNOSIS_CONFIDENCE_FLOOR)
+    proposal_used = ai_proposal is not None and match.cause is None
+    # Named for what it is — the answer before a Delay_Reason refinement, whether the
+    # provider table or a model produced it — rather than ``provider_recorded``, which would
+    # be a lie on the one path where a model's answer reaches it.
+    pre_refinement = (
+        resolve_ai_diagnosis(ai_proposal, confidence_floor=config.DIAGNOSIS_CONFIDENCE_FLOOR)
+        if proposal_used and ai_proposal is not None
+        else deterministic
+    )
 
     evidence = match_evidence(
         match,
@@ -434,28 +677,33 @@ def run_diagnosis(
         error_code=canonical.error_code,
         payment_method=canonical.method,
     )
-    evidence[EVIDENCE_REASONING_INVOKED] = False
+    # R3.C7. Read off the proposal rather than inferred from the method, for the reason
+    # ``AiCauseProposal.invoked`` gives: a request that was issued and whose answer was thrown
+    # away is an invocation, and a payload the allow-list refused is not.
+    evidence[EVIDENCE_REASONING_INVOKED] = ai_proposal is not None and ai_proposal.invoked
+    if ai_proposal is not None and not proposal_used:
+        evidence[EVIDENCE_AI_PROPOSAL_UNUSED] = True
 
     # R20.C4. Read after the taxonomy rather than instead of it, so the provider's answer is
     # computed and recorded even when the customer's words supersede it.
     signal = CustomerSignalRepository(session).latest_delay_reason(merchant_id, case_id)
-    recorded = provider_recorded
+    recorded = pre_refinement
     signal_id: uuid.UUID | None = None
     if signal is not None:
         signal_id = signal.id
         recorded = resolve_stated_reason_diagnosis(
             reason=DelayReason(str(signal.delay_reason)),
-            provider=provider_recorded,
+            provider=pre_refinement,
             stated_confidence=config.CUSTOMER_STATED_CAUSE_CONFIDENCE,
             confidence_floor=config.DIAGNOSIS_CONFIDENCE_FLOOR,
         )
-        refined = recorded is not provider_recorded
+        refined = recorded is not pre_refinement
         evidence[EVIDENCE_CUSTOMER_SIGNAL_ID] = str(signal.id)
         evidence[EVIDENCE_STATED_REASON] = str(signal.delay_reason)
         evidence[EVIDENCE_CAUSE_REFINED] = refined
         if refined:
             evidence[EVIDENCE_SOURCE] = DiagnosisEvidenceSource.CUSTOMER_STATED_REASON.value
-            evidence[EVIDENCE_SUPERSEDED_CAUSE] = provider_recorded.cause.value
+            evidence[EVIDENCE_SUPERSEDED_CAUSE] = pre_refinement.cause.value
 
     if recorded.substituted_to_unknown:
         evidence[EVIDENCE_SUBSTITUTED] = True
@@ -473,9 +721,11 @@ def run_diagnosis(
             "method": recorded.method.value,
             "evidence": dict(evidence),
             "substituted_to_unknown": recorded.substituted_to_unknown,
-            # Never set on this path, and the column is how that is audited rather
-            # than merely claimed.
-            "ai_invocation_id": None,
+            # ``NULL`` unless a model was actually consulted for this cycle, which is how
+            # "zero LLM invocations" stays a queryable claim rather than a promise. Set from
+            # the row the pipeline committed *before* calling here, so the foreign key
+            # always resolves.
+            "ai_invocation_id": None if ai_proposal is None else ai_proposal.invocation_id,
         },
     )
     if diagnosis_id is None:
@@ -519,10 +769,17 @@ def run_diagnosis(
         deterministic_hit=match.is_deterministic_hit,
         coverage_gap=match.is_coverage_gap,
         needs_operational_alert=match.needs_operational_alert,
+        # ``deterministic.cause`` rather than ``pre_refinement.cause``, and the difference is
+        # only visible on the reasoning path: R3.C6's fraud routing reads the *provider's*
+        # risk decline, and a model's answer must be able to add that routing but never to
+        # talk it away. Passing the provider table's own cause keeps the gate reading a
+        # trusted input while ``recorded`` and ``recorded.original_cause`` still let an
+        # AI-proposed fraud signal route conservatively.
         requires_policy_evaluation=_requires_policy_evaluation(
-            recorded, superseded=provider_recorded.cause
+            recorded, superseded=deterministic.cause
         ),
         case_version=case.version,
+        reasoning_layer_invoked=ai_proposal is not None and ai_proposal.invoked,
         evidence_source=_evidence_source(evidence),
         customer_signal_id=signal_id,
     )
@@ -644,7 +901,9 @@ def _write_audit(
         "cause": recorded.cause.value,
         "method": recorded.method.value,
         "decision_cycle": decision_cycle,
-        EVIDENCE_REASONING_INVOKED: False,
+        # Read back out of ``evidence`` rather than restated, so the record's headline field
+        # and its evidence document cannot disagree about whether a model was consulted.
+        EVIDENCE_REASONING_INVOKED: bool(evidence.get(EVIDENCE_REASONING_INVOKED, False)),
         # Beside the method rather than only inside ``evidence``, because this field is what
         # the dashboard reads to say why a cause was chosen, and "DETERMINISTIC" alone no
         # longer answers that question (R20.C4).

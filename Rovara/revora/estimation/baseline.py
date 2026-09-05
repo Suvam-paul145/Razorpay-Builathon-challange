@@ -35,6 +35,29 @@ exist. The posterior is prior-based at any ``n``; the honest label is the same a
 :attr:`SelectedSegment.sample_size_satisfied`, which the dashboard can read. The
 requirement is satisfied and nothing above it is misled.
 
+**A customer who answered a message is not a no-intervention observation** (R25.C4). The
+training labels come from exactly one intervention status, :data:`TRAINING_LABEL_STATUS`, and
+R25.C4 moves a case into a different one: an observation carrying a Customer_Signal that arrived
+after a Revora action is ``REVORA_INTERVENED``, so it never enters the ``n`` or the ``s`` of any
+posterior computed here. That has teeth in the one situation where the old rule was silently
+wrong. ``NO_INTERVENTION_CONFIRMED`` was granted on *zero confirmed actions plus a control-arm
+assignment*, and an intent stranded in ``ATTEMPTED`` or ``UNCERTAIN`` has no confirmation — so a
+control case whose message demonstrably reached somebody, because that somebody submitted a
+Delay_Reason afterwards, would have become a baseline label. The classification itself is made at
+write time in :func:`revora.memory.store.classify_intervention_status`, because the fact being
+classified — which instant a submission arrived at relative to which attempt — is knowable in the
+terminal transition and unrecoverable from an aggregate afterwards. What lives here is the label
+*filter*, :func:`usable_as_training_label`, which is exhaustive over
+:class:`~revora.domain.enums.InterventionStatus` so that a member added later cannot become a
+training label by default.
+
+Nothing about a Customer_Signal reaches this estimator by any other route. There is no
+``delay_reason`` in :data:`~revora.domain.segments.FEATURE_KEYS`, so ``backoff_candidates``
+produces no containment probe naming one and no segment this module selects can be defined by
+what a customer said. The signal fields R25.C1 puts on an observation are recorded and
+selectable — deliberately, so a future trainer can condition on them — and they are not
+segment dimensions, which is why adding them moved no baseline.
+
 **Failure records nothing.** R5.C11: a timeout or an unreachable memory store writes
 ``BASELINE_ESTIMATION_FAILED``, records **no estimate at all**, and leaves the case in
 ``DIAGNOSED``. This is the single most important error path in the module, because the
@@ -70,7 +93,13 @@ from revora.audit.events import (
     BASELINE_ESTIMATION_FAILED,
 )
 from revora.audit.writer import AuditEntry, AuditWriter
-from revora.domain.enums import EstimationMethod, Provenance, RiskCause, ValidationStatus
+from revora.domain.enums import (
+    EstimationMethod,
+    InterventionStatus,
+    Provenance,
+    RiskCause,
+    ValidationStatus,
+)
 from revora.domain.money import Minor
 from revora.domain.payment_event import CanonicalPaymentEvent
 from revora.domain.probability import Probability
@@ -102,6 +131,7 @@ __all__ = [
     "FAILURE_MEMORY_UNAVAILABLE",
     "FAILURE_NO_ACTIVE_DIAGNOSIS",
     "FAILURE_TIMEOUT",
+    "TRAINING_LABEL_STATUS",
     "UNCERTAINTY_UNAVAILABLE",
     "BaselineComputation",
     "BaselineFailure",
@@ -113,6 +143,7 @@ __all__ = [
     "estimate_baseline",
     "run_baseline_estimation",
     "select_segment",
+    "usable_as_training_label",
 ]
 
 _logger = get_logger(__name__)
@@ -150,6 +181,43 @@ combination "fitted model, no bootstrap run" has no interval to report. When tha
 comes the answer is this string with both interval columns ``NULL`` — never a wide
 guess, and never a narrow one. The schema's ``interval_present_iff_available`` check
 makes the half-populated middle case uncommittable."""
+
+TRAINING_LABEL_STATUS: Final[InterventionStatus] = (
+    InterventionStatus.NO_INTERVENTION_CONFIRMED
+)
+"""The one intervention status a baseline training label may carry (R5.C6, R25.C4).
+
+Named as a constant rather than written into the two places that compare against it, because
+this is the single decision that separates a baseline from a description of intervened
+outcomes. The segment aggregate filters on the same value in SQL, and the two agreeing is
+what makes ``SegmentCounts.observations`` mean what its docstring says it means.
+
+R25.C4 adds no member here and removes none. It changes which cases *arrive* carrying this
+status — a case with a post-action Customer_Signal now arrives as ``REVORA_INTERVENED`` — and
+the filter is unchanged, which is the whole shape of the change: the estimator kept drawing
+from one status and the writer stopped mislabelling cases into it."""
+
+
+def usable_as_training_label(intervention_status: str | InterventionStatus) -> bool:
+    """Whether an observation with this status may inform a baseline posterior.
+
+    Exhaustive by construction: it compares against :data:`TRAINING_LABEL_STATUS` and admits
+    nothing else, so a fourth :class:`~revora.domain.enums.InterventionStatus` member added
+    later is excluded by default rather than included by default. That direction is the point.
+    A new status describing some newly-observable kind of intervention would, under a
+    deny-list, silently join the training set the day it was declared — and the resulting
+    baseline would look better-evidenced while being contaminated, which is the failure mode
+    this whole module is arranged against.
+
+    Accepts the string form as well as the enum because the value arrives from a ``TEXT``
+    column. An unrecognized string is ``False`` rather than an error: a row written by a build
+    this one does not understand is a row that must not train anything, and raising would take
+    a whole estimation run down over one unfamiliar label.
+    """
+    if isinstance(intervention_status, InterventionStatus):
+        return intervention_status is TRAINING_LABEL_STATUS
+    return intervention_status == TRAINING_LABEL_STATUS.value
+
 
 FAILURE_TIMEOUT: Final[str] = "ESTIMATION_TIMEOUT"
 FAILURE_MEMORY_UNAVAILABLE: Final[str] = "MEMORY_UNAVAILABLE"
@@ -227,10 +295,12 @@ def select_segment(
         lookup: reads a segment's counts. Called at most once per level, and at most
             six times.
         min_sample_size: ``Configuration.MIN_SEGMENT_SAMPLE_SIZE``. The count compared
-            against is the ``NO_INTERVENTION_CONFIRMED`` count and nothing else —
+            against is the :data:`TRAINING_LABEL_STATUS` count and nothing else —
             R5.C6 restricts training labels to that status, so counting a
             ``REVORA_INTERVENED`` observation toward the threshold would let intervened
-            outcomes decide when the estimator stops calling itself a fallback.
+            outcomes decide when the estimator stops calling itself a fallback. R25.C4 puts
+            a case carrying a post-action Customer_Signal in that excluded group, so a
+            responded-to control case no longer moves this threshold either.
         out_of_time: optional budget predicate, consulted before each query.
 
     Returns:
@@ -341,6 +411,11 @@ class BaselineFigures:
         document["posterior_alpha"] = self.posterior.alpha
         document["posterior_beta"] = self.posterior.beta
         document["model_version"] = self.model_version
+        # Which status the ``n`` and ``s`` above were drawn from (R5.C6, R25.C4). Recorded on
+        # the estimate rather than left as a fact about the code, because a calibration report
+        # recomputed years later has to know what population the counts described — and
+        # "observations" alone does not say whether an intervened case was in it.
+        document["training_label_status"] = TRAINING_LABEL_STATUS.value
         return document
 
 
@@ -693,6 +768,10 @@ def run_baseline_estimation(
                     computation.segment.counts.unknown_share()
                 ),
                 "sample_size_satisfied": computation.segment.sample_size_satisfied,
+                # R25.C4, in the record a reviewer reads: the labels behind this estimate came
+                # from one status, and an observation carrying a post-action Customer_Signal
+                # does not carry it.
+                "training_label_status": TRAINING_LABEL_STATUS.value,
                 "method": computation.method.value,
                 "provenance": computation.provenance.value,
                 "validation_status": computation.validation_status.value,
