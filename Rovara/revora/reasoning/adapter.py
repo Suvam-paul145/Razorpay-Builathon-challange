@@ -153,6 +153,7 @@ __all__ = [
     "UnavailableReason",
     "audit_event_type_for",
     "build_request_payload",
+    "credential_available",
     "extract_transmitted_payload",
     "response_schema_for",
     "validate_link_description_content",
@@ -491,6 +492,34 @@ _AUDIT_EVENT_TYPES: Final[Mapping[UnavailableReason, str]] = MappingProxyType(
         UnavailableReason.TRANSPORT_SECURITY_FAILED: TRANSPORT_SECURITY_FAILED,
     }
 )
+
+
+def credential_available() -> bool:
+    """Whether a reasoning credential is configured. Issues nothing and waits for nothing.
+
+    **This function exists so that ``llm_credential()`` is resolved in exactly one file.** A
+    caller that wants to know whether the reasoning layer is usable at all — the job pipeline,
+    deciding whether to construct an adapter for a processing step — would otherwise reach the
+    secret store itself, and ``tests/test_smoke.py`` pins the set of callers of that accessor to
+    this module precisely because a component resolving the credential for itself would be one
+    step from reaching a model outside the four gates. Asking here keeps the set at one entry
+    and puts the presence question where the credential knowledge already lives.
+
+    It answers a *different* question from :class:`Unavailable` with
+    ``CREDENTIAL_ABSENT``, and both are needed. That result means "this invocation could not
+    happen"; this means "no invocation should be attempted in this step at all", which is what
+    lets the caller skip building a client, a payload and a row rather than building all three
+    and discarding them. R27.C7's "nothing waits" is satisfied either way; this is the cheaper
+    of the two, and it is the branch the deployed reality takes.
+
+    The value is resolved and discarded. Nothing is cached and nothing is returned, so a
+    rotation or a newly added credential takes effect on the next call.
+    """
+    try:
+        get_secret_store().llm_credential()
+    except CredentialUnavailableError:
+        return False
+    return True
 
 
 def audit_event_type_for(result: ReasoningResult[object]) -> str | None:

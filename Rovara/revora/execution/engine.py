@@ -46,6 +46,13 @@ re-evaluation, an absent or expired or already-consumed approval, an audit-write
 existing intent in any state, a token that could not be minted — each of these returns before
 the provider is touched. The enumeration is deliberate: it is easier to review "which paths
 can reach the call" when the answer is one.
+
+**This module holds no reasoning adapter and cannot obtain one.** The optional
+``LINK_DESCRIPTION`` draft arrives as ``execute_approved_action``'s ``ai_description``
+argument, already schema- and content-validated by the layer that asked for it, and is
+substituted for the approved template at the one point where the description is composed.
+Every refusal above that point runs identically whether it is set or ``None``, which is what
+makes "the reasoning layer cannot change what gets executed" a property of the signature.
 """
 
 from __future__ import annotations
@@ -262,6 +269,7 @@ def execute_approved_action(
     factory: sessionmaker[Session] | None = None,
     config: Configuration | None = None,
     correlation_id: uuid.UUID | None = None,
+    ai_description: str | None = None,
 ) -> ExecutionAttempt:
     """Execute the case's approved action at most once. The engine's only entry point.
 
@@ -271,6 +279,21 @@ def execute_approved_action(
 
     Never raises for a provider condition: the client returns classifications rather than
     exceptions, and this returns an :class:`ExecutionAttempt` for every path.
+
+    Args:
+        ai_description: an already-validated ``LINK_DESCRIPTION`` draft, or ``None`` to send
+            the approved template (R27.C10). **An argument rather than an adapter**, and that
+            is the whole of this module's relationship with the reasoning layer: it holds no
+            client, resolves no credential, and cannot tell whether the string it was handed
+            came from a model or from a file. ``None`` is the value on every path where no
+            model was consulted, where one timed out and where its answer was refused — so
+            with no credential configured this engine composes exactly the sentence it
+            composed before the reasoning layer existed, and "identical with every model
+            response removed" is a call with ``None``.
+
+            It substitutes for the template; it never authorizes anything. Every refusal path
+            above the send is evaluated identically whether it is set or not, and a draft
+            cannot make an action executable that had no approved wording of its own.
     """
     configuration = config or default_configuration()
 
@@ -280,6 +303,7 @@ def execute_approved_action(
         factory=factory,
         config=configuration,
         correlation_id=correlation_id,
+        ai_description=ai_description,
     )
     if reservation.attempt is not None:
         if reservation.attempt.outcome is ExecutionOutcome.TOKEN_ISSUE_FAILED:
@@ -371,6 +395,7 @@ def _reserve_under_lock(
     factory: sessionmaker[Session] | None,
     config: Configuration,
     correlation_id: uuid.UUID | None,
+    ai_description: str | None = None,
 ) -> _Reservation:
     """Decide whether one call is permitted, and commit the intent that permits it."""
     with tenant_transaction(merchant_id, factory) as session:
@@ -625,8 +650,8 @@ def _reserve_under_lock(
                 )
 
             merchant_name = _merchant_name(session, merchant_id)
-            description = description_for(action, merchant_name=merchant_name)
-            if description is None:
+            template = description_for(action, merchant_name=merchant_name)
+            if template is None:
                 session.rollback()
                 return _refused(
                     case_id,
@@ -634,6 +659,13 @@ def _reserve_under_lock(
                     key=key,
                     detail=f"no approved template for {action.value}",
                 )
+            # R27.C10's substitution, and note which way round it is: the template is required
+            # *first*, and only then may a draft stand in for it. An action with no approved
+            # wording is refused above whether or not a draft exists, so a model cannot make an
+            # action sendable that Revora has written no copy for. The draft has already passed
+            # the output schema, ``validate_description`` and the placeholder, amount-equality
+            # and single-link rules before it reached this argument.
+            description = template if ai_description is None else ai_description
 
             try:
                 request = build_payment_link_request(
