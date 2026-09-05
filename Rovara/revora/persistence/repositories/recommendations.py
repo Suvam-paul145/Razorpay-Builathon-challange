@@ -16,7 +16,7 @@ the dashboard's whole case-detail view is the comparison, not just the winner.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 from sqlalchemy import func, select
 
@@ -58,6 +58,49 @@ class RecommendationRepository(MerchantScopedRepository[Recommendation]):
             .limit(1)
         )
         return self.session.execute(statement).scalars().first()
+
+    def latest_for_cases(
+        self, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, Recommendation]:
+        """:meth:`latest_for_case` for a whole page of cases, in one statement.
+
+        Keyed by ``case_id``, and a case with no recommendation is **absent from the mapping**
+        rather than present with ``None`` — so a caller reads ``mapping.get(case_id)`` and gets
+        exactly what the singular read would have returned.
+
+        **The choosing is done here, in Python, and deliberately not in SQL.** This fetches the
+        candidate rows for every named case and then picks one per case by the same two keys the
+        singular read orders on. It is not a ``DISTINCT ON``, not a window function and not a
+        lateral join, because the moment "which recommendation is *the* recommendation" has two
+        implementations — one for the list and one for the detail page — the list column and the
+        page it links to are free to disagree, and that is worse than either being wrong alone.
+        The ``ORDER BY`` below is the singular method's ``ORDER BY`` with ``case_id`` prepended,
+        which fixes the row order across groups without touching the order within one, so
+        "the first row seen for a case" *is* that case's ``LIMIT 1`` row.
+
+        Ties cannot arise: ``uq_recommendation_case_id_decision_cycle`` makes a second row for
+        one ``(case_id, decision_cycle)`` uncommittable, so the leading sort key is already
+        unique within a case.
+
+        An empty ``case_ids`` issues **no** statement. An empty page must not cost a query, and
+        ``IN ()`` is a statement whose answer is known before it is sent.
+        """
+        ids = list(case_ids)
+        if not ids:
+            return {}
+        statement = (
+            self.scoped(merchant_id)
+            .where(Recommendation.case_id.in_(ids))
+            .order_by(
+                Recommendation.case_id,
+                Recommendation.decision_cycle.desc(),
+                Recommendation.created_at.desc(),
+            )
+        )
+        latest: dict[uuid.UUID, Recommendation] = {}
+        for row in self.session.execute(statement).scalars():
+            latest.setdefault(row.case_id, row)
+        return latest
 
     def active_decision_cycle(
         self, merchant_id: uuid.UUID, case_id: uuid.UUID, *, fallback: int

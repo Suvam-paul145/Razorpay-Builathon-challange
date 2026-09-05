@@ -23,9 +23,9 @@ table could actively mislead.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 
 from revora.domain.enums import IntentState, PolicyVerdict
 from revora.persistence.models.execution import ExecutionIntent
@@ -99,6 +99,50 @@ class PolicyDecisionRepository(MerchantScopedRepository[PolicyDecision]):
         )
         return list(self.session.execute(statement).scalars())
 
+    def for_cycles(
+        self, merchant_id: uuid.UUID, cycles: Mapping[uuid.UUID, int]
+    ) -> dict[uuid.UUID, list[PolicyDecision]]:
+        """:meth:`for_cycle` for a whole page of cases, in one statement.
+
+        ``cycles`` maps each case to the **one** cycle to read, because that is the shape the
+        question actually has: the cycle a case's live decisions are filed under is derived from
+        that case's own recommendation, so a hundred cases name a hundred possibly-different
+        cycles. The caller derives them exactly as :func:`revora.api.views.case_summary` does and
+        hands the pairs over; this method does not derive anything, which is what stops it becoming
+        a second place the cycle is decided.
+
+        Keyed by ``case_id``, each value oldest-decision-first. A case with no decision in its
+        cycle is **absent from the mapping** rather than mapped to an empty list, so
+        ``mapping.get(case_id, ())`` is indistinguishable from the singular read's empty sequence.
+
+        Matched as a **row-value** ``IN`` over ``(case_id, decision_cycle)`` rather than as
+        ``case_id IN (...) AND decision_cycle IN (...)``. The looser form is a cross product: case
+        A asking for cycle 1 and case B asking for cycle 2 would also match A's cycle 2 rows, and a
+        list column showing a *later* cycle's verdict than the detail page reads is precisely the
+        divergence this batching is not allowed to introduce. The row-value form matches only the
+        pairs asked for, so nothing has to be filtered back out in Python and nothing can be
+        forgotten.
+
+        ``ORDER BY case_id, evaluated_at`` prepends the grouping key to the singular read's key,
+        leaving the order within one case untouched.
+
+        An empty ``cycles`` issues no statement.
+        """
+        pairs = [(case_id, cycle) for case_id, cycle in cycles.items()]
+        if not pairs:
+            return {}
+        statement = (
+            self.scoped(merchant_id)
+            .where(
+                tuple_(PolicyDecision.case_id, PolicyDecision.decision_cycle).in_(pairs)
+            )
+            .order_by(PolicyDecision.case_id, PolicyDecision.evaluated_at)
+        )
+        grouped: dict[uuid.UUID, list[PolicyDecision]] = {}
+        for row in self.session.execute(statement).scalars():
+            grouped.setdefault(row.case_id, []).append(row)
+        return grouped
+
     def latest_approved_unconsumed(
         self, merchant_id: uuid.UUID, case_id: uuid.UUID
     ) -> PolicyDecision | None:
@@ -167,6 +211,41 @@ class PolicyDecisionRepository(MerchantScopedRepository[PolicyDecision]):
             .order_by(PolicyCheckResult.check_order)
         )
         return list(self.session.execute(statement).scalars())
+
+    def check_results_for_decisions(
+        self, merchant_id: uuid.UUID, policy_decision_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, list[PolicyCheckResult]]:
+        """:meth:`check_results_for` for several decisions, in one statement.
+
+        Keyed by ``policy_decision_id``, each value in evaluation order. A decision with no
+        recorded checks is **absent from the mapping**, so ``mapping.get(decision_id, ())`` returns
+        the empty sequence the singular read returns — which matters here more than usual, because
+        :func:`revora.api.views._check_documents` renders a missing row as ``NOT_RECORDED`` rather
+        than omitting it, and an absent key has to reach that renderer as "no rows" and not as
+        "no such decision".
+
+        No selection: all twelve rows of every named decision are part of the answer. Served by
+        ``uq_policy_check_result_policy_decision_id_check_order``, whose unique index also orders
+        the read. ``ORDER BY policy_decision_id`` is prepended to the singular read's
+        ``check_order``, so the order within one decision is unchanged.
+
+        An empty ``policy_decision_ids`` issues no statement.
+        """
+        ids = list(policy_decision_ids)
+        if not ids:
+            return {}
+        statement = (
+            select(PolicyCheckResult)
+            .where(
+                PolicyCheckResult.merchant_id == merchant_id,
+                PolicyCheckResult.policy_decision_id.in_(ids),
+            )
+            .order_by(PolicyCheckResult.policy_decision_id, PolicyCheckResult.check_order)
+        )
+        grouped: dict[uuid.UUID, list[PolicyCheckResult]] = {}
+        for row in self.session.execute(statement).scalars():
+            grouped.setdefault(row.policy_decision_id, []).append(row)
+        return grouped
 
     def open_intent_exists(self, merchant_id: uuid.UUID, case_id: uuid.UUID) -> bool:
         """Whether an unresolved execution intent exists for the case (check 3)."""

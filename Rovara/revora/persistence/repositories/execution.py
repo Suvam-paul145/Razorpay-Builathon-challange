@@ -27,7 +27,7 @@ see the method.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 
 from sqlalchemy import select
@@ -101,6 +101,37 @@ class ExecutionIntentRepository(MerchantScopedRepository[ExecutionIntent]):
             .order_by(ExecutionIntent.attempt_ordinal)
         )
         return list(self.session.execute(statement).scalars())
+
+    def list_for_cases(
+        self, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, list[ExecutionIntent]]:
+        """:meth:`list_for_case` for a whole page of cases, in one statement.
+
+        Keyed by ``case_id``, each value in attempt order. A case with no attempts is **absent
+        from the mapping** rather than mapped to an empty list, so a caller writing
+        ``mapping.get(case_id, ())`` gets the same empty sequence the singular read returns and
+        cannot tell the two apart.
+
+        No selection happens here — every attempt on a case is part of the answer, exactly as in
+        the singular read — so this is a pure fan-in: one statement instead of one per case, and
+        the grouping is by ``case_id`` in Python. ``ORDER BY case_id, attempt_ordinal`` matches
+        ``ix_execution_intent_case_id_attempt_ordinal``, and prepending ``case_id`` orders the
+        groups without reordering the attempts inside one.
+
+        An empty ``case_ids`` issues no statement.
+        """
+        ids = list(case_ids)
+        if not ids:
+            return {}
+        statement = (
+            self.scoped(merchant_id)
+            .where(ExecutionIntent.case_id.in_(ids))
+            .order_by(ExecutionIntent.case_id, ExecutionIntent.attempt_ordinal)
+        )
+        grouped: dict[uuid.UUID, list[ExecutionIntent]] = {}
+        for row in self.session.execute(statement).scalars():
+            grouped.setdefault(row.case_id, []).append(row)
+        return grouped
 
     def live_payment_link(
         self, merchant_id: uuid.UUID, case_id: uuid.UUID
@@ -236,6 +267,28 @@ class RecoveryOutcomeRepository(MerchantScopedRepository[RecoveryOutcome]):
         """The outcome for a case, if it has been verified."""
         statement = self.scoped(merchant_id).where(RecoveryOutcome.case_id == case_id)
         return self.session.execute(statement).scalar_one_or_none()
+
+    def for_cases(
+        self, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, RecoveryOutcome]:
+        """:meth:`for_case` for a whole page of cases, in one statement.
+
+        Keyed by ``case_id``, with an unverified case **absent from the mapping** rather than
+        mapped to ``None``, so ``mapping.get(case_id)`` answers exactly as the singular read does.
+
+        There is nothing to choose. ``uq_recovery_outcome_case_id`` means a case has at most one
+        outcome row, which is the same fact that lets the singular read use
+        ``scalar_one_or_none`` — so a second row here would be a broken invariant rather than an
+        ambiguity this method has to resolve, and the last-write-wins assignment below cannot
+        silently pick between two the way a ``LIMIT 1`` would.
+
+        An empty ``case_ids`` issues no statement.
+        """
+        ids = list(case_ids)
+        if not ids:
+            return {}
+        statement = self.scoped(merchant_id).where(RecoveryOutcome.case_id.in_(ids))
+        return {row.case_id: row for row in self.session.execute(statement).scalars()}
 
     def list_in_window(
         self,

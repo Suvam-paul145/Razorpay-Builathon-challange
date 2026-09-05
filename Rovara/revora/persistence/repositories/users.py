@@ -20,14 +20,27 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Final
 
 from sqlalchemy import update
 
 from revora.persistence.models.tenancy import MerchantSession, MerchantUser
 from revora.persistence.repositories.base import MerchantScopedRepository, rows_affected
 
-__all__ = ["MerchantSessionRepository", "MerchantUserRepository"]
+__all__ = ["TOUCH_THRESHOLD", "MerchantSessionRepository", "MerchantUserRepository"]
+
+TOUCH_THRESHOLD: Final[timedelta] = timedelta(seconds=60)
+"""How stale ``merchant_session.last_seen_at`` is allowed to get before it is rewritten.
+
+One minute. ``last_seen_at`` answers "is somebody using this session", and nothing in this
+system reads it — session acceptance is decided by ``revoked_at`` and the stored
+``expires_at``, both untouched here. So the figure only has to be fresh enough for a person
+reading it, and a minute is finer than any human judgement of "currently in use" while
+turning one WAL write per authenticated request into at most one per session per minute.
+
+Not a ``ConfigurationBound``: adding one needs a migration to seed it, and the value governs
+how often a diagnostic column is rewritten rather than any decision about a merchant."""
 
 
 class MerchantUserRepository(MerchantScopedRepository[MerchantUser]):
@@ -135,6 +148,10 @@ class MerchantSessionRepository(MerchantScopedRepository[MerchantSession]):
         would mean a session left open in a browser tab never expires, which turns
         ``SESSION_LIFETIME`` into a description of idle time rather than of session age —
         and R17.C1 bounds the age.
+
+        Unconditional. :meth:`touch_if_stale` is what the authentication path calls; this
+        stays for a caller that means "write it now" and for the tests that pin the column's
+        behaviour independently of the staleness rule.
         """
         self.session.execute(
             update(MerchantSession)
@@ -144,6 +161,36 @@ class MerchantSessionRepository(MerchantScopedRepository[MerchantSession]):
             )
             .values(last_seen_at=moment)
         )
+
+    def touch_if_stale(
+        self,
+        merchant_id: uuid.UUID,
+        row: MerchantSession,
+        *,
+        moment: datetime,
+        threshold: timedelta = TOUCH_THRESHOLD,
+    ) -> bool:
+        """Stamp ``last_seen_at`` only if it is older than ``threshold``. ``True`` if written.
+
+        **This is a write elimination, not a behaviour change.** ``last_seen_at`` is read by
+        nobody in this system — not by :meth:`live_by_digest`, which compares the stored
+        ``expires_at``, and not by anything that decides whether a token is accepted. It is an
+        operator-facing liveness figure. So the only question is how fresh that figure has to
+        be, and the answer is not "to the millisecond, at the cost of a WAL write on every
+        authenticated request" — which is what the unconditional version cost, on the hottest
+        path in the application, for a column no code reads.
+
+        The staleness decision is made from the row the caller already has in hand, so the
+        skip costs nothing: no extra read, and on the common path no statement at all.
+
+        A row that has never been seen is stale by definition and is always written, so the
+        first use of a session still stamps it.
+        """
+        last_seen = row.last_seen_at
+        if last_seen is not None and moment - last_seen < threshold:
+            return False
+        self.touch(merchant_id, row.id, moment=moment)
+        return True
 
     def revoke(
         self, merchant_id: uuid.UUID, session_id: uuid.UUID, *, moment: datetime

@@ -28,7 +28,7 @@ that binary rounding makes embarrassing.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -184,6 +184,41 @@ class DiagnosisRepository(MerchantScopedRepository[Diagnosis]):
             .limit(1)
         )
         return self.session.execute(statement).scalars().first()
+
+    def active_for_cases(
+        self, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, Diagnosis]:
+        """:meth:`active_for_case` for a whole page of cases, in one statement.
+
+        Keyed by ``case_id``, with a case that has no active diagnosis **absent from the mapping**
+        rather than mapped to ``None``, so ``mapping.get(case_id)`` returns what the singular read
+        would have returned.
+
+        **The choosing stays in Python.** The statement fetches the active rows for every named
+        case and this method picks the newest cycle per case, by the same key
+        :meth:`active_for_case` orders on. Expressing it as a ``DISTINCT ON`` or a window function
+        would put "which diagnosis is *the* diagnosis" in two places — the list's SQL and the
+        detail view's repository call — and two places is how a case's risk cause comes to differ
+        between the row a merchant clicks and the page it opens.
+
+        ``ORDER BY case_id`` is prepended to the singular read's key, which orders the groups
+        without reordering anything inside one. ``one_active_diagnosis_per_cycle`` makes
+        ``decision_cycle`` unique among a case's active rows, so the pick is unambiguous.
+
+        An empty ``case_ids`` issues no statement.
+        """
+        ids = list(case_ids)
+        if not ids:
+            return {}
+        statement = (
+            self._active(merchant_id)
+            .where(Diagnosis.case_id.in_(ids))
+            .order_by(Diagnosis.case_id, Diagnosis.decision_cycle.desc())
+        )
+        active: dict[uuid.UUID, Diagnosis] = {}
+        for row in self.session.execute(statement).scalars():
+            active.setdefault(row.case_id, row)
+        return active
 
     def list_for_case(
         self, merchant_id: uuid.UUID, case_id: uuid.UUID

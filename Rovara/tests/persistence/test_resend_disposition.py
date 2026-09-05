@@ -718,3 +718,89 @@ def test_only_a_confirmed_link_creation_counts_as_a_live_payment_link(
     )
     _confirm(owner_engine, second.idempotency_key, link_id=newer_link)
     assert live_for(case_id) == newer_link
+
+# ---------------------------------------------------------------------------
+# 54.4 — the resend row of the degradation ladder, the half not covered above
+# ---------------------------------------------------------------------------
+
+
+def test_a_read_timeout_resend_escalates_with_zero_further_external_calls(
+    owner_engine: Engine, factory: sessionmaker[Session], merchant_id: uuid.UUID
+) -> None:
+    """The design's resend row names *two* faults that escalate; only one was asserted.
+
+    ``test_an_uncertain_resend_escalates_once_and_no_sweep_can_see_it`` above stages a **5xx**,
+    where the provider answered and the answer was useless. This stages a **read timeout**, where
+    the request left the socket and nothing ever came back — a different classification
+    (``Timeout(AFTER_SEND)`` rather than ``ServerError``) reaching the same disposition, and the
+    reason ``ResendOutcome`` has no ``TIMEOUT_MESSAGE_SENT``/``TIMEOUT_NOT_SENT`` pair: for a
+    resend the distinction is not observable by the caller, by a later read, or by the fake. The
+    system is asserted under *permanent* ignorance here rather than under a bad answer.
+
+    Written as a companion rather than a copy: what is asserted is the classification-to-
+    disposition mapping and the zero-further-calls claim, and the parts the 5xx test already owns
+    — the partial index predicate, the positive control, ``unresolved_intent_count`` — are not
+    repeated. Both faults collapsing onto one disposition is the point; a change that made the
+    timeout ``FAILED`` instead would license a second attempt under a new key while a message may
+    already have reached a customer, and only this test would catch it.
+
+    The negatives, and there are three:
+
+    * **The intent stays ``UNCERTAIN`` and unresolved.** ``resolved_at`` is null because nothing
+      resolved it and nothing ever will.
+    * **The recorded reconciliation attempt budget is zero**, not the create's six. Attempts
+      would be reads that cannot answer, so spending them would be pretending.
+    * **Running both reconciliation entry points issues no further call for it** — not a second
+      notification, and not even a read, because a resend has no provider object to read.
+    """
+    case_id = _insert_case(owner_engine, merchant_id, state=CaseState.ACTION_SCHEDULED)
+    decision_id = insert_policy_decision(owner_engine, merchant_id, case_id)
+    scenario = _reserve_and_execute(factory, merchant_id, case_id, decision_id)
+
+    fake = FakeRazorpay(ProviderBehaviour.resend_unverifiable())
+    result = fake.notify_by(_LINK_ID, NotifyMedium.SMS)
+
+    with _settling(factory, scenario) as (session, case, intent):
+        settlement = settle_resend_result(
+            session,
+            merchant_id,
+            case,
+            intent,
+            result,
+            target=ResendTarget(_LINK_ID, NotifyMedium.SMS, short_url=_SHORT_URL),
+            config=default_configuration(),
+        )
+
+    assert settlement.disposition is ResendDisposition.ESCALATED_UNVERIFIABLE, (
+        "a read timeout on a resend must reach the same disposition a 5xx does; anything that "
+        "resolved it would license a second message to a customer who may already have one"
+    )
+    assert settlement.intent_state is IntentState.UNCERTAIN
+    assert settlement.is_terminal_for_case
+
+    case_row = _case_row(owner_engine, case_id)
+    assert case_row["state"] == CaseState.ESCALATED.value
+    assert case_row["terminal_reason"] == TerminalReason.EXECUTION_RESULT_UNVERIFIABLE.value
+    assert case_row["customer_message_count"] == 1, (
+        "the increment was spent on the edge into EXECUTING and a message may have gone out, so "
+        "an unverifiable resend is not refunded either"
+    )
+
+    intent_row = _intent_row(owner_engine, merchant_id, scenario.idempotency_key)
+    assert intent_row["state"] == IntentState.UNCERTAIN.value
+    assert intent_row["resolved_at"] is None
+    assert intent_row["reconciliation_attempts"] == RESEND_RECONCILIATION_ATTEMPT_BOUND
+
+    # Both entry points into the resolution machinery, run for real. Neither may touch it.
+    promoted = promote_stale_intents(merchant_id, factory=factory)
+    assert scenario.intent_id not in promoted
+    reconcile_intents(merchant_id, provider=as_provider_client(fake), factory=factory)
+
+    assert fake.notify_call_count_for(_LINK_ID, NotifyMedium.SMS) == 1, (
+        "a resend was issued more than once; after a read timeout nothing — not a sweep, not a "
+        "restart, not a further decision cycle — may send that message again"
+    )
+    assert fake.call_count == 1, (
+        "a further external call was issued for a case the ladder says gets zero: "
+        f"{[call.operation for call in fake.calls]}"
+    )
