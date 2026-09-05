@@ -137,3 +137,57 @@ Rovara/
 ├── local_credentials.txt # [GITIGNORED] Private local credentials & secrets
 └── RUNBOOK.md          # This instruction guide
 ```
+
+---
+
+## 🧾 Verified Test-Mode Recoveries (manual, 3 required)
+
+`DEMO_VERIFIED_RECOVERY_MIN_COUNT = 3`. A **Verified_Demo_Recovery** is a Demo_Batch case that reached `RECOVERED` because an authoritative provider read reported `captured = true` at an amount equal to the case's `payment_amount` — money that genuinely moved in Razorpay **test mode**.
+
+> **Why this is manual and not a script.** Razorpay's Payment Links API can create, fetch, update, cancel and re-notify a link. **It has no endpoint that pays one.** Payment happens on the customer-facing payment page, and in test mode that page is a mock that asks a person to choose success or failure. So `revora.synthetic.demo.verified_test_mode_capability()` returns `False` and no automation is written for step 3 below. Automating it would mean faking a capture, which is the one thing this figure exists to not do.
+>
+> A harness or `pg` run uses the scriptable provider fake, so it reports `verified_test_mode_recoveries: 0`. That zero is correct: the reads are genuine, but they read a fake. Only the run below produces a non-zero count.
+
+### Before you start
+
+Real Razorpay test credentials are required, and they are read from `.env` by name — **never paste a secret value into a terminal, a log or this file**:
+
+| Variable | What it must be |
+|---|---|
+| `REVORA_RAZORPAY_KEY_ID` | a test-mode key id (the `rzp_test_…` form) |
+| `REVORA_RAZORPAY_KEY_SECRET` | its secret |
+| `REVORA_WEBHOOK_SECRETS_<SLUG>` | the webhook secret configured on the same Razorpay account |
+
+Sanity-check that the loaded key is a **test** key before running anything that spends money:
+
+```powershell
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -c "import os; k=os.environ.get('REVORA_RAZORPAY_KEY_ID',''); print('test mode:', k.startswith('rzp_test_'))"
+```
+
+If that prints `test mode: False`, **stop.** Nothing below should be run against a live key.
+
+### Steps
+
+1. **Start the four terminals** (API, worker, ticker, and the webhook simulator) exactly as in the Quick Start above, with the real Razorpay client rather than the fake — that is what `. .\scripts\dev_env.ps1` gives you.
+
+2. **Send three failed-payment events** in the amount band where the optimizer selects `PAYMENT_LINK` (₹1,500–₹11,000). Anything below it is correctly a null action and anything above it is correctly a human escalation, so an amount outside the band produces a valid case and no link:
+   ```powershell
+   1..3 | ForEach-Object { .\.venv\Scripts\python.exe scripts\dev_webhook.py failed --slug default-merchant --amount 400000 }
+   ```
+
+3. **Pay each link, by hand.** Find the three `plink_…` ids and their `short_url`s — either on the Razorpay test dashboard under Payment Links, or in the worker log line for the created link. Open each `short_url` in a browser, choose any test payment method, and on the mock page choose **success**. This is the step with no API.
+
+4. **Let the capture land.** Either the real `payment.captured` webhook arrives at `/webhooks/razorpay/default-merchant`, or the payment-state reconciliation sweep reads the payment on its next tick. Both routes end in `observe_payment_outcome` performing a genuine `fetch_payment` and declaring recovery only from `captured = true` with `amount = payment_amount`. To drive the sweep by hand rather than waiting:
+   ```powershell
+   .\.venv\Scripts\python.exe scripts\dev_tick.py --due
+   ```
+
+5. **Confirm the evidence**, from the rows rather than from the log. `recovery_outcome.verified_by_read_id` is `NOT NULL` by design, so every recorded recovery names the read that verified it — this is the same query `authoritative_test_mode_recoveries` runs:
+   ```powershell
+   docker exec revora-pg18 psql -U revora -d revora -c "SELECT count(*) FROM recovery_outcome o JOIN payment_state_read r ON r.id = o.verified_by_read_id AND r.merchant_id = o.merchant_id JOIN recovery_case c ON c.id = o.case_id AND c.merchant_id = o.merchant_id WHERE c.state = 'RECOVERED' AND r.captured AND r.amount = c.payment_amount"
+   ```
+   Three or more is R28.C2 satisfied.
+
+### What the label means
+
+These three amounts land in `observed_recovered_revenue`, labelled `SYNTHETIC`, `CAUSALITY_NOT_ESTABLISHED` and `RECOVERY_GROSS_OF_REFUNDS` on every surface and every export (R28.C3, R28.C14). **The label is what makes this evidence rather than a claim:** the money genuinely moved in test mode, and nothing here says Revora caused it. `incremental_recovered_revenue` stays `NOT_ESTABLISHED` — a synthetic run cannot license a causal claim no matter how clean its lift is.

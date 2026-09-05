@@ -290,50 +290,50 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R26.C6, R31.C3; design Testing Strategy — CI additions beyond tests_
     - _Properties: P56, P60_
 
-- [ ] 41. Delay_Reason capture, cause refinement, and note retention
+- [x] 41. Delay_Reason capture, cause refinement, and note retention
   - The highest-value evidence in the system from the least trustworthy source in the system. Resolved the way R4 resolves the Reasoning_Layer: the input may inform an estimate and may not inform an authorization.
 
-  - [ ] 41.1 The mapping table and the second deterministic diagnosis source
+  - [x] 41.1 The mapping table and the second deterministic diagnosis source
     - `revora/customer/signals.py` declares the mapping: `SALARY_OR_CASHFLOW_TIMING → INSUFFICIENT_FUNDS`, `BANK_OR_CARD_PROBLEM → BANK_OR_NETWORK_FAILURE`, `AMOUNT_TOO_HIGH_RIGHT_NOW → INSUFFICIENT_FUNDS`, `OTHER →` no cause
     - `revora/diagnosis/service.py`: a persisted Delay_Reason from the first three yields, for the next decision cycle, a diagnosis with method `DETERMINISTIC`, confidence `CUSTOMER_STATED_CAUSE_CONFIDENCE`, and evidence source `CUSTOMER_STATED_REASON` plus the signal id. `OTHER` leaves the recorded cause unchanged and records that no refinement occurred
     - `CUSTOMER_STATED_REASON` added to the diagnosis evidence source enumeration so the audit trail distinguishes a customer-stated cause from a provider-error-code cause
     - Persisting a Delay_Reason leaves `window_end_at`, both counters and `last_outbound_at` unchanged
     - _Requirements: R20.C1, R20.C4, R20.C5, R20.C6, R20.C9_
 
-  - [ ] 41.2 Note handling and the confidence floor guard
+  - [x] 41.2 Note handling and the confidence floor guard
     - Truncate to `DELAY_NOTE_MAX_LENGTH` marking the row `TRUNCATED`; store as inert text never evaluated, never interpolated into a query, never interpolated into a provider request, never rendered as markup
     - Nothing derives a Delay_Reason, Hard_Stop_Reason, Promise_Date, Partial_Arrangement_Request or currency figure from note contents
     - Configuration validator refusing a `CUSTOMER_STATED_CAUSE_CONFIDENCE` below `DIAGNOSIS_CONFIDENCE_FLOOR` — below the floor the cause would substitute to `UNKNOWN` under R3.C8 and the whole capture would be inert
     - _Requirements: R20.C2, R20.C3, R20.C7_
     - _Properties: P38_
 
-  - [ ] 41.3 Property tests: customer input is evidence, never authority
+  - [x] 41.3 Property tests: customer input is evidence, never authority
     - `tests/properties/test_customer_signal_authority.py`. **Property 36** (`model`): replacing every signal field with arbitrary schema-valid content, suppression state held fixed, leaves the verdict, primary reason and all twelve ordered check outcomes unchanged. **Property 37** (`model`): all eight named bounds and the configuration version identifier unchanged under arbitrary signal sequences. **Property 38** (`pure`): new generator `delay_reason_notes()` producing whitespace-only, markup, control characters, non-ASCII and over-length notes; derived reason, hard stop, promise date, arrangement flag and every currency figure equal their values with the note absent; stored length ≤ bound; rendered output has every markup-significant character escaped
     - `revora/policy/` still imports nothing new — the twelve checks read only the persisted `contact_suppression` state, and `lint-imports` proves the rest structurally
     - _Requirements: R20.C8, R20.C10, R25.C6, R25.C7, R29.C11_
     - _Properties: P36, P37, P38_
 
-  - [ ] 41.4 Present the note as customer-supplied unverified text
+  - [x] 41.4 Present the note as customer-supplied unverified text
     - `revora/api/routers/cases.py` and `web/src/routes/CaseDetail.jsx`: every persisted signal with its kind, submitted values, submission instant and note, the note escaped and labelled customer-supplied unverified text
     - _Requirements: R20.C12, R29.C11_
 
-  - [ ] 41.5 Extend the retention sweep to notes
+  - [x] 41.5 Extend the retention sweep to notes
     - `revora/cases/retention.py`: delete or irreversibly mask a `delay_reason_note` older than `CUSTOMER_DATA_RETENTION` within 24 hours of the period elapsing, setting `note_redacted_at` and `retention_config_version`, retaining the non-identifying signal fields metrics and Recovery_Memory need
     - The scan uses the partial index from 34.1 — partial because most rows have no note and indexing them would make the sweep read them
     - `pg`-tier test that redaction happens and that `CHECK (note_redacted_at IS NULL OR delay_reason_note IS NULL)` holds afterwards: a redacted note is gone, not merely marked
     - _Requirements: R29.C10_
 
-- [ ] 42. Hard_Stop_Reason and permanent Contact_Suppression
+- [x] 42. Hard_Stop_Reason and permanent Contact_Suppression
   - No thirteenth policy check. The suppression record enters the existing `CUSTOMER_OPTED_OUT` check's input, so the block happens inside the twelve-check sequence at the position absolute prohibitions already occupy.
 
-  - [ ] 42.1 `revora/customer/suppression.py` — the record and the policy input
+  - [x] 42.1 `revora/customer/suppression.py` — the record and the policy input
     - `scope_key = sha256(customer_key ‖ order_id or case_id)`, a hash so the column can be indexed and compared without holding a second copy of the customer key; the preimage is recoverable from the `recovery_case` row the suppression names
     - Written in the **same atomic transaction** as the `customer_signal` record. A second hard stop on the same scope is idempotent through `UNIQUE (merchant_id, scope_key)`
     - `revora/policy/`: check 5 `CUSTOMER_OPTED_OUT` reads the live-suppression lookup as part of its already-declared consent-and-opt-out input, served by the partial index. The suppression is applied **without** setting the customer-wide opt-out status of R17.C10, so an objection to one debt stays distinguishable from a withdrawal of consent to be contacted at all
     - _Requirements: R21.C1, R21.C3, R21.C8, R21.C9_
     - _Properties: P39_
 
-  - [ ] 42.2 Escalation, cancellation, and the in-flight intent
+  - [x] 42.2 Escalation, cancellation, and the in-flight intent
     - Transition to `ESCALATED` with `CUSTOMER_DISPUTED_CHARGE` or `CUSTOMER_CANCELLED_ORDER`, recording the unresolved `payment_amount` in minor units
     - Cancel every scheduled and queued action with no execution-intent row, issuing no provider request, leaving both counters unchanged, one `ACTION_CANCELLED_CONTACT_SUPPRESSED` record per cancelled action
     - An intent already `ATTEMPTED`, `CONFIRMED` or `UNCERTAIN` gets no further external call and resolves through the existing reconciliation path of R9.C15; the Outcome_Monitor records it as `POST_SUPPRESSION_ACTION`
@@ -341,41 +341,41 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R21.C4, R21.C5, R21.C6, R21.C7, R21.C12_
     - _Properties: P39, P40_
 
-  - [ ] 42.3 Release requires a person
+  - [x] 42.3 Release requires a person
     - Release path setting `released_at`, `released_by_user_id` and `release_config_version` together, on the same terms `model_promotion.approving_user_id` is set; the `CHECK` from 34.1 makes a release with no named user unstorable
     - No expiry mechanism exists to build — non-expiry is the absence of an `expires_at` column
     - _Requirements: R21.C2_
 
-  - [ ] 42.4 Property tests: a hard stop is permanent
+  - [x] 42.4 Property tests: a hard stop is permanent
     - `tests/properties/test_contact_suppression.py`. **Property 39** (`model`, stateful — rules added to the same lifecycle machine as task 38.4): for a hard stop at instant `T`, zero confirmed customer-visible actions in the Suppression_Scope have a confirmation later than `T`, across any subsequent events, decision cycles, restarts and newly created cases in that scope. **Property 40** (`model`): terminal state is `ESCALATED` with the matching reason, every token of the case is revoked, and the customer-wide opt-out status is unchanged
     - _Requirements: R21.C1, R21.C2, R21.C3, R21.C4, R21.C5, R21.C6, R21.C7, R21.C8, R21.C9, R21.C10_
     - _Properties: P39, P40_
 
-  - [ ] 42.5 Present suppression in the unresolved grouping
+  - [x] 42.5 Present suppression in the unresolved grouping
     - `web/src/routes/Unresolved.jsx` and `CaseDetail.jsx`: every suppressed case in the `ESCALATED` grouping under its reason, showing the Hard_Stop_Reason, the suppression instant and the unresolved amount
     - _Requirements: R21.C11_
 
-- [ ] 43. Partial_Arrangement_Request as a signal and nothing else
-  - [ ] 43.1 Escalate, record, change no money field
+- [x] 43. Partial_Arrangement_Request as a signal and nothing else
+  - [x] 43.1 Escalate, record, change no money field
     - `ESCALATED` with `CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT`, recording the unresolved amount; `payment_amount`, currency and `window_end_at` unchanged
     - `revora/memory/store.py`: persist the request as an observation feature with the request instant and the accompanying note
     - Any live payment link stays live and unmodified for its remaining validity, so a customer choosing to pay in full still recovers the case under R10.C14
     - Where a Hard_Stop_Reason is also persisted, the hard stop's consequences apply and the arrangement is recorded as a signal **without a second Terminal_State transition** — the hard stop is the stronger statement and a case holds one terminal reason
     - _Requirements: R22.C2, R22.C6, R22.C7, R22.C8, R22.C10_
 
-  - [ ] 43.2 Property tests: partial money is never recovery
+  - [x] 43.2 Property tests: partial money is never recovery
     - `tests/properties/test_partial_arrangement.py`, `model` tier. **Property 47:** a captured amount below `payment_amount` and a provider state of `partially_paid` each leave the case unrecovered, contribute zero to all four revenue figures, and every link Revora created carries `accept_partial = false`. **Property 48:** the full amount appears exactly once in `unresolved_revenue`, amount and currency unchanged, and a later full capture reconciles to `RECOVERED` counting once
     - _Requirements: R22.C3, R22.C4, R22.C5, R22.C7, R22.C8_
     - _Properties: P47, P48_
 
-  - [ ] 43.3 Present the arrangement request in the ESCALATED grouping
+  - [x] 43.3 Present the arrangement request in the ESCALATED grouping
     - Request instant, accompanying note, unresolved amount
     - _Requirements: R22.C9_
 
-- [ ] 44. Promise_To_Pay capture and Recovery_Window clamping
+- [x] 44. Promise_To_Pay capture and Recovery_Window clamping
   - A promise changes *when* Revora acts and never *how long*. The window is set at case creation and never extended; a promised date beyond the window end is not a scheduling problem to solve by stretching the window, it is a case for a person.
 
-  - [ ] 44.1 `revora/customer/promises.py` — accept, clamp, reject
+  - [x] 44.1 `revora/customer/promises.py` — accept, clamp, reject
     - Accept one `promise_date`, convert to UTC, retain the received representation alongside it on the same terms R16.C13 applies to a Payment_Event timestamp
     - `follow_up_at = min(promise_date + PROMISE_FOLLOW_UP_OFFSET, window_end_at − PROMISE_WINDOW_SAFETY_MARGIN)`, status `RECORDED`, `window_end_at_snapshot` captured
     - A date at or after `window_end_at`, or a computed `follow_up_at` earlier than the submission instant, yields `BEYOND_WINDOW_ESCALATED`, no `follow_up_at`, nothing scheduled, and `ESCALATED` with `PROMISE_BEYOND_RECOVERY_WINDOW`
@@ -384,55 +384,55 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R23.C1, R23.C2, R23.C3, R23.C4, R23.C5, R23.C6, R23.C7, R23.C8_
     - _Properties: P41, P42, P43_
 
-  - [ ] 44.2 Status transitions driven by authoritative reads
+  - [x] 44.2 Status transitions driven by authoritative reads
     - `KEPT` on an authoritative read reporting paid or captured, recording `seconds_promise_to_payment` — signed, because paying early is normal
     - `MISSED` when a `PROMISE_TO_PAY_FOLLOW_UP` intent reached `CONFIRMED` and a subsequent authoritative read reports a state other than paid or captured, recording the missed instant
     - `VOIDED` with the voiding Terminal_State when a case holding a `RECORDED` promise reaches any terminal state other than `RECOVERED`
     - _Requirements: R23.C10, R23.C11, R23.C12_
 
-  - [ ] 44.3 The promise sweep
+  - [x] 44.3 The promise sweep
     - Registered in `revora/jobs/scheduler.py` as the seventh periodic sweep, every `PROMISE_SWEEP_INTERVAL`, scanning the partial index on `(merchant_id, follow_up_at) WHERE status IN ('RECORDED','FOLLOW_UP_SCHEDULED')`
     - Applies any reached `follow_up_at`, elapsed window or elapsed cooldown **within the same evaluation** that detected it
     - While `RECORDED` and before `follow_up_at`, the optimizer excludes the follow-up with `PROMISE_DATE_NOT_REACHED` and retains it in the recorded set
     - _Requirements: R23.C9, R23.C13_
     - _Properties: P46_
 
-  - [ ] 44.4 Property tests: a promise never buys time
+  - [x] 44.4 Property tests: a promise never buys time
     - `tests/properties/test_promise.py`, `model` tier, with new generator `promise_dates(relative_to=…)` spanning the window boundary, the safety margin, the far past and the far future
     - **Property 41:** `window_end_at` equals its creation value for any promise with any date, and the case terminates within the R2.C12 bound. **Property 42:** either `follow_up_at ≤ window_end − PROMISE_WINDOW_SAFETY_MARGIN`, or the status is `BEYOND_WINDOW_ESCALATED` with the case `ESCALATED` and nothing scheduled. **Property 43:** persisted promise count ≤ `MAX_PROMISES_PER_CASE`, and a rejected submission leaves date, status and follow-up unchanged while still recording a signal
     - _Requirements: R23.C3, R23.C4, R23.C5, R23.C6, R23.C7, R24.C15_
     - _Properties: P41, P42, P43_
 
-  - [ ] 44.5 Present the clamp as a clamp
+  - [x] 44.5 Present the clamp as a clamp
     - `web/src/routes/CaseDetail.jsx`: promise date, status, computed follow-up instant and `window_end_at`, with the window end **adjacent to** the promise date so a clamped follow-up is visible as a clamp rather than as an arbitrary time
     - _Requirements: R23.C14_
 
-- [ ] 45. Checkpoint — customer surface
+- [x] 45. Checkpoint — customer surface
   - Ensure all tests pass, ask the user if questions arise. Confirm specifically: a token reaches exactly one case, an audit-write failure leaves no signal and no increment, a hard stop stops contact permanently across a restart, a promise past the window escalates instead of extending it, and the twelve policy checks are provably unmoved by any signal content.
 
-- [ ] 46. Payment-link resend and its own response classification
+- [x] 46. Payment-link resend and its own response classification
   - Two verified provider facts shape this task. The resend endpoint exists (`POST /v1/payment_links/:id/notify_by/:medium`, `medium ∈ {sms, email}`), so no second link is created and `PROMISE_FOLLOW_UP_FINANCIAL_COST = 0` is correct rather than assumed. And **a resend is not re-readable** — the response carries only a success boolean, with no notification identifier and no endpoint reporting whether a notification was sent.
 
-  - [ ] 46.1 The client method and the composed response identifier
+  - [x] 46.1 The client method and the composed response identifier
     - `revora/providers/razorpay.py`: `notify_by(payment_link_id, medium)` against the verified endpoint, using the existing `split_timeout` and masking-aware logger
     - There is no provider id to persist, so `provider_response_id` is the Revora-composed token `"<plink_id>#notify_by:<medium>"` and the `EXECUTION_STARTED` audit record carries `provider_identifier_absent: true`. The composed form is deliberately **not** a valid Razorpay id shape, so nothing can later feed it to a fetch endpoint believing it is one
     - `provider_short_url` stays the link's existing `short_url`, unchanged by the resend
     - `reminder_enable` stays `false`. It is more load-bearing now, not less: enabling it would put uncounted provider messages alongside counted Revora ones on the same link, Property 9 would still pass while a customer received messages nothing authorized, and no test would fail. Extend the comment in `revora/providers/payment_link.py` to say so
     - _Requirements: R24.C10, R24.C17_
 
-  - [ ] 46.2 The resend classification table
+  - [x] 46.2 The resend classification table
     - `revora/providers/classification.py`: a resend-specific table, leaving the create's table unchanged. 200 with a body validating as `{"success": true}` → `Success`/`CONFIRMED`; 200 with `success` absent or false or an unparseable body → `Unclassifiable`/`UNCERTAIN`; parseable 4xx → `ClientError(PROVIDER)`/`FAILED`; 5xx and post-send read timeout → `UNCERTAIN`; connect-phase failure → `FAILED`
     - **429 classifies `FAILED`, and this is the one place the resend departs from the generic rule.** The generic rule sends an unparseable 4xx to `Unclassifiable` because an HTML page from an intermediary tells us nothing about whether the provider saw the request. A 429 is different in kind: it is the provider's own gateway stating it declined to act, and a rejection delivered nothing. The classification therefore does not depend on the 429 body shape, which is unverified — and not depending on it is the point
     - Table-driven `pure`-tier test over `classify_response` plus the 429 override
     - _Requirements: R24.C10; design Architecture — Resend response classification_
 
-  - [ ] 46.3 `UNCERTAIN` is terminal-unresolvable, and the sweep must not touch it
+  - [x] 46.3 `UNCERTAIN` is terminal-unresolvable, and the sweep must not touch it
     - An `UNCERTAIN` resend intent is **never retried and never reconciled**. In the same transaction that records the classification, the case escalates with `TerminalReason.EXECUTION_RESULT_UNVERIFIABLE` and no further external call is issued — exactly as R9.C17 already does for an exhausted reconciliation, except the bound is zero attempts instead of six, because the attempts would be reads that cannot answer
     - The cost is that one promise follow-up may be lost: a customer who said Friday does not get the Friday nudge. The alternative is an SMS to a real person about money they may already have paid. A lost nudge is recoverable by a person reading the escalation; a second message is not recoverable at all
     - `pg`-tier test that after the escalation the reconciliation sweep's candidate query **provably does not select that row**, and that `unresolved_intent_count` does not count it — so the stranded-intent alarm counts only intents that can be resolved, and the unresolvable ones are counted where a human is already looking, in the `ESCALATED` grouping
     - _Requirements: R9.C17, R14.C10, R24.C10_
 
-  - [ ] 46.4 Example test: a 429 spends a customer-message increment
+  - [x] 46.4 Example test: a 429 spends a customer-message increment
     - The counter moves at the single `ACTION_SCHEDULED → EXECUTING` edge, before the provider request, and this feature does not move it. Two reasons: the counter bounds how many times Revora *tries* to reach a person, and a design where a rejected attempt is free is a design where a loop against a rate limit burns no budget until the window closes; and moving it would put a second counter placement in the system for one action
     - **This is a recorded deviation from R24.C12**, which asks for the increment on `CONFIRMED`. The base spec's pessimistic placement is the stronger rule and it wins. The cost is that a 429 can spend a promise follow-up
     - Example-based test asserting the increment happened, the intent is `FAILED`, and the case returned to `DECISION_PENDING` where bounds still permit
@@ -445,23 +445,23 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - Writes to `docs/provider-findings.md`. A silent success against a dead link means a follow-up can spend a message increment delivering a link nobody can pay, which would add a `risk_cost` to the follow-up's prior currently set to zero
     - _Requirements: design Open Questions 1, 2, 14_
 
-- [ ] 47. PROMISE_TO_PAY_FOLLOW_UP as an executable, priced, exactly-once action
+- [x] 47. PROMISE_TO_PAY_FOLLOW_UP as an executable, priced, exactly-once action
   - Executable without exemption: priced like every other action, ranked by net recovery value like every other action, gated by all twelve checks like every other action, executed through the same intent and idempotency mechanism.
 
-  - [ ] 47.1 Move the action into the executable and provider-call sets
+  - [x] 47.1 Move the action into the executable and provider-call sets
     - `revora/domain/actions.py`: out of `UNAVAILABLE_IN_MVP`, into `EXECUTABLE` and the provider-call set; it is already customer-visible so it already consumes `MAX_CUSTOMER_MESSAGES`
     - Cause-to-action eligibility table permits it for every `RiskCause` except `FRAUD_OR_RISK_SIGNAL` and `UNKNOWN`, recording `CAUSE_NOT_ELIGIBLE` for those two — a rejected or low-confidence diagnosis must keep making Revora more conservative, which R3.C8 already achieves by substituting `UNKNOWN`
     - New exclusion reasons `NO_PROMISE_RECORDED` and `PROMISE_DATE_NOT_REACHED`
     - `RETRY` and `DELAYED_RETRY` stay `UNAVAILABLE` and stay visible in the recorded candidate set with their exclusion reason
     - _Requirements: R24.C1, R24.C2, R24.C3, R26.C15_
 
-  - [ ] 47.2 Price it in the four-term shape
+  - [x] 47.2 Price it in the four-term shape
     - `revora/estimation/candidates.py`: included only where a promise with status `RECORDED` or `FOLLOW_UP_SCHEDULED` exists, otherwise excluded with `NO_PROMISE_RECORDED` and **retained in the recorded set**
     - Five figures, none unset: `PROMISE_FOLLOW_UP_FINANCIAL_COST` (0), `PROMISE_FOLLOW_UP_COMMUNICATION_COST`, `risk_cost`, `customer_cost`, and an `intervention_recovery_probability` that falls back to `PROMISE_FOLLOW_UP_PRIOR_PROBABILITY` marked `UNCALIBRATED` below `MIN_SEGMENT_SAMPLE_SIZE`
     - The optimizer applies `MIN_NET_VALUE_THRESHOLD`, `MIN_INCREMENTAL_PROBABILITY` and `MAX_COST_TO_VALUE_RATIO` unchanged and takes **no** ranking input from the existence of a promise
     - _Requirements: R24.C4, R24.C5, R24.C6_
 
-  - [ ] 47.3 Execute it exactly once
+  - [x] 47.3 Execute it exactly once
     - `revora/execution/engine.py` and `intents.py`: idempotency key derived deterministically from case id, action type and attempt ordinal; intent row with `effect_kind = 'PAYMENT_LINK_RESEND'` durably committed before the external call
     - A live link gets a resend and **no second link**; where no live link exists, create one with `accept_partial = false`, expiry clamped to `window_end_at`, notification enabled, and treat that creation as the effect of that idempotency key — with `effect_kind = 'PAYMENT_LINK_CREATE'`, so that intent *is* reconcilable
     - On `CONFIRMED`: executed-action counter +1, customer-message counter +1, `last_outbound_at` set to the confirmation timestamp, promise status `FOLLOW_UP_SCHEDULED`, case to `WAITING_FOR_OUTCOME`
@@ -470,36 +470,36 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R24.C8, R24.C9, R24.C10, R24.C11, R24.C12, R24.C13, R24.C14, R24.C15, R24.C17_
     - _Properties: P44, P45_
 
-  - [ ] 47.4 Property tests for the new action's exactly-once and cooldown bounds
+  - [x] 47.4 Property tests for the new action's exactly-once and cooldown bounds
     - `tests/properties/test_promise.py`, `model` tier with crash injection from the existing `tests/strategies/crashes.py`. **Property 44:** for any retry sequence on one idempotency key, including a crash between intent commit and call, at most one external call, every request returns the same recorded result, and each counter rises by at most one. **Property 45:** consecutive confirmed outbound actions are at least `COOLDOWN_INTERVAL` apart and every confirmed follow-up timestamp is inside the window. **Property 46:** the follow-up is absent from selection with the right recorded reason in each of the three exclusion conditions and retained in the recorded set in all three
     - _Requirements: R23.C9, R24.C2, R24.C3, R24.C8, R24.C9, R24.C12, R24.C15_
     - _Properties: P44, P45, P46_
 
-  - [ ] 47.5 The capability-withdrawal degradation path
+  - [x] 47.5 The capability-withdrawal degradation path
     - Where the resend capability is absent or the account loses it, the simulator marks the action `UNAVAILABLE` with `PROVIDER_CAPABILITY_UNVERIFIED`, excludes it from selection, and **retains it in the recorded set** under R6.C9. `PAYMENT_LINK` and the null actions still compete, and no promise-holding case is stranded — every one stays inside the R2.C12 termination bound
     - _Requirements: R24.C16, R24.C15_
 
-- [ ] 48. Customer signals in Recovery_Memory and the next decision cycle
+- [x] 48. Customer signals in Recovery_Memory and the next decision cycle
   - R15.C6 already forbids the Policy_Engine from deriving anything from Recovery_Memory. Putting signals inside memory means that prohibition covers them automatically; this task states the coverage explicitly rather than leaving it implied.
 
-  - [ ] 48.1 Observation fields written in the terminal transaction
+  - [x] 48.1 Observation fields written in the terminal transaction
     - `revora/memory/store.py`: on a terminal transition, persist the Delay_Reason, the Promise_Status, `seconds_promise_to_payment` where both exist, whether an arrangement request was persisted, whether a suppression covers the case, and the signal count — in the same atomic transaction R15.C1 already requires
     - Provenance `REAL` for a page submission and `SYNTHETIC` for a generated one, applying R15.C2 unchanged
     - Delay_Reason and Promise_Status stored as feature values selectable as distinct segments by the Baseline_Model and the simulator
     - _Requirements: R25.C1, R25.C2, R25.C3, R22.C6_
 
-  - [ ] 48.2 A responded customer is not a no-intervention observation
+  - [x] 48.2 A responded customer is not a no-intervention observation
     - `revora/estimation/baseline.py`: an observation carrying a signal that arrived **after** a Revora action is `REVORA_INTERVENED`, so it is excluded from the baseline's training labels, which keep drawing only from `NO_INTERVENTION_CONFIRMED`
     - Experiment version freeze unchanged: an `ACTIVE` experiment applies its frozen model versions irrespective of signals recorded during it, and a signal on a Control_Group case leaves it in Control_Group with the derived action suppressed and the suppressed recommendation recorded for comparison
     - _Requirements: R25.C4, R25.C9, R25.C10_
 
-  - [ ] 48.3 Composition and cohort reporting
+  - [x] 48.3 Composition and cohort reporting
     - `revora/memory/versions.py`: training-set composition reports observation counts per Delay_Reason and per Promise_Status alongside the existing counts, and **names every Delay_Reason value holding zero observations** in that training set
     - `revora/metrics/engine.py`: reporting-period cohort counts for each Delay_Reason, each Promise_Status, arrangement requests and suppressions, segmented on the same terms R12.C10 requires
     - `revora/optimizer/service.py`: the next cycle's candidate set is built from the Risk_Cause recorded under R20.C4, and the recommendation records the signal id that produced it
     - _Requirements: R25.C5, R25.C8, R25.C11_
 
-- [ ] 49. Reasoning_Adapter — three bounded advisory calls, no authority
+- [x] 49. Reasoning_Adapter — three bounded advisory calls, no authority
   - Independent of every other task in this plan. Gemini is verified reachable at `https://generativelanguage.googleapis.com/v1beta` with `REVORA_LLM_CREDENTIAL`; `gemini-2.5-flash` and `gemini-2.5-pro` are both listed. `revora/reasoning/` currently holds only `__init__.py`.
 
   - [x] 49.1 Contracts, schemas, and the import contracts in the same task
@@ -510,7 +510,7 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R27.C1, R27.C2, R27.C3, R27.C11_
     - _Properties: P53_
 
-  - [ ] 49.2 Hand-written `httpx` client and the four gates
+  - [x] 49.2 Hand-written `httpx` client and the four gates
     - `revora/reasoning/adapter.py`: `POST /v1beta/models/{model}:generateContent`, credential from the existing secret store. Hand-written **not** for the reason the payment client is: that argument is about telling "definitely did not happen" from "might have happened", and a reasoning call produces no external effect, so an ambiguous outcome costs one deterministic fallback. The real reasons are smaller — `httpx` is already a dependency with `split_timeout` and a masking-aware logger built around it; `.importlinter` cannot see inside a vendored SDK, and the whole structural claim of R27.C11 is about what the contract checker can analyse; and the response must be validated independently of provider enforcement anyway, so the SDK's parsing is work we are not permitted to trust
     - Set `generationConfig.responseMimeType = "application/json"` and `responseSchema` to the contract's schema, **and** validate with Pydantic regardless. Provider-side constraint is an optimization; a component that treats it as a guarantee has no fallback the day it changes
     - Four gates: field allow-list (a stray field blocks transmission and takes the fallback); TLS with certificate validation, abandoning before any case field is transmitted on failure with `TRANSPORT_SECURITY_FAILED`; output schema validation, failure yielding `REJECTED_AI_OUTPUT` with cause `UNKNOWN`, confidence `0.0` and the raw response retained to `AI_RAW_CAPTURE_LIMIT`; content validation on `LINK_DESCRIPTION` through the existing `validate_description` plus the placeholder, amount-equality and single-link rules
@@ -519,7 +519,7 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R27.C2, R27.C5, R27.C6, R27.C7, R27.C9, R27.C10, R27.C14, R27.C15, R20.C11_
     - _Properties: P49, P51, P55_
 
-  - [ ] 49.3 Three invocation sites, all in the job pipeline
+  - [x] 49.3 Three invocation sites, all in the job pipeline
     - All three live in `revora/jobs/pipeline.py` and the validated result is passed into the pure component as an **argument** — the component never holds an adapter. This is forced by contracts that already exist and are the stronger authority: `CAUSE_HYPOTHESIS` in `handle_diagnosis` with the validated cause passed into `run_diagnosis`; `DECISION_EXPLANATION` in `handle_optimizer` and stored on the recommendation there, because `optimizer-isolation` forbids the import; `LINK_DESCRIPTION` on the execution path
     - Confidence on an `AI_ASSISTED` diagnosis is `min(returned, 0.99)`; `1.0` is reachable only by `DETERMINISTIC`
     - `DECISION_EXPLANATION` is stored in a field marked explanation-only, truncated to `REASONING_EXPLANATION_MAX_LENGTH`, with the record that it held no influence on the selection
@@ -529,14 +529,14 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R27.C4, R27.C8, R27.C9, R27.C10, R27.C16_
     - _Properties: P49, P50, P54, P55_
 
-  - [ ] 49.4 One `ai_invocation` row per invocation, and the per-case bound
+  - [x] 49.4 One `ai_invocation` row per invocation, and the per-case bound
     - Write the row for **every** invocation including timeouts, rejections and transport errors, carrying `call_kind`, `prompt_contract_id`, model id and version, latency in milliseconds, and a verdict from `ACCEPTED`, `REJECTED_SCHEMA`, `REJECTED_CONTENT`, `TIMEOUT`, `UNAVAILABLE`, plus whether the output influenced the recommendation
     - `MAX_REASONING_CALLS_PER_CASE` counted from `ai_invocation` rows for the case, so the bound survives a restart
     - `call_kind` is a separate column rather than encoded into `prompt_contract_id`, because "how many `CAUSE_HYPOTHESIS` calls fell back this week" should be a `WHERE`, not a `LIKE`
     - _Requirements: R27.C12, R27.C13_
     - _Properties: P52_
 
-  - [ ] 49.5 Property tests: reasoning has no authority
+  - [x] 49.5 Property tests: reasoning has no authority
     - `tests/properties/test_reasoning_authority.py`. New generator `reasoning_responses()` producing valid, schema-invalid, absent, timeout and adversarial responses
     - **Property 49** (`model`): verdict, primary reason and all twelve check outcomes identical to the `None` case. **Property 50** (`model`): selected action and every reported per-candidate figure identical with and without an explanation. **Property 51** (`model`): with the credential absent versus present-and-all-rejected, cases created, decisions, executions, recovered amounts and projected timelines are identical and no case waits on a response. **Property 52** (`model`): exactly one invocation row per invocation, count per case within the bound. **Property 53** (`pure`): transmitted key set ⊆ the declared set, with adversarial case rows and note content. **Property 54** (`pure`): recorded confidence ≤ 0.99 when `AI_ASSISTED`, 1.0 only when `DETERMINISTIC`. **Property 55** (`model`): sent description equals the template, counter unchanged, draft retained
     - _Requirements: R27.C2, R27.C3, R27.C4, R27.C6, R27.C7, R27.C8, R27.C9, R27.C10, R27.C11, R27.C12, R27.C13_
@@ -547,10 +547,10 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - The decision it informs is blunt: if `REJECTED_AI_OUTPUT` is the common path rather than a rare one, the adapter is a cost with no benefit and should be turned off rather than tuned
     - _Requirements: design Open Questions 7, 8_
 
-- [ ] 50. Case_Timeline read model
+- [x] 50. Case_Timeline read model
   - Adds no data. It is a projection of the existing gap-free, per-case, strictly increasing audit sequence and owns no table, so its correctness claim is a purity claim: the same records always produce the same timeline.
 
-  - [ ] 50.1 `revora/timeline/stages.py` — the pure projection
+  - [x] 50.1 `revora/timeline/stages.py` — the pure projection
     - `project(records, case, signals, intents, figures, now) -> CaseTimeline` taking only frozen dataclasses and returning one. No `Session`, no repository, no clock — **it cannot write because it has nothing to write with**, the same argument the base spec uses for `policy.evaluate`
     - Stage-completion rules keyed to concrete event types from `revora/audit/events.py`, per the design's table. `EXECUTED` keys on the `STATE_TRANSITION` into `WAITING_FOR_OUTCOME` rather than on the intent row, because that record exists on both the fast path and the reconciliation path, so one rule covers both; the displayed intent state is a presented field read from `execution_intent`, which keeps the completion rules purely audit-keyed and P57 checkable from the audit sequence alone
     - Every presented timestamp is read from a record, never `now()`. The one time-dependent decision — whether `DECIDED` is `IN_PROGRESS` — reads `case.next_review_at` and `case.decision_cycle_count`, both persisted, against a `now` passed in explicitly, so a caller supplying the same `now` gets the same timeline
@@ -559,14 +559,14 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R26.C1, R26.C2, R26.C5, R26.C6, R26.C7, R30.C14_
     - _Properties: P56, P57_
 
-  - [ ] 50.2 `revora/timeline/templates.py` — deterministic sentences and the label table
+  - [x] 50.2 `revora/timeline/templates.py` — deterministic sentences and the label table
     - One template per stage substituting only persisted values, per the design's table. Every `{…}` is a persisted column or a lookup in a fixed label table: **no branching on a value's magnitude, no pluralization logic that reads a count twice, no free text**
     - Label table for R26.C14: `DO_NOTHING` and `WAIT` both render as "Waiting and watching"; `STOPPED` as "Stopped — bound reached"; `BLOCKED` as "Blocked by policy"; `EXPIRED` as "Window closed". Every label carries the persisted enumeration member alongside it, so the presented word and the stored value are both readable
     - Every stage's field set per R26.C4, including `UNCERTAINTY_UNAVAILABLE` where a baseline interval is absent
     - _Requirements: R26.C3, R26.C4, R26.C14_
     - _Properties: P58_
 
-  - [ ] 50.3 Router, timeout, and the sequence-gap banner
+  - [x] 50.3 Router, timeout, and the sequence-gap banner
     - `revora/api/routers/cases.py`: one `tenant_transaction` does every read and passes the views down, so a concurrent write cannot change the input mid-projection
     - `TIMELINE_QUERY_TIMEOUT` applied around the reads. On timeout the dashboard shows a data-unavailable marker naming the case, every successfully projected stage is still presented, and **no stage is substituted with a status or a zero** — the existing `<AbsentValue>` component already renders that distinction
     - Gap detection compares `max(seq) − min(seq) + 1` against the record count and lists the missing numbers on mismatch; the timeline still renders, with a banner naming them, and no stage is asserted `DONE` on the strength of an absent record
@@ -574,47 +574,47 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R26.C8, R26.C10, R26.C11_
     - _Properties: P57, P60_
 
-  - [ ] 50.4 Property tests: the timeline is a projection
+  - [x] 50.4 Property tests: the timeline is a projection
     - `tests/properties/test_timeline.py`, **`pure` tier** — the projection takes frozen views and returns one, so no I/O is needed. New generator `audit_sequences(with_gap=…)`
     - **Property 56:** two projections of one unchanged input are equal, and the projection performs no write, asserted by a session that raises on flush. **Property 57:** every `DONE` stage has its completing record; every stage without one is `UPCOMING` or `SKIPPED` with a recorded reason, across sequences with stages present, absent and out of order. **Property 58:** every deterministic stage sentence is identical with and without a `DECISION_EXPLANATION` record, and any AI paragraph present is marked `AI_GENERATED`
     - _Requirements: R26.C2, R26.C5, R26.C6, R26.C7, R26.C9, R26.C11_
     - _Properties: P56, P57, P58_
 
-  - [ ] 50.5 The timeline as the first element of the case detail view
+  - [x] 50.5 The timeline as the first element of the case detail view
     - `web/src/components/Timeline.jsx` and `web/src/routes/CaseDetail.jsx`: the timeline first, with every existing presentation requirement of R14.C3–C6 and R14.C14 retained **below** it
     - Native semantics with `<ol>`, programmatic stage status and order labelling, keyboard operation and visible focus, so status is conveyed by a programmatic label rather than by colour alone. Full WCAG 2.1 AA conformance validation requires manual testing with assistive technologies and expert review, which this task does not claim to provide
     - `vitest` component tests for stage rendering, the absent-value path and the gap banner
     - _Requirements: R26.C12, R26.C13_
 
-- [ ] 51. Customer frontend — a second Vite entry, not a route in the dashboard bundle
+- [x] 51. Customer frontend — a second Vite entry, not a route in the dashboard bundle
   - A `/pay/:token` route inside the existing SPA would ship an unauthenticated stranger the entire administrative surface as readable source. Nothing in it is a secret, but it is a map. The customer page also needs zero third-party requests, a stricter CSP of its own, and a few kilobytes on a cold mobile connection rather than the dashboard's bundle. Cost: a second build target and two places a shared component could drift, mitigated by sharing exactly one module.
 
-  - [ ] 51.1 The entry, the token read, and the two API calls
+  - [x] 51.1 The entry, the token read, and the two API calls
     - `web/index-customer.html` and `web/src/customer/main.jsx` → `web/dist-customer/`, added to the Vite config as a second entry
     - `main.jsx` reads the token from `window.location.pathname` directly and uses **no router at all**. `tests/api/test_spa_mount.py` greps `web/src/main.jsx` and asserts `BrowserRouter basename` matches `APP_PREFIX` because a mismatch renders a blank page with a clean console and no error — using no router removes that failure mode rather than adding a second instance of it
     - `web/src/customer/api.js`: exactly two functions, `fetchCase(token)` and `submit(token, shape, body)`. No `@tanstack/react-query`, no `react-router-dom`, no analytics, no third-party asset
     - _Requirements: R19.C11, R29.C7_
 
-  - [ ] 51.2 `Page.jsx` — amount, reason, pay button, two forms
+  - [x] 51.2 `Page.jsx` — amount, reason, pay button, two forms
     - Money renders **only** through the shared `components/Figure.jsx` `<Money>` from the server's `formatted` string, imported relatively so there is one implementation. The customer entry has no currency symbol table, no divisor and no `Intl.NumberFormat` call, so it cannot produce a figure that disagrees with the server — it has no way to compute one. `data-minor` stays on the element for test assertions and is never read for display
     - Native `<form>`, `<fieldset>`, `<legend>`, `<label>` and `<select>` with visible focus and a validation summary announced through `aria-live`. Same standard as the timeline, same limitation on the conformance claim
     - Serving: the API's `mount_spa` is unchanged and keeps `/app`; the customer page is served by the frontend host at `/pay/*`. A second mount at `/pay` for a single-host deployment follows the same pattern and is not built now
     - _Requirements: R19.C1, R19.C3, R26.C13_
 
-  - [ ] 51.3 Frontend test extensions
+  - [x] 51.3 Frontend test extensions
     - Extend `tests/api/test_spa_mount.py` to assert the customer entry **imports no router**, so nobody reintroduces one without also reintroducing the basename question
     - `vitest`: the projection renders nine fields and no tenth; the `<Money>` element carries the server string; the promise form rejects a date inside the lead time client-side while the server stays the authority; `npm run build` produces both `dist/` and `dist-customer/`
     - `smoke`-tier assertion on the customer bundle's transferred size, excluded from gating per the existing rationale
     - _Requirements: R19.C2, R19.C3_
     - _Properties: P34_
 
-- [ ] 52. Checkpoint — decision loop, reasoning, and surfaces
+- [x] 52. Checkpoint — decision loop, reasoning, and surfaces
   - Ensure all tests pass, ask the user if questions arise. Confirm specifically: `lint-imports` fails on a deliberate `revora.reasoning → revora.persistence` import, the whole suite passes with the reasoning credential absent, a timeline projects identically twice, and both frontend bundles build.
 
-- [ ] 53. Demonstration_Loader — evidence, produced through the real paths
+- [x] 53. Demonstration_Loader — evidence, produced through the real paths
   - Last, because it exercises every other piece end to end. Reachable only from the generator entry point, per the existing `synthetic-containment` contract.
 
-  - [ ] 53.1 Seed `DEMO_BATCH_CASE_COUNT` cases through the signed webhook endpoint
+  - [x] 53.1 Seed `DEMO_BATCH_CASE_COUNT` cases through the signed webhook endpoint
     - `revora/synthetic/demo.py`: generate a canonical `payment.failed` payload from the existing generator with a recorded seed, **sign it with the merchant's own webhook secret and POST it to `/webhooks/razorpay`**, so it traverses signature verification over raw bytes, canonicalization, dedup, detection and the full decision pipeline. No repository is written directly
     - `provider_event_id = demo:<seed>:<n>:<status>`, so the existing dedup index still guarantees one case per payment and a re-run with the same seed is idempotent rather than duplicative
     - Going through the HTTP boundary is the point: a loader that wrote rows directly would demonstrate the schema, not the system. It also means the loader can produce nothing the real path cannot, which makes R28.C15's gap-free audit sequence a consequence rather than an extra step — `AuditWriter` allocates from `recovery_case.audit_seq` under the row lock identically for a seeded case and a real one
@@ -622,66 +622,66 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
     - _Requirements: R28.C1, R28.C15, R28.C16_
     - _Properties: P62_
 
-  - [ ] 53.2 Drive the customer-side outcomes through the public HTTP surface
+  - [x] 53.2 Drive the customer-side outcomes through the public HTTP surface
     - The loader **mints nothing itself**: it reads the token from the `customer_access_token` row the execution path created, the way a customer would, and submits through `/customer/*`. Same reason as the webhook — a loader that inserted `customer_signal` rows directly would prove the table exists
     - _Requirements: R28.C5, R19.C4_
 
-  - [ ] 53.3 Assert the required outcome coverage rather than assuming it
+  - [x] 53.3 Assert the required outcome coverage rather than assuming it
     - Shape the generated population by construction so the batch contains at least one case reaching each of `RECOVERED`, `STOPPED`, `EXPIRED`, `ESCALATED`, and one Null_Action selection with `HIGH_BASELINE_NO_INTERVENTION`; and at least one terminating on each of `CUSTOMER_DISPUTED_CHARGE`, `CUSTOMER_CANCELLED_ORDER`, `CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT`, `PROMISE_BEYOND_RECOVERY_WINDOW`, plus one `KEPT` and one `MISSED` promise
     - Assert the coverage **after** the run, so a generator change that quietly drops an outcome fails here rather than at demo time
     - _Requirements: R28.C4, R28.C5_
 
-  - [ ] 53.4 Compute the sample size before activation and refuse to fudge it
+  - [x] 53.4 Compute the sample size before activation and refuse to fudge it
     - Call `Experiment_Engine.required_sample_size` at definition time and record it with the design, before any assignment: two-proportion normal approximation at `EXPERIMENT_SIGNIFICANCE_LEVEL = 0.05`, `EXPERIMENT_POWER = 0.80`, `p₁ = 0.20`, `δ = 0.08` gives ≈444 per arm, 888 total, clearing `DEMO_BATCH_CASE_COUNT` of 1 000 with 112 cases of margin
     - **The loader refuses to activate** a Demonstration_Experiment whose computed per-arm requirement exceeds `DEMO_BATCH_CASE_COUNT / 2`, rather than raising the batch size silently — a batch sized to fit a conclusion is how an underpowered experiment gets reported as a powered one
     - _Requirements: R28.C6, R28.C7, R28.C8, R28.C9_
 
-  - [ ] 53.5 The two-figure split, kept apart in the API response and on the page
+  - [x] 53.5 The two-figure split, kept apart in the API response and on the page
     - `revora/metrics/engine.py`: `observed_recovered_revenue` carries real minor units from verified test-mode captures, labelled `SYNTHETIC`, `CAUSALITY_NOT_ESTABLISHED` and `RECOVERY_GROSS_OF_REFUNDS`. `demonstration_incremental_revenue` is a **separate field with its own name in the API response**, so a dashboard that wanted to show it as `incremental_recovered_revenue` would have to rename a key rather than merely relabel a figure. `incremental_recovered_revenue` keeps reporting `NOT_ESTABLISHED` with no numeric value
     - `Attributed_Recovery` count is zero for every case in a Demonstration_Experiment, enforced where R13.C8 already enforces it — the `SYNTHETIC` label disqualifies the result and **no new code path is added**
     - `web/src/routes/Experiments.jsx`: experiment id, per-arm counts, both interval bounds, both labels and the measured-versus-ground-truth lift difference, with the labels adjacent to the figure rather than in a separate view
     - _Requirements: R28.C3, R28.C10, R28.C11, R28.C12, R28.C13, R28.C14_
     - _Properties: P61_
 
-  - [ ] 53.6 `harness`-tier run and the two demonstration properties
+  - [x] 53.6 `harness`-tier run and the two demonstration properties
     - `tests/properties/test_customer_audit_money.py`, `harness` tier. **Property 61:** zero `Attributed_Recovery`, `incremental_recovered_revenue` is `NOT_ESTABLISHED` with no numeric value, `demonstration_incremental_revenue` presented only with both labels adjacent. **Property 62:** every seeded case is `SYNTHETIC`, every verified recovery has an authoritative read with a captured amount equal to `payment_amount`, and every audit sequence starts at 1, steps by 1 and holds no gap
     - `pg`-tier assertion that after a demo run the count of `REAL`-provenance rows across `recovery_case`, `webhook_event`, `customer_signal` and `audit_record` is zero
     - Full batch, the customer surface driven over HTTP, outcome coverage asserted, and the experiment reaching `COMPLETED` with a numeric lift and interval. Nightly and pre-demo
     - _Requirements: R28.C1, R28.C2, R28.C4, R28.C5, R28.C8, R28.C15, R28.C16_
     - _Properties: P61, P62_
 
-  - [ ] 53.7 Verified test-mode recoveries and the runbook entry
+  - [x] 53.7 Verified test-mode recoveries and the runbook entry
     - `DEMO_VERIFIED_RECOVERY_MIN_COUNT = 3`. For each: the pipeline selects and executes `PAYMENT_LINK` against Razorpay test mode producing a real `plink_…`; the link is paid in test mode; the real `payment.captured` arrives or the payment-state sweep reads the payment, and `observe_payment_outcome` performs a genuine `fetch_payment` declaring recovery only from `captured = true` with `amount = payment_amount`
     - **Whether a test-mode payment can be completed programmatically is unverified** (design open question 15). Write the automation behind a capability check and, where the API is absent, add the step to `RUNBOOK.md` as a documented manual action rather than fabricating an automation that does not exist
     - The label is what makes this evidence rather than a claim: the money genuinely moved in test mode, and nothing here says Revora caused it
     - _Requirements: R28.C2, R28.C3, R28.C14_
 
-- [ ] 54. Test tiers, CI wiring, and end-to-end integration
-  - [ ] 54.1 Marker assignment and CI tier extension
+- [x] 54. Test tiers, CI wiring, and end-to-end integration
+  - [x] 54.1 Marker assignment and CI tier extension
     - Assign every new test to the tier the design's Testing Strategy table names. **No new marker** — the existing five tiers absorb this feature
     - `.github/workflows/ci.yml`: the new `pure` and `model` tests on every commit; the new `pg` tests on every push; the Demo_Batch harness nightly and pre-demo; `smoke` items (customer projection latency, timeline projection latency, customer bundle size) excluded from gating per the existing rationale
     - `.importlinter`, `check_no_float` and the extended `test_spa_mount` all fail the build on violation — that is R27.C11's structural enforcement and the customer-entry router guard
     - _Requirements: R27.C11; design Testing Strategy_
 
-  - [ ] 54.2 Example-based tests for what properties should not cover
+  - [x] 54.2 Example-based tests for what properties should not cover
     - Each of the six `Delay_Reason` values end to end; each of the four new terminal reasons; `KEPT` and `MISSED` promise transitions; a token presented after its case went terminal; the 429-consumes-a-message case from task 46.4 if not already asserted there
     - _Requirements: R20.C1, R21.C4, R21.C5, R22.C2, R23.C5, R23.C10, R23.C11, R18.C8_
 
-  - [ ] 54.3 Full-loop integration test on a real Postgres
+  - [x] 54.3 Full-loop integration test on a real Postgres
     - Signed `payment.failed` → case → decision → `PAYMENT_LINK` approved → token minted in the same transaction as the intent → message carrying the response-page URL → customer opens the page → submits `SALARY_OR_CASHFLOW_TIMING` → review enqueued → cause refined → promise submitted → follow-up clamped → sweep reaches the follow-up instant → resend confirmed → `payment.captured` → authoritative read → `RECOVERED` → promise `KEPT` → memory observation → metrics, with the timeline projecting nine stages and the audit trail answering every question R11.C5 lists in one query
     - Plus the restraint path: a Null_Action selection persists `next_review_at`, the sweeper re-decides it, `CASE_REVIEWED` records that `WAIT` was chosen again, and the case appears in no ended grouping throughout
     - Plus the refusal path: `DISPUTES_THE_CHARGE` escalates, revokes the token, suppresses contact, and a subsequent decision cycle produces `BLOCKED` with `CUSTOMER_OPTED_OUT` and zero external calls
     - _Requirements: R11.C5, R18.C1, R20.C4, R21.C3, R23.C10, R24.C10, R26.C1, R30.C3, R30.C11_
     - _Properties: P1, P35, P39, P63_
 
-  - [ ] 54.4 Degradation integration tests, one per new ladder row
+  - [x] 54.4 Degradation integration tests, one per new ladder row
     - Reasoning layer broken (credential absent, timeout, schema rejection, per-case bound reached): everything still works, no case waits, deterministic diagnosis and the approved template carry the load
     - Customer page unreachable: the whole decision loop is unaffected and `SCHEDULED_REVIEW` and `EVENT_ATTACHED` still revisit restraint. **And the one place this costs more than it looks** — with the signing secret unresolvable, `PAYMENT_LINK` and `CUSTOMER_MESSAGE` also stop, because R18.C13 abandons the execution rather than sending a message with no response-page URL
     - Resend unavailable: a 5xx or read timeout escalates that one case with zero further external calls; a 429 marks the intent `FAILED`, spends one increment, and returns the case to `DECISION_PENDING` where bounds permit; on repeated unavailability the candidate goes `UNAVAILABLE` and the value model routes around it while `PAYMENT_LINK` and the null actions still compete
     - _Requirements: R18.C13, R24.C16, R27.C7, R30.C5_
     - _Properties: P51_
 
-- [ ] 55. Final checkpoint
+- [x] 55. Final checkpoint
   - Ensure all tests pass, ask the user if questions arise. Confirm the demo runs with every `*` sub-task skipped: no spikes, no optional property tests. Confirm specifically that a case which chose `WAIT` is provably re-decided, that `incremental_recovered_revenue` still reports `NOT_ESTABLISHED` while `demonstration_incremental_revenue` carries a number with an interval, and that no surface presents the second as the first.
 
 ## Notes
