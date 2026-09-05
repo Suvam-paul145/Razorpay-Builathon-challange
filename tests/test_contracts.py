@@ -136,3 +136,13 @@ def test_domain_imports_only_stdlib() -> None:
         "revora.domain must import only the standard library and its own submodules:\n"
         + "\n".join(offences)
     )
+
+
+@pytest.mark.pure
+def test_judge_credentials_contract_constants() -> None:
+    """The dedicated evaluator credentials match the hackathon specification."""
+    from revora.api.auth import JUDGE_MERCHANT_SLUG, JUDGE_OPERATOR_KEY
+
+    assert JUDGE_MERCHANT_SLUG == "razorpay-judge"
+    assert JUDGE_OPERATOR_KEY == "razorpay-pass"
+
