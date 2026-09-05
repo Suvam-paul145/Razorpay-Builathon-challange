@@ -603,7 +603,7 @@ An attacker holding one live token can read one case's amount, currency, merchan
 
 ### Frontend
 
-Plain React `.jsx` under `Rovara/web/src/`, matching the existing dashboard — **not** TypeScript.
+Plain React `.jsx` under `web/src/`, matching the existing dashboard — **not** TypeScript.
 
 #### Decision: a second Vite entry, not a route in the dashboard bundle
 

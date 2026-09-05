@@ -42,10 +42,6 @@ on:
     - cron: "0 19 * * *"
   workflow_dispatch:
 
-defaults:
-  run:
-    working-directory: Rovara
-
 # Every Postgres service below pins postgres:18 to match docker-compose and the managed
 # Neon instance. Repeated rather than shared through `env`, because `services.*.image`
 # does not expand the `env` context — a variable there would silently resolve to an
@@ -145,14 +141,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: Rovara/web
+        working-directory: web
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: Rovara/web/package-lock.json
+          cache-dependency-path: web/package-lock.json
       - name: Install
         # `npm ci` rather than `npm install`: it installs exactly the lockfile and fails
         # if the two have drifted. `install` would silently resolve a newer version and

@@ -8,35 +8,35 @@ This guide contains everything you need to run, test, and develop the **Revora A
 
 > **Note:** All confidential credentials (API keys, operator sign-in keys, database URLs, encryption secrets) are stored in the gitignored file:
 > 
-> 📄 **`local_credentials.txt`** *(in the `Rovara/` directory)*
+> 📄 **`local_credentials.txt`** *(in the project root)*
 
 ---
 
 ## ⚡ Quick Start: 4-Terminal Execution
 
-Open **PowerShell** terminals in your workspace directory (`.../Razorpay Builathon challange/Rovara`).
+Open **PowerShell** terminals in your workspace directory (`.../Razorpay Builathon challange`).
 
 ### 🖥️ **Terminal 1 — Backend API & Dashboard**
 Runs FastAPI on `http://127.0.0.1:8000` with the dashboard mounted at `/app`:
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -m revora.api.main
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -m revora.api.main
 ```
 
 ### ⚙️ **Terminal 2 — Background Worker**
 Pulls queued jobs (ingestion, diagnosis, optimization, policy checks, execution, and outcome monitoring):
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='worker'; .\.venv\Scripts\python.exe -m revora.jobs.main
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='worker'; .\.venv\Scripts\python.exe -m revora.jobs.main
 ```
 
 ### ⏰ **Terminal 3 — Ticker (the schedule)**
 Produces the seven periodic sweep jobs and returns a dead worker's `RUNNING` job to `PENDING`. Nothing else creates those jobs, so without this the worker has nothing periodic to claim: cases never expire, intents never reconcile, payment state is never re-read, detection gaps are never backfilled, customer data is never redacted, and a case that chose restraint is never reviewed. None of that logs an error.
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='ticker'; .\.venv\Scripts\python.exe -m revora.jobs.ticker_main
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; $env:REVORA_ROLE='ticker'; .\.venv\Scripts\python.exe -m revora.jobs.ticker_main
 ```
 
 `enqueued=0` in its log is the expected steady state — it means every interval bucket already has a pending sweep, which is the dedupe key doing its job. To drive the same loop by hand instead, one tick at a time:
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_tick.py --due
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_tick.py --due
 ```
 
 ### 📡 **Terminal 4 — Send Test Events (Webhook Simulator)**
@@ -44,11 +44,11 @@ Send mock Razorpay failed payment events to trigger recovery flows:
 
 - **Standard failure event:**
   ```powershell
-  cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_webhook.py failed --slug default-merchant
+  cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_webhook.py failed --slug default-merchant
   ```
 - **High-amount failure event (₹20,000):**
   ```powershell
-  cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_webhook.py failed --slug default-merchant --amount 2000000
+  cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_webhook.py failed --slug default-merchant --amount 2000000
   ```
 
 ---
@@ -59,7 +59,7 @@ By default, the backend API serves the pre-built frontend SPA at `http://127.0.0
 
 If you are modifying frontend UI code (`web/` directory) and want live hot-reloading:
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara\web"; npm run dev
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\web"; npm run dev
 ```
 Open browser at: **[http://localhost:5173](http://localhost:5173)** *(automatically proxies/redirects to `/app`)*.
 
@@ -85,19 +85,19 @@ Open browser at: **[http://localhost:5173](http://localhost:5173)** *(automatica
 ### 1. Database Migrations (Alembic)
 Apply the latest PostgreSQL schema migrations (includes `bigint` duration columns, `merchant_session`, etc.):
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -m alembic upgrade head
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
 ### 2. Wiring & Health Check
 Verify database connection, crypto keys, and pipeline services:
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_check.py
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_check.py
 ```
 
 ### 3. Seed a New Merchant
 Create a new tenant merchant with an operator key:
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_seed.py <new-merchant-slug>
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe scripts\dev_seed.py <new-merchant-slug>
 ```
 
 ### 4. Kill Stuck Process on Port 8000
@@ -109,7 +109,7 @@ Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
 ### 5. Run the Test Suite
 Run the full pytest suite (including unit, integration, and property tests):
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\pytest.exe
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\pytest.exe
 ```
 
 ---
@@ -117,7 +117,7 @@ cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"
 ## 📂 Project Architecture Reference
 
 ```
-Rovara/
+Razorpay Builathon challange/          # project root
 ├── revora/
 │   ├── api/            # FastAPI app, routers, SPA mount (/app), webhook receiver
 │   ├── cases/          # Case lifecycle state machine, consent, sweeper
@@ -161,7 +161,7 @@ Real Razorpay test credentials are required, and they are read from `.env` by na
 Sanity-check that the loaded key is a **test** key before running anything that spends money:
 
 ```powershell
-cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange\Rovara"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -c "import os; k=os.environ.get('REVORA_RAZORPAY_KEY_ID',''); print('test mode:', k.startswith('rzp_test_'))"
+cd "c:\Users\suvam\Desktop\VS code\Projects\Razorpay Builathon challange"; . .\scripts\dev_env.ps1; .\.venv\Scripts\python.exe -c "import os; k=os.environ.get('REVORA_RAZORPAY_KEY_ID',''); print('test mode:', k.startswith('rzp_test_'))"
 ```
 
 If that prints `test mode: False`, **stop.** Nothing below should be run against a live key.

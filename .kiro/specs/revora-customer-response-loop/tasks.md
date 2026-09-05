@@ -31,7 +31,7 @@ cd web ; npx eslint src ; npx vitest run ; npm run build
 
 ### Conventions
 
-- Paths are relative to `Rovara/`.
+- Paths are relative to the repository root.
 - Sub-tasks marked `*` are optional. The system must be demonstrable with every one of them skipped.
 - Every property test carries the design-mandated tag comment naming the feature and the full property statement, and runs in the marker tier the design's Testing Strategy table assigns it.
 - Frontend is plain React `.jsx`. No TypeScript is introduced anywhere by this feature.

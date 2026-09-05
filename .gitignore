@@ -23,3 +23,8 @@ local_credentials.txt
 credentials.txt
 credentials.local.txt
 *.log
+
+# tool caches and local measurement scratch (added when the tree was flattened to the repo root)
+.import_linter_cache/
+_demo_probe.py
+

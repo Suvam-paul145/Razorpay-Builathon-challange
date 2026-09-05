@@ -2,7 +2,7 @@
 
 ## Overview
 
-Greenfield build into the empty `Rovara/` directory. Python 3.12 modular monolith (FastAPI, one Docker image, two process roles) against one PostgreSQL, plus a React + TypeScript SPA. The design document is the authority; this plan cites its acceptance criteria rather than restating them.
+Greenfield build into an empty repository. Python 3.12 modular monolith (FastAPI, one Docker image, two process roles) against one PostgreSQL, plus a React + TypeScript SPA. The design document is the authority; this plan cites its acceptance criteria rather than restating them.
 
 Build order follows the dependency chain that the design's guarantees imply: the structural mechanisms first (import contracts, integer money, schema constraints), then the transactional core (queue, audit, ingestion, lifecycle), then the decision pipeline (diagnosis, estimation, optimizer, policy), then the exactly-once execution and outcome verification that the recovery number depends on, then measurement (experiment, metrics, memory, synthetic harness), then the surfaces.
 
@@ -21,7 +21,7 @@ Two departures from the suggested order, both justified in place:
 
 - Sub-tasks marked `*` are optional. The system must be demonstrable with every one of them skipped.
 - `_Requirements:` cites acceptance criteria as `Rn.Cm`. `_Properties:` cites the design's numbered correctness properties.
-- Paths are relative to `Rovara/`.
+- Paths are relative to the repository root.
 - Every property test carries the design-mandated tag comment naming the feature and the property statement.
 
 ---

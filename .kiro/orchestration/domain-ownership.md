@@ -12,8 +12,8 @@ Derived from the `design.md` module map and `tasks.md` task assignments.
 | `.kiro/steering/` | Decision checkpoints |
 | `.kiro/orchestration/` | Orchestration state |
 | `ai_revenue_recovery_skills/` | Skill definitions |
-| `Rovara/.importlinter` | Import contracts |
-| `Rovara/pyproject.toml` | Dependencies, build config |
+| `.importlinter` | Import contracts |
+| `pyproject.toml` | Dependencies, build config |
 
 ---
 
