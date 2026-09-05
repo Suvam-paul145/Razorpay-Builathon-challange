@@ -119,6 +119,7 @@ from revora.persistence.models import SyntheticRun
 from revora.persistence.repositories.session import tenant_transaction
 from revora.platform.clock import now
 from revora.platform.logging import get_logger
+from revora.platform.ratelimit import WINDOW as INGEST_RATE_WINDOW
 from revora.synthetic.generator import (
     GENERATOR_VERSION,
     GeneratedCase,
@@ -158,7 +159,9 @@ __all__ = [
     "DemoTransport",
     "DemoWorker",
     "HttpResult",
+    "SeedDeliveryShortfallError",
     "UnderpoweredDemoBatchError",
+    "authoritative_test_mode_recoveries",
     "capturing_customer_tokens",
     "define_demonstration_experiment",
     "demo_provider_event_id",
@@ -208,10 +211,17 @@ DEMO_VERIFIED_RECOVERY_MIN_COUNT: Final[int] = 3
 
 A Verified_Demo_Recovery is a case that reached ``RECOVERED`` from an authoritative read
 **against the provider test environment** reporting ``captured = true`` with an amount equal to
-the case's ``payment_amount``. Whether a Razorpay test-mode payment link can be *paid*
-programmatically is unverified (design open question 15), so the loader checks for the capability
-and, where it is absent, refuses to claim the recovery rather than manufacturing one — see
-:func:`verified_test_mode_capability` and the Demo_Batch entry in ``RUNBOOK.md``."""
+the case's ``payment_amount``.
+
+**A minimum, not the reported figure.** What the report carries is
+:func:`authoritative_test_mode_recoveries` — a count of the rows that satisfy that definition —
+and this constant is what that count has to reach. The two were briefly the same thing, which was
+the defect: reporting the constant whenever a capability check passed would have made the field a
+restatement of the requirement rather than a measurement against it.
+
+Paying a test-mode link programmatically is not possible — design open question 15, answered in
+:func:`verified_test_mode_capability` — so the payment step is a documented manual action in
+``RUNBOOK.md`` (§ Verified test-mode recoveries)."""
 
 DEMO_SEED: Final[int] = 20_260_903
 """The recorded generation seed (R28.C1).
@@ -1320,28 +1330,80 @@ class DemoBatchReport:
 
 
 def verified_test_mode_capability(transport: object) -> bool:
-    """Whether this run can complete a Razorpay test-mode payment programmatically.
+    """Whether this run can **pay** a Razorpay test-mode payment link programmatically.
 
-    ``False`` in every automated tier, and that is a finding rather than a limitation to route
-    around. R28.C2 wants ``DEMO_VERIFIED_RECOVERY_MIN_COUNT`` cases recovered from an
-    authoritative read **against the provider test environment**, which needs a real
-    ``plink_…`` to be paid; whether that can be driven by an API is design open question 15 and
-    remains **[EVIDENCE INSUFFICIENT]**. No gated test may make a real network call, so no gated
-    tier can answer the question either.
+    ``False``, and design open question 15 is now answered rather than open: **the API does not
+    exist.** The Payment Links surface Razorpay documents is create (standard and UPI), fetch,
+    fetch-all, update, cancel, offers, and ``POST /v1/payment_links/:id/notify_by/:medium`` —
+    seven operations, none of which pays a link. Payment happens on the customer-facing payment
+    page, and in test mode that page is a mock that asks a *person* to choose success or failure.
+    ``revora.providers.razorpay.PaymentProviderClient`` mirrors that surface with five methods
+    (``create_payment_link``, ``notify_by``, ``find_payment_links_by_reference_id``,
+    ``fetch_payment``, ``list_payments``), so there is nothing for this function to call even if
+    it wanted to.
 
-    So the capability is checked and the claim is withheld when it is absent, rather than a
-    scripted capture being counted as a verified test-mode recovery. The three recoveries are a
-    documented manual step in ``RUNBOOK.md``; a batch that reported them from a fake would be
-    the one dishonest number in an artefact whose entire purpose is that its numbers can be
-    trusted.
+    So no automation is written. Step 2 of R28.C2 — *pay the link* — is a documented manual
+    action in ``RUNBOOK.md`` (§ Verified test-mode recoveries), which is what task 53.7 asks for
+    where the API is absent: a capability check plus a real manual step, not a fabricated
+    automation that would have to pretend a capture happened.
+
+    **This gates the automation, not the counting.** A test-mode run whose links an operator paid
+    by hand produces genuine Verified_Demo_Recoveries, and they are counted from the persisted
+    reads by :func:`authoritative_test_mode_recoveries` rather than being asserted from this
+    boolean. What used to happen here was the dishonest shape: this function returning ``True``
+    would have made the report claim exactly ``DEMO_VERIFIED_RECOVERY_MIN_COUNT`` recoveries —
+    the constant, not a count of anything.
+
+    **What would change this answer.** A documented endpoint that completes a payment against a
+    test-mode link, or a documented test-payment route for Payment Links of the kind that exists
+    for BharatQR codes. Then the automation goes behind this check, and the ``transport``
+    parameter is what it would reach the provider through — which is why it stays in the
+    signature rather than being added later as a change to every caller.
 
     Args:
-        transport: accepted and deliberately unused. The signature is where a future
-            implementation would go — it would need a transport to reach the provider — and
-            leaving the parameter out would make adding it a signature change in every caller.
+        transport: accepted and deliberately unused. See above.
     """
     _ = transport
     return False
+
+
+def authoritative_test_mode_recoveries(session: Session, merchant_id: uuid.UUID) -> int:
+    """Count the Verified_Demo_Recoveries this merchant's rows actually evidence (R28.C2).
+
+    A Verified_Demo_Recovery is defined by R28.C2 as a case that reached ``RECOVERED`` from an
+    authoritative provider state read reporting ``captured = true`` with an amount equal to the
+    case's ``payment_amount``. Every one of those clauses is a column, so this is a count of rows
+    that satisfy the definition rather than a number the loader decided:
+
+    * ``recovery_outcome.verified_by_read_id`` is ``NOT NULL`` by design, so a recorded recovery
+      always names the read that verified it. The join cannot silently miss one.
+    * ``payment_state_read.captured`` and ``.amount`` are the read's own values, compared against
+      the case's ``payment_amount`` here rather than trusted to have been compared upstream. The
+      Outcome_Monitor does apply that rule — this asks the rows whether it held.
+    * ``recovery_case.state`` must be ``RECOVERED``. A case that recovered and was later
+      superseded is not evidence of a recovery that stands.
+
+    **What this cannot see, and who supplies it.** No column records whether the client behind a
+    read was Razorpay test mode or ``tests.fakes.razorpay``, and inventing one would be a
+    provenance claim written by the thing making it. The caller knows: ``run_demo_batch``'s
+    ``script_payment`` is ``None`` exactly when the run takes the provider's own answers, so
+    :func:`_conclude` reports this count then and reports zero otherwise. That keeps a harness
+    run's scripted captures — which are real reads of a fake — out of a field whose whole meaning
+    is *money that moved at the provider*.
+    """
+    return int(
+        session.execute(
+            text(
+                "SELECT count(*) FROM recovery_outcome o "
+                "JOIN payment_state_read r ON r.id = o.verified_by_read_id "
+                "AND r.merchant_id = o.merchant_id "
+                "JOIN recovery_case c ON c.id = o.case_id AND c.merchant_id = o.merchant_id "
+                "WHERE o.merchant_id = :m AND c.state = :recovered "
+                "AND r.captured AND r.amount = c.payment_amount"
+            ),
+            {"m": str(merchant_id), "recovered": CaseState.RECOVERED.value},
+        ).scalar_one()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1386,18 +1448,123 @@ def _record_consent(
     return recorded
 
 
+_INGEST_WINDOW_MARGIN: Final[timedelta] = timedelta(seconds=1)
+"""How far past the ingest rate window the clock is moved to open a fresh one.
+
+One second, because :meth:`revora.platform.ratelimit.RateLimiter.allow` compares
+``moment - start >= window`` — so one second past the window *is* the next window, and any
+larger margin only ages the batch further in exchange for nothing."""
+
+
+class _IngestPacer:
+    """Keeps the loader's webhook deliveries inside ``INGEST_RATE_LIMIT`` instead of exceeding it.
+
+    **The defect this exists to fix.** ``INGEST_RATE_LIMIT`` defaults to 600 accepted ingestion
+    requests per minute per source identifier, and every case this loader seeds arrives at
+    ``/webhooks/razorpay/{slug}`` — one source key, one clock. Delivering a 1 000-case batch in
+    one tight loop against a frozen clock therefore put 820 main-cohort deliveries into a single
+    window: 600 were accepted, 220 came back ``RATE_LIMITED`` → HTTP 429, and the batch reported
+    ``seeded_case_count`` 780 against ``case_count`` 1 000 with both arms below the 447-per-arm
+    requirement it had computed for itself. The arithmetic is exact and the limiter was right
+    every time. **The loader was what was wrong**, and it is the loader that is fixed here: the
+    rate limit is a real protection on the only unauthenticated endpoint in Revora and raising,
+    overriding or special-casing it for a demonstration would be removing the guard in order to
+    demonstrate the system that has it.
+
+    **The window semantics this relies on**, read off ``revora.platform.ratelimit`` rather than
+    assumed: the counter is a *fixed* window that resets rather than sliding, keyed per source,
+    and it reads **no clock of its own** — every caller passes the instant it already has, and
+    ``ingest_webhook`` passes ``revora.platform.clock.now()``. So the same substituted clock the
+    harness drives through ``advance`` decides which window a delivery falls in, and pacing the
+    deliveries against a moved clock is not a trick played on the limiter: it is a batch arriving
+    at the rate a provider would send it at.
+
+    The arithmetic here mirrors ``allow`` exactly — same window start, same ``>=`` comparison —
+    so the pacer stays in step with the limiter across the clock advances the *rest* of the run
+    makes (``_close_prior_window`` moves a week, ``_run_sweeps`` moves several). A pacer that
+    counted deliveries without tracking when its window opened would keep advancing the clock
+    after those, for allowance the limiter had already released.
+
+    **One pacer per run, covering every delivery.** The limit is per source identifier and the
+    loader is one source, so a per-cohort counter would let the main cohort's tail and the
+    captures that resolve it pool their allowances in the same window and refuse the second half
+    — which is the original defect displaced rather than fixed.
+
+    **What the clock advances cost, stated rather than left unexamined** — the concern
+    :func:`_close_prior_window` is careful about, and the same reasoning applies:
+
+    * Each advance is ``WINDOW + 1s`` = 61 seconds. A 1 000-case batch delivers roughly 1 400
+      webhooks in total (1 000 failures, the captures for the cases whose counterfactual
+      recovers, and the repeat failures), so it spends **two or three** advances: about three
+      minutes across a run whose ``RECOVERY_WINDOW_DURATION`` is seven days. Three minutes is
+      0.03% of a 10 080-minute window.
+    * It cannot *shorten* a window. ``window_end_at`` is written once, at detection, as
+      ``detected_at + RECOVERY_WINDOW_DURATION`` (R2.C5 makes it immutable), so a case seeded
+      after an advance gets a full window measured from its own later detection instant. The only
+      effect is that cases in a later chunk are detected up to a minute after those in an earlier
+      one, which is what a provider delivering a real backlog would also produce.
+    * Nothing else in the batch is measured in minutes. ``CUSTOMER_TOKEN_LIFETIME`` is 72 hours,
+      ``WAIT_REVIEW_INTERVAL`` 12 hours, ``PROMISE_MIN_LEAD_TIME`` and the follow-up offset are
+      driven by explicit advances of their own in :func:`_run_sweeps`. A minute moves none of
+      them across a boundary, and every advance moves time *forward*, so no bound that was
+      satisfied becomes unsatisfied.
+    """
+
+    __slots__ = ("_advance", "_limit", "_spent", "_started", "_window", "advances")
+
+    def __init__(
+        self,
+        advance: Callable[[timedelta], None],
+        limit: int,
+        window: timedelta = INGEST_RATE_WINDOW,
+    ) -> None:
+        self._advance = advance
+        self._limit = int(limit)
+        self._window = window
+        self._started: datetime | None = None
+        self._spent = 0
+        self.advances = 0
+        """How many rate windows the run opened. Reported so a caller can price the ageing."""
+
+    def reserve(self) -> None:
+        """Make room for one delivery, moving the clock past the window if the allowance is spent.
+
+        Called immediately before the request rather than after it, because the allowance has to
+        exist at the moment the request is made; a check afterwards would be a report of a
+        refusal that already happened.
+
+        A limit below one is not paced. There is no allowance to renew in that case, so advancing
+        would move the clock forward for ever and never admit anything — the delivery goes out,
+        the endpoint refuses it, and :class:`SeedDeliveryShortfallError` says so with the status.
+        """
+        moment = now()
+        if self._started is None or moment - self._started >= self._window:
+            self._started, self._spent = moment, 0
+        if self._spent >= self._limit and self._limit >= 1:
+            self._advance(self._window + _INGEST_WINDOW_MARGIN)
+            self.advances += 1
+            self._started, self._spent = now(), 0
+        self._spent += 1
+
+
 def _deliver(
     transport: DemoTransport,
     tenant: DemoTenant,
     payload: Mapping[str, object],
     event_id: str,
+    *,
+    pacer: _IngestPacer,
 ) -> int:
     """POST one signed webhook the way Razorpay would. Returns the status code.
 
     The signature is computed over the same bytes that are sent, and the event id goes in the
     header the provider uses — so a batch that produced a case proves signature verification
     over raw bytes, canonicalization and the dedup index all ran.
+
+    Every webhook the loader sends goes through here, which is what lets one :class:`_IngestPacer`
+    account for the whole run's ingest allowance rather than each loop guessing at its own share.
     """
+    pacer.reserve()
     body = _encode(payload)
     return transport.request(
         "POST",
@@ -1848,12 +2015,19 @@ def run_demo_batch(
     Raises:
         UnderpoweredDemoBatchError: from :func:`define_demonstration_experiment`, before any case
             is seeded.
+        SeedDeliveryShortfallError: if either cohort's deliveries were not all accepted. A batch
+            that seeded fewer cases than it was asked for fails here rather than reporting a
+            figure computed over a population it does not describe.
     """
     plans = plan_batch(
         seed=seed, case_count=case_count, prior_cohort_size=prior_cohort_size
     )
     prior = [plan for plan in plans if plan.outcome in PRIOR_OUTCOMES]
     main = [plan for plan in plans if plan.outcome not in PRIOR_OUTCOMES]
+
+    # One pacer for the whole run, because ``INGEST_RATE_LIMIT`` is per source identifier and
+    # every webhook below is delivered under the same one. See :class:`_IngestPacer`.
+    pacer = _IngestPacer(advance, config.INGEST_RATE_LIMIT)
 
     # -- phase 0: the run row and the experiment, before a single case exists ---------------
     #
@@ -1908,7 +2082,7 @@ def run_demo_batch(
     # Seeded and resolved *before* the main cohort, because the estimator reads history and this
     # is the history. See :data:`DEMO_PRIOR_COHORT_SIZE` and :func:`prior_cohort_split`.
     with capturing_customer_tokens() as prior_tokens:
-        _seed_cohort(transport, tenant, prior, worker)
+        _seed_cohort(transport, tenant, prior, worker, pacer=pacer)
     _resolve_cohort(
         transport,
         tenant,
@@ -1916,13 +2090,14 @@ def run_demo_batch(
         worker=worker,
         experiment_id=experiment_id,
         script_payment=script_payment,
+        pacer=pacer,
     )
     _close_prior_window(worker, advance, config)
     _ = prior_tokens
 
     # -- phase 3: the main cohort ------------------------------------------------------------
     with capturing_customer_tokens() as tokens:
-        _seed_cohort(transport, tenant, main, worker)
+        _seed_cohort(transport, tenant, main, worker, pacer=pacer)
 
         with tenant_transaction(tenant.merchant_id) as session:
             case_ids = _case_ids_by_index(session, tenant.merchant_id, plans)
@@ -1951,6 +2126,7 @@ def run_demo_batch(
         worker=worker,
         experiment_id=experiment_id,
         script_payment=script_payment,
+        pacer=pacer,
     )
     # The kept promise is the one customer-driven role whose money does arrive.
     _resolve_cohort(
@@ -1960,6 +2136,7 @@ def run_demo_batch(
         worker=worker,
         experiment_id=experiment_id,
         script_payment=script_payment,
+        pacer=pacer,
         force_recovery=True,
     )
 
@@ -1972,7 +2149,9 @@ def run_demo_batch(
         worker,
         advance,
         config,
-        after_reviews=lambda: _deliver_repeat_failures(transport, tenant, main, worker),
+        after_reviews=lambda: _deliver_repeat_failures(
+            transport, tenant, main, worker, pacer
+        ),
     )
 
     # -- phase 7: analyse, complete, and read everything back --------------------------------
@@ -1986,6 +2165,11 @@ def run_demo_batch(
         required_per_arm=required_per_arm,
         submissions=submissions,
         transport=transport,
+        # ``script_payment is None`` is the loader's only structural evidence that the
+        # authoritative reads behind this run's recoveries went to a real provider rather than a
+        # scriptable fake — see :func:`authoritative_test_mode_recoveries`.
+        provider_reads_live=script_payment is None,
+        rate_windows_opened=pacer.advances,
     )
 
 
@@ -2012,30 +2196,77 @@ def _assumptions(
     return document
 
 
+class SeedDeliveryShortfallError(RuntimeError):
+    """A cohort was not fully accepted, so the batch is smaller than the design it reports.
+
+    **This is a raise rather than a warning because the alternative is the one dishonesty the
+    rest of this module is built to prevent.** ``_seed_cohort`` used to log one line per refusal
+    and return a short count; a run that seeded 780 of 1 000 therefore *finished*, printed
+    ``observed_recovered_revenue``, and reported both arms below the per-arm sample size it had
+    computed for itself — a figure produced from a population that was not the one described
+    beside it. It is the same argument task 53.3 makes for asserting outcome coverage after the
+    run rather than assuming it: a demonstration whose shortfalls are warnings is a demonstration
+    whose numbers nobody can check.
+
+    ``statuses`` carries the refusal status codes and how many of each, because the status is the
+    diagnosis. 429 is the ingest rate limit — which, now that :class:`_IngestPacer` paces every
+    delivery, means the limit was lowered below what the pacer was told or a second source shared
+    the key. 401 is the signature, 413 the payload size, 503 the ack budget. A message that said
+    only "short by 220" would send the next reader back to the logs to find out which.
+    """
+
+    def __init__(self, requested: int, accepted: int, statuses: Mapping[int, int]) -> None:
+        self.requested = requested
+        self.accepted = accepted
+        self.statuses = dict(statuses)
+        observed = ", ".join(
+            f"HTTP {status}: {count}" for status, count in sorted(self.statuses.items())
+        )
+        super().__init__(
+            f"requested {requested} seeded cases and {accepted} were accepted; refusals "
+            f"observed: {observed or 'none'}. Refusing to run a batch smaller than its design: "
+            "a short cohort drops both experiment arms below the sample size the loader computed "
+            "and every figure the batch then reports describes a population it does not name"
+        )
+
+
 def _seed_cohort(
     transport: DemoTransport,
     tenant: DemoTenant,
     plans: Sequence[CasePlan],
     worker: DemoWorker,
+    *,
+    pacer: _IngestPacer,
 ) -> int:
     """Deliver every ``payment.failed`` in the cohort, then let the pipeline run. Returns 2xx count.
 
     Delivered first and drained afterwards rather than one at a time, because that is how a
     provider behaves: the ack budget is per delivery and the work is asynchronous, so a batch
-    that drained between deliveries would be testing a system nobody deployed.
+    that drained between deliveries would be testing a system nobody deployed. ``pacer`` is what
+    keeps "all of them, then drain" inside ``INGEST_RATE_LIMIT`` — see :class:`_IngestPacer`.
+
+    Raises:
+        SeedDeliveryShortfallError: if any delivery was refused. Raised before the drain, because
+            there is nothing worth draining about a cohort that is already the wrong size.
     """
     accepted = 0
+    refusals: dict[int, int] = {}
     for plan in plans:
-        status = _deliver(transport, tenant, _failed_payload(plan), plan.failed_event_id)
+        status = _deliver(
+            transport, tenant, _failed_payload(plan), plan.failed_event_id, pacer=pacer
+        )
         if status == 200:
             accepted += 1
         else:
+            refusals[status] = refusals.get(status, 0) + 1
             _logger.warning(
                 "demo webhook refused",
                 index=plan.index,
                 status_code=status,
                 event_id=plan.failed_event_id,
             )
+    if accepted != len(plans):
+        raise SeedDeliveryShortfallError(len(plans), accepted, refusals)
     worker.drain()
     return accepted
 
@@ -2048,6 +2279,7 @@ def _resolve_cohort(
     worker: DemoWorker,
     experiment_id: uuid.UUID,
     script_payment: Callable[[str, int, bool], None] | None,
+    pacer: _IngestPacer,
     force_recovery: bool = False,
 ) -> int:
     """Let the money arrive for the cases whose outcome says it does. Returns how many captures.
@@ -2075,7 +2307,10 @@ def _resolve_cohort(
             continue
         if script_payment is not None:
             script_payment(plan.provider_payment_id, int(plan.amount), True)
-        if _deliver(transport, tenant, _captured_payload(plan), plan.captured_event_id) == 200:
+        status = _deliver(
+            transport, tenant, _captured_payload(plan), plan.captured_event_id, pacer=pacer
+        )
+        if status == 200:
             delivered += 1
     worker.drain()
     return delivered
@@ -2118,6 +2353,7 @@ def _deliver_repeat_failures(
     tenant: DemoTenant,
     plans: Sequence[CasePlan],
     worker: DemoWorker,
+    pacer: _IngestPacer,
 ) -> int:
     """Deliver a second ``payment.failed`` for each ``REPEAT_FAILURE`` case. Returns the 2xx count.
 
@@ -2135,7 +2371,7 @@ def _deliver_repeat_failures(
         if plan.outcome is not DemoOutcome.REPEAT_FAILURE:
             continue
         status = _deliver(
-            transport, tenant, _failed_payload(plan), plan.repeat_failed_event_id
+            transport, tenant, _failed_payload(plan), plan.repeat_failed_event_id, pacer=pacer
         )
         if status == 200:
             delivered += 1
@@ -2226,6 +2462,8 @@ def _conclude(
     required_per_arm: int,
     submissions: Mapping[str, int],
     transport: DemoTransport,
+    provider_reads_live: bool,
+    rate_windows_opened: int,
 ) -> DemoBatchReport:
     """Complete the experiment, compute the figures, and read the coverage back.
 
@@ -2287,12 +2525,12 @@ def _conclude(
         coverage = read_coverage(session, tenant.merchant_id)
         arms = _arms(session, tenant.merchant_id, experiment_id)
         seeded = len(_case_ids_by_index(session, tenant.merchant_id, plans))
+        # Counted from the rows that satisfy R28.C2's definition, and reported only where the
+        # authoritative reads behind them went to a real provider. A scripted fake produces
+        # genuine reads of something that is not the provider, which is not what this field says.
+        evidenced = authoritative_test_mode_recoveries(session, tenant.merchant_id)
 
-    verified = (
-        DEMO_VERIFIED_RECOVERY_MIN_COUNT
-        if verified_test_mode_capability(transport)
-        else 0
-    )
+    verified = evidenced if provider_reads_live else 0
 
     report = DemoBatchReport(
         seed=seed,
@@ -2330,9 +2568,20 @@ def _conclude(
         customer_submissions=dict(submissions),
     )
     _logger.warning(
+        "demo verified test-mode recoveries",
+        required=DEMO_VERIFIED_RECOVERY_MIN_COUNT,
+        reported=verified,
+        recoveries_evidenced_by_authoritative_read=evidenced,
+        provider_reads_live=provider_reads_live,
+        # Design open question 15, answered: no documented endpoint pays a payment link, so the
+        # payment step is a manual RUNBOOK.md action rather than an automation.
+        programmatic_test_mode_payment=verified_test_mode_capability(transport),
+    )
+    _logger.warning(
         "demo batch complete",
         seed=seed,
         case_count=report.case_count,
+        rate_windows_opened=rate_windows_opened,
         recovered=report.recovered_case_count,
         observed_recovered_revenue=report.observed_recovered_revenue,
         incremental=report.incremental_status,
