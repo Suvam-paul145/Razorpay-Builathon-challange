@@ -33,8 +33,8 @@ Most recovery tools send a payment link, some customers pay, and the tool claims
 
 Revora refuses to make that claim. It always shows **two figures, never merged**:
 
-- **Observed recovered revenue** — money that arrived on cases Revora touched. A fact.
-- **Incremental recovered revenue** — money that arrived *because* Revora acted. A causal claim, shown **only** when a proper holdout experiment proves it. Until then it reads `NOT_ESTABLISHED` — not zero, because "we haven't measured this" and "we measured nothing" are different statements.
+- **Observed recovered revenue** — **Total payments collected:** All money that arrived after Revora reached out.
+- **Incremental recovered revenue** — **True added value:** Only the *extra* revenue brought in because Revora stepped in (excluding customers who would have retried and paid anyway). Proven through A/B holdout tests; displays `NOT_ESTABLISHED` until statistically verified.
 
 **Where this applies in the real world:** any merchant deciding whether a recovery vendor is worth paying for. Revora is the tool that tells them the honest number instead of the flattering one.
 
