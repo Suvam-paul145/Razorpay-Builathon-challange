@@ -1,6 +1,6 @@
 # Revora — Live Demo Guide
 
-A stepwise script for showing Revora to judges. Read it top to bottom once, then present.
+A step-by-step script for showing Revora to judges. Read it through once, then present.
 
 Everything here uses the **deployed** app. Nothing needs to run on your laptop.
 
@@ -15,7 +15,7 @@ Everything here uses the **deployed** app. Nothing needs to run on your laptop.
 | API health check | https://revora-api-h3aj.onrender.com/health | — |
 | API docs (optional) | https://revora-api-h3aj.onrender.com/docs | — |
 
-> The dashboard and the API are the **same** Render service. The customer page is a **separate** Vercel deployment on purpose — an unauthenticated payer must never be shipped the admin app's source.
+> The dashboard and the API are the **same** Render service. The customer page is a **separate** Vercel deployment on purpose — a payer who hasn't signed in must never be sent the admin app's source code.
 
 ---
 
@@ -29,12 +29,12 @@ That last separation is the whole product. Everything else supports it.
 
 ## The idea judges must remember
 
-Most recovery tools send a payment link, some customers pay, and the tool claims the total as "revenue recovered." **That number is inflated** — many of those customers would have paid on their own, and the tool takes credit for the customer's own persistence.
+Most recovery tools send a payment link, some customers pay, and the tool claims the whole amount as "revenue recovered." **That number is inflated** — many of those customers would have paid on their own, and the tool takes credit for the customer's own effort.
 
 Revora refuses to make that claim. It always shows **two figures, never merged**:
 
 - **Observed recovered revenue** — **Total payments collected:** All money that arrived after Revora reached out.
-- **Incremental recovered revenue** — **True added value:** Only the *extra* revenue brought in because Revora stepped in (excluding customers who would have retried and paid anyway). Proven through A/B holdout tests; displays `NOT_ESTABLISHED` until statistically verified.
+- **Incremental recovered revenue** — **True added value:** Only the *extra* revenue brought in because Revora stepped in. This leaves out customers who would have tried again and paid anyway. It is proven through A/B holdout tests, and shows `NOT_ESTABLISHED` until the numbers prove it.
 
 **Where this applies in the real world:** any merchant deciding whether a recovery vendor is worth paying for. Revora is the tool that tells them the honest number instead of the flattering one.
 
@@ -48,7 +48,7 @@ The Render free tier **sleeps when idle**. The first request after a nap takes ~
 2. Wait until it returns a small JSON response (not an error page). This wakes the server.
 3. Now open the dashboard link and sign in. It will be instant.
 
-If `/health` shows an error about the schema revision, the database migration hasn't been applied — see **If something breaks** at the bottom.
+If `/health` shows an error about the schema revision, the database migration hasn't been run yet — see **If something breaks** at the bottom.
 
 ---
 
@@ -61,7 +61,7 @@ Sign in at the dashboard link with the slug and key above. You land on **Perform
 **Do:** Point at the two big figures side by side.
 
 **Say:**
-> "Observed recovered revenue is real money that came back on cases we worked. Right beside it, incremental revenue reads `NOT_ESTABLISHED` with a `CAUSALITY_NOT_ESTABLISHED` label — we will not call it *ours* until an experiment proves it. Notice every amount is server-formatted; the browser never does money maths, so two parts of the screen can't disagree."
+> "Observed recovered revenue is real money that came back on cases we worked. Right beside it, incremental revenue reads `NOT_ESTABLISHED` with a `CAUSALITY_NOT_ESTABLISHED` label — we will not call it *ours* until an experiment proves it. Notice every amount is formatted on the server. The browser never does money maths, so two parts of the screen can't disagree."
 
 **Applies to:** the finance/ops person who signs the cheque — this is the number they actually care about.
 
@@ -90,7 +90,7 @@ Sign in at the dashboard link with the slug and key above. You land on **Perform
 **Do:** Open Experiments and open the one experiment.
 
 **Say:**
-> "This is how `incremental` gets established: a holdout where some cases are deliberately left untreated. The dashboard shows both arms, the measured lift, and its confidence interval. Only when that interval sits entirely above zero does Revora make a causal claim."
+> "This is how `incremental` gets established: a holdout, where some cases are deliberately left untouched so we have a fair comparison. The dashboard shows both groups, the measured lift, and its confidence interval — the range the true effect likely falls in. Only when that whole range sits above zero does Revora claim it caused the recovery."
 
 **Applies to:** the skeptical buyer who's been burned by inflated vendor numbers before.
 
@@ -99,7 +99,7 @@ Sign in at the dashboard link with the slug and key above. You land on **Perform
 **Do:** Open Consent briefly.
 
 **Say:**
-> "Opt-out is keyed to the customer, not the payment, so it governs cases that don't exist yet. Once someone opts out, Revora cannot contact them — enforced in the code, not by policy."
+> "Opt-out is tied to the customer, not the payment, so it covers cases that don't exist yet. Once someone opts out, Revora cannot contact them — this is enforced in the code, not just by policy."
 
 **Applies to:** anyone asking about DPDP / privacy obligations.
 
@@ -118,11 +118,11 @@ https://razorpay-builathon-challange.vercel.app/pay/default-merchant/rvc_<26 cha
 The token sits in the **path**, never a query string, so it stays out of `Referer` headers and analytics.
 
 **Say:**
-> "This is the page a customer opens from the payment message. It shows the amount and reason, a pay button, and lets them tell us *why* it's late or promise a date. It's a completely separate deployment from the dashboard — a payer never receives the admin app. It discloses exactly eight fields and nothing else: no internal probabilities, no costs, no other customer's data."
+> "This is the page a customer opens from the payment message. It shows the amount and reason, a pay button, and lets them tell us *why* it's late or promise a date. It's a completely separate deployment from the dashboard — a payer never receives the admin app. It shows exactly eight fields and nothing else: no internal probabilities, no costs, no other customer's data."
 
 **Applies to:** the end customer — the person actually being asked to pay.
 
-> If you want to show it fully working, that needs a token minted by a live payment run — do that only if you've rehearsed it. For most demos, explaining it on the "not found" page is enough and safer.
+> If you want to show it fully working, you need a token created by a live payment run — only do that if you've rehearsed it. For most demos, explaining it on the "not found" page is enough, and safer.
 
 ---
 
@@ -149,7 +149,7 @@ The token sits in the **path**, never a query string, so it stays out of `Refere
 ## 20-second recap if you run out of time
 
 1. Failed payments aren't automatically lost — Revora decides, per payment, whether acting beats waiting.
-2. It acts **at most once**, and only declares a recovery from an authoritative provider read, never a webhook.
+2. It acts **at most once**, and only declares a recovery from a direct, trusted read of the payment provider, never from a webhook.
 3. It reports **observed** money as fact and **incremental** money only when an experiment proves it — and refuses to inflate the number even when it could.
 
 That refusal is the product.

@@ -10,19 +10,19 @@ All commands run from the **repository root**.
 
 ### `check_no_float.py`
 
-Walks every currency-bearing module — **72 of them** — and fails the build on a `float`, a `/`, or a
-`round()` anywhere near an amount.
+Walks every module that touches currency — **72 of them** — and fails the build if it finds a
+`float`, a `/`, or a `round()` anywhere near an amount.
 
 ```powershell
 .venv\Scripts\python.exe scripts\check_no_float.py
 ```
 
-This is the lexical half of the money rule. `mypy` catches a wrong *type*; this catches an integer
-divided by an integer, which type-checks perfectly and is wrong by two decimal places. Together they
-cover what neither does alone.
+This is the text-scanning half of the money rule. `mypy` catches a wrong *type*; this catches an
+integer divided by an integer, which passes the type check yet is wrong by two decimal places.
+Together they cover what neither does alone.
 
-It is a build-failing step in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml), not an
-advisory script.
+It is a step that fails the build in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml),
+not just an advisory script.
 
 ---
 
@@ -30,15 +30,15 @@ advisory script.
 
 ### `dev_env.ps1` — always run this first
 
-Sets `REVORA_DATABASE_URL` and every local secret in the current shell. Dot-source it so the
-variables persist:
+Sets `REVORA_DATABASE_URL` and every local secret in the current shell. Dot-source it (run it with a
+leading `.`) so the variables stay set:
 
 ```powershell
 . .\scripts\dev_env.ps1
 ```
 
-Nothing in Revora has a credential default — an unresolvable secret fails loudly at the point of use
-rather than silently degrading — so most other commands fail without this.
+Nothing in Revora has a default credential. A secret that cannot be resolved fails loudly where it is
+used, instead of quietly degrading. So most other commands fail without this.
 
 ### `dev_check.py` — is the environment sane
 
@@ -46,8 +46,8 @@ rather than silently degrading — so most other commands fail without this.
 .venv\Scripts\python.exe scripts\dev_check.py
 ```
 
-Verifies the database connection, the migration revision, the crypto keys and the pipeline wiring.
-**Run this before debugging anything else** — it turns "the app is broken" into a named cause.
+Checks the database connection, the migration revision, the crypto keys and the pipeline wiring.
+**Run this before debugging anything else** — it turns "the app is broken" into a specific, named cause.
 
 ### `dev_seed.py` — create a merchant
 
@@ -55,7 +55,7 @@ Verifies the database connection, the migration revision, the crypto keys and th
 .venv\Scripts\python.exe scripts\dev_seed.py <merchant-slug>
 ```
 
-Creates a tenant and prints its operator key, which is what the dashboard sign-in wants.
+Creates a tenant and prints its operator key, which is what the dashboard sign-in asks for.
 
 ### `dev_webhook.py` — send a payment event
 
@@ -72,17 +72,17 @@ The fastest way to watch the whole pipeline run.
 .venv\Scripts\python.exe scripts\dev_webhook.py captured pay_XXXXXXXX
 ```
 
-It signs the body with the merchant's real webhook secret and POSTs it to the real endpoint, so the
-delivery traverses signature verification over raw bytes, canonicalization and dedup exactly as
-Razorpay's would.
+It signs the body with the merchant's real webhook secret and POSTs it to the real endpoint. So the
+delivery goes through signature verification over raw bytes, canonicalization and dedup exactly as a
+real Razorpay delivery would.
 
-**The two amounts are the demo.** Same code path, different decision, because the expected-value
-arithmetic says so — not because of a branch on amount.
+**The two amounts are the demo.** Same code path, different decision, because the expected-value math
+works out that way — not because of an `if` that checks the amount.
 
 ### `spikes/` — provider verification against real test-mode credentials
 
-Four scripts that measure what Razorpay **actually does**, rather than assuming it. Several design
-parameters are set from their output, and `docs/provider-findings.md` records the results.
+Four scripts that measure what Razorpay **actually does**, instead of assuming it. Several design
+parameters come from their output, and `docs/provider-findings.md` records the results.
 
 | Spike | The question it answers |
 | --- | --- |
@@ -92,7 +92,7 @@ parameters are set from their output, and `docs/provider-findings.md` records th
 | `retry_capability.py` | Can a failed payment be retried at the provider, or is it terminal |
 
 See [`spikes/README.md`](spikes/README.md) for credentials, run order and the manual steps. These are
-the `spike` test tier — never run in CI, because they make real network calls.
+the `spike` test tier. They never run in CI, because they make real network calls.
 
 ### `dev_tick.py` — drive the schedule by hand
 
@@ -102,9 +102,10 @@ the `spike` test tier — never run in CI, because they make real network calls.
 
 Runs one tick of the periodic sweeps instead of waiting for the ticker process.
 
-**Why you will need this:** nothing in Revora ticks itself. Without the ticker running, cases never
-expire, intents never reconcile, payment state is never re-read, and a case that chose restraint is
-never reviewed — **and none of that logs an error.** If something seems stuck, this is usually why.
+**Why you will need this:** nothing in Revora ticks on its own. Without the ticker running, cases
+never expire, intents never reconcile, payment state is never re-read, and a case that chose
+restraint is never reviewed — **and none of that logs an error.** If something seems stuck, this is
+usually why.
 
 ---
 

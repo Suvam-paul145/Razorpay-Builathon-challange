@@ -1,7 +1,8 @@
 # `revora/` — the backend
 
-A modular monolith. 166 modules, 23 packages, one Docker image, three process roles selected at
-runtime by `REVORA_ROLE` (`api`, `worker`, `ticker`).
+A modular monolith — one program split into separate parts, not many services. 166 modules, 23
+packages, one Docker image, and three process roles picked at runtime by `REVORA_ROLE`
+(`api`, `worker`, `ticker`).
 
 **Deep dive:** [`references/REVORA-SYSTEM-GUIDE.md`](../references/REVORA-SYSTEM-GUIDE.md) §2 *The
 Layers — A Map* and §3 *Feature-by-Feature Walkthrough*.
@@ -10,8 +11,9 @@ Layers — A Map* and §3 *Feature-by-Feature Walkthrough*.
 
 ## The one rule that shapes everything
 
-Dependencies point **downward only**, and four packages are walled off from things that would let
-them cheat. This is enforced by [`../.importlinter`](../.importlinter) in CI, not by convention.
+Dependencies point **downward only**, and four packages are blocked from reaching things that would
+let them cheat. A tool, [`../.importlinter`](../.importlinter), checks this in CI — it is not just a
+habit people follow.
 
 ```mermaid
 flowchart TD
@@ -57,7 +59,7 @@ The six contracts, all kept:
 | Contract | Why it exists |
 | --- | --- |
 | Policy engine may not reach AI, estimation, optimizer or memory | The component deciding *whether an action is permitted* cannot see a model's opinion |
-| Domain imports only the standard library | Money and state types cannot acquire a database or a network dependency |
+| Domain imports only the standard library | Money and state types cannot pull in a database or a network dependency |
 | Value optimizer may not reach AI output or the provider | Ranking cannot be influenced by a model, and cannot cause an effect |
 | Synthetic data is unreachable from the decision and action path | Generated ground truth cannot leak into the code being measured |
 | Reasoning adapter sees only platform and domain | The AI layer has no session to open and no row to read |
@@ -99,18 +101,18 @@ The six contracts, all kept:
 
 1. **[`domain/money.py`](domain/money.py)** — integer minor units, and why no `float` exists anywhere near a currency.
 2. **[`domain/transitions.py`](domain/transitions.py)** — 14 case states, 63 legal edges, and the termination proof.
-3. **[`policy/engine.py`](policy/engine.py)** — the twelve checks. A pure function, so it is exhaustively property-testable.
+3. **[`policy/engine.py`](policy/engine.py)** — the twelve checks. A pure function — it only reads its inputs and returns a value, with no database or network — so it can be property-tested exhaustively.
 4. **[`jobs/pipeline.py`](jobs/pipeline.py)** — the one layer allowed to see both rows and pure functions. Every pipeline step lives here.
 5. **[`outcome/monitor.py`](outcome/monitor.py)** — where a recovery is declared, and only from a provider read.
 
 ## Two things that surprise people
 
-- **`jobs/pipeline.py` is deliberately the fat module.** Pure components take their inputs as
-  arguments; something has to load rows and call them. Concentrating that in one place is what keeps
-  `policy/` and `optimizer/` pure enough to test exhaustively.
-- **Each pipeline step enqueues its successor inside its own transaction.** That is why the queue is
-  a Postgres table and not a broker — a broker enqueue after commit can be lost, and before commit
-  can fire against state that never committed.
+- **`jobs/pipeline.py` is the big module on purpose.** Pure components take their inputs as
+  arguments, so something has to load the rows and call them. Keeping all of that in one place is
+  what lets `policy/` and `optimizer/` stay pure enough to test exhaustively.
+- **Each pipeline step adds the next step to the queue inside its own transaction.** That is why the
+  queue is a Postgres table and not a message broker. With a broker, adding the next step after the
+  commit can lose it, and adding it before the commit can fire it against state that never got saved.
 
 ## Related
 
