@@ -1037,6 +1037,27 @@ pre {
   font-weight: 600;
 }
 
+.field__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.field__toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.field__toggle:hover {
+  color: var(--accent);
+}
+
 .field__hint {
   max-width: 56ch;
   color: var(--ink-faint);
@@ -1052,6 +1073,11 @@ pre {
   color: var(--ink);
   font-family: inherit;
   font-size: 14px;
+}
+
+.field__input::placeholder {
+  color: var(--ink-faint);
+  opacity: 0.85;
 }
 
 .radio {

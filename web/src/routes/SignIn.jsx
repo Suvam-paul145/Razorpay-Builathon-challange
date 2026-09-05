@@ -20,6 +20,7 @@ import { useSignIn } from '../api/queries'
 export function SignIn({ onSignedIn }) {
   const [merchantSlug, setMerchantSlug] = useState('')
   const [dashboardKey, setDashboardKey] = useState('')
+  const [showKey, setShowKey] = useState(false)
   const signIn = useSignIn()
 
   function submit(event) {
@@ -59,21 +60,32 @@ export function SignIn({ onSignedIn }) {
               onChange={(event) => {
                 setMerchantSlug(event.target.value)
               }}
-              placeholder="e.g. razorpay-judge"
+              placeholder="razorpay-judge"
               autoComplete="username"
               required
             />
           </label>
           <label className="field">
-            <span className="field__label">Operator key</span>
+            <div className="field__header">
+              <span className="field__label">Operator key</span>
+              <button
+                type="button"
+                className="field__toggle"
+                onClick={() => setShowKey(!showKey)}
+                tabIndex={-1}
+                aria-label={showKey ? 'Hide key' : 'Show key'}
+              >
+                {showKey ? 'Hide' : 'Show'}
+              </button>
+            </div>
             <input
               className="field__input"
-              type="password"
+              type={showKey ? 'text' : 'password'}
               value={dashboardKey}
               onChange={(event) => {
                 setDashboardKey(event.target.value)
               }}
-              placeholder="e.g. razorpay-pass"
+              placeholder="razorpay-pass"
               autoComplete="current-password"
               required
             />
@@ -92,7 +104,7 @@ export function SignIn({ onSignedIn }) {
             <span className="signin__evaluator-badge">Hackathon Evaluator</span>
           </div>
           <p className="signin__evaluator-desc">
-            Evaluating Revora? Use quick credentials supporting 5+ concurrent judges:
+            Credentials: <code>razorpay-judge</code> / <code>razorpay-pass</code> (supports 5+ concurrent judges)
           </p>
           <button
             type="button"
