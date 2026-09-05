@@ -18,6 +18,18 @@
 # the Python jobs rather than folded into one because the two need different toolchains
 # and there is no ordering between them — the SPA talks to the API over HTTP and shares
 # no code with it, only a set of DTO shapes that `web/src/api/types.ts` restates by hand.
+#
+# The customer response loop added no job and no marker. That is the point of task 54.1:
+# the five existing tiers absorb the feature, so its tests are selected by the filters
+# already written below rather than by a sixth one that would have to be kept in step.
+# What did change is small and named where it happens — the strict-typing step covers the
+# three new packages, the customer-entry router guard gets its own step beside the other
+# structural gates, and the nightly harness job now carries the Demo_Batch as well as the
+# synthetic scenarios. The `smoke` items this feature adds (the customer page and timeline
+# projection latencies, and the customer bundle's transferred size) stay outside every
+# gating selection for the reason the `smoke` marker in pyproject.toml gives; the bundle
+# one is a vitest case behind `REVORA_WEB_SMOKE`, which is the same decision in the other
+# toolchain.
 
 name: ci
 
@@ -72,11 +84,33 @@ jobs:
       - name: Strict typing on money-bearing modules
         # Widened as each phase landed. The list is every module where a wrong type
         # is a wrong amount, a wrong probability or a wrong causal claim.
+        #
+        # `customer`, `timeline` and `reasoning` joined with the customer response loop,
+        # one for each of those three failure modes: the customer page presents an amount
+        # to the person being asked to pay it, the timeline presents a server-formatted
+        # figure it must not recompute, and the reasoning adapter carries a `confidence`
+        # that is compared against two thresholds and has to answer the same way twice.
+        # They are also the three directories `scripts/check_no_float.py` gained, and the
+        # two checks are stronger together — the lexical one catches a `float` annotation
+        # mypy would accept, this one catches the type errors a grep cannot see.
         run: >-
           mypy -p revora.domain -p revora.policy -p revora.optimizer
           -p revora.providers -p revora.execution -p revora.outcome
           -p revora.memory -p revora.experiment -p revora.metrics
           -p revora.synthetic -p revora.api -p revora.cases -p revora.jobs
+          -p revora.customer -p revora.timeline -p revora.reasoning
+      - name: Customer entry router guard
+        # A structural claim rather than a behaviour, which is why it sits here beside the
+        # import contracts and not only inside the `pure` tier where it also runs. The
+        # duplication is deliberate and costs a couple of seconds: this is the check that
+        # the customer response page still ships with no router, and a red X named for it
+        # is worth more than the same failure buried in a nine-hundred-test run.
+        #
+        # The whole module runs, not a `-k` selection: the assertions on either side of the
+        # router one — the dashboard's `basename` matching `APP_PREFIX`, and `/pay/*` still
+        # 404ing on the API — are the same boundary from the other two directions, and a
+        # filter here would be a third list to keep in step with the file.
+        run: pytest tests/api/test_spa_mount.py -m pure -q
 
   test-fast:
     name: pure + model test tiers
@@ -95,6 +129,15 @@ jobs:
         # measure the hardware as much as the code, and a gate that can fail for reasons nobody can
         # act on teaches everyone to re-run the build. They are tagged rather than deleted so the
         # budgets stay written down — see the `smoke` marker in pyproject.toml.
+        #
+        # The customer response loop lands here without editing this line, which is what "no new
+        # marker" buys: the token wire format, the whole `Timeline_Reader`, the cost split, the
+        # promise clamp, the `Delay_Reason` table and the resend classification are `pure`; the
+        # Customer_Response_Service against in-memory fakes, policy invariance under arbitrary
+        # signal content, reasoning authority against a fake adapter and the extended lifecycle
+        # state machine are `model`. `--strict-markers` is on by default through pyproject's
+        # `addopts`, so a test that reaches for a sixth tier fails collection rather than running
+        # in no tier at all.
         run: pytest -m "(pure or model) and not smoke" -q
 
   dashboard:
@@ -165,6 +208,13 @@ jobs:
         # "not harness" keeps the synthetic scenarios out of this job. They need the
         # same server but they are minutes rather than seconds, and they have their
         # own two jobs below.
+        #
+        # This selection is where migration `0008` is exercised up and down, where each
+        # new constraint is shown rejecting its violation, where RLS is shown denying a
+        # cross-tenant read on all four new tables, and where the Review_Sweeper is shown
+        # using its index and deduping under two concurrent sweeps. None of those claims
+        # can be made against a fake, and all of them are about the database rather than
+        # about the feature, which is why they run on every push rather than nightly.
         env:
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
         run: pytest -m "pg and not harness and not smoke" -q
@@ -222,7 +272,22 @@ jobs:
     # minute of Postgres round-trips on its own, and because it answers a question
     # that does not change commit to commit — whether the reported interval is the
     # width it claims to be.
-    name: evidence harness (nightly)
+    #
+    # It also carries the Demo_Batch, and by marker rather than by a second selection.
+    # `-m harness` is the tier, and the design puts the Demo_Batch in it: a thousand cases
+    # seeded through the signed webhook endpoint, the customer surface driven over HTTP,
+    # the required outcome coverage asserted, gap-free audit sequences on every seeded
+    # case, and the Demonstration_Experiment reaching COMPLETED with a numeric lift and an
+    # interval. A separate job naming those files would be a filter to keep in step with
+    # the test tree, and it would answer the same question against the same server twice.
+    #
+    # "Nightly and pre-demo" is these two triggers and nothing else. `schedule` is the
+    # nightly run; `workflow_dispatch` is the pre-demo one — run it against the commit the
+    # demo is built from, because that is the only run that says anything about the demo.
+    # Verified test-mode recoveries stay out: they need real provider credentials, so they
+    # are a documented RUNBOOK.md step rather than a job that would either hold secrets or
+    # quietly skip.
+    name: evidence + Demo_Batch harness (nightly, pre-demo)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     services:
@@ -248,7 +313,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,ml]"
-      - name: Synthetic harness tier
+      - name: Harness tier (synthetic scenarios and Demo_Batch)
         env:
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
         run: pytest -m harness -q
