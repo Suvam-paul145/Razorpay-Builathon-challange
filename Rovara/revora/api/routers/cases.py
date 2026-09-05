@@ -46,6 +46,7 @@ from revora.api.views import (
     audit_document,
     case_detail,
     case_summary,
+    case_summary_reads,
     timeline_inputs,
 )
 from revora.cases.ownership import (
@@ -122,6 +123,18 @@ def list_cases(
     ``has_more`` is derived by asking for one row beyond the page rather than by counting the
     table. A ``COUNT(*)`` on every list request is a scan whose cost grows with a tenant's success,
     and the only question a client actually has is whether to offer a next-page control.
+
+    **The page's five supporting reads are issued once for the whole page, not once per row.** Each
+    summary row draws on five other tables, and reading them per row made this endpoint issue five
+    hundred statements for a hundred cases — a fan-out that arrived by composition rather than by
+    anybody writing a loop over queries. :func:`~revora.api.views.case_summary_reads` fetches all
+    five for the page and each ``case_summary`` is handed its own slice.
+
+    What deliberately did **not** change is where the choosing happens. The batch reads fetch
+    candidate rows and pick "the" recommendation, "the" diagnosis and the cycle's decisions in
+    Python, by the same rules the per-case reads use — no joins, no ``DISTINCT ON``, no window
+    functions. A join would put that choice in a second place, and a list column that disagrees with
+    the detail page it links to is worse than either being wrong alone.
     """
     page_size = min(limit or current.config.DASHBOARD_PAGE_SIZE, current.config.DASHBOARD_PAGE_SIZE)
 
@@ -139,8 +152,15 @@ def list_cases(
         )
         has_more = len(rows) > page_size
         page = rows[:page_size]
+        reads = case_summary_reads(session, current.merchant_id, page)
         cases = [
-            case_summary(session, current.merchant_id, case, config=current.config)
+            case_summary(
+                session,
+                current.merchant_id,
+                case,
+                config=current.config,
+                reads=reads[case.id],
+            )
             for case in page
         ]
 

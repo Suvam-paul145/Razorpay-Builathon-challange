@@ -123,6 +123,27 @@ def _incremental_within_timeout(
     ``METRICS_TIMEOUT``. That keeps two things true at once: the report's labels stay correct
     (nothing was established), and the rendered field says *data unavailable* rather than *not
     established* — which are different claims, and only the second one would be a lie.
+
+    **This is a second transaction and it stays one.** Folding it into the cohort read's transaction
+    to save a round trip was considered and measured, and it cannot be done without changing what
+    ``DASHBOARD_METRICS_TIMEOUT`` bounds. Three facts, all confirmed against Postgres 18 rather than
+    assumed:
+
+    * A cancelled statement aborts the transaction it ran in. Every later statement fails with
+      *current transaction is aborted*, so ``compute_metrics`` would not run at all and R14.C16's
+      *every other figure still returns* would become *the page 500s*. Keeping the cancellation
+      survivable needs a ``SAVEPOINT`` around this read.
+    * ``SET LOCAL`` inside a savepoint that is **released** does not revert with it — the value
+      persists to the end of the enclosing transaction. So on the success path ``compute_metrics``
+      would inherit this bound, and a cohort read that is merely slow would be cancelled where today
+      it completes. Undoing that needs an explicit ``RESET`` whose correct value is the connection's
+      session default, which belongs to the engine module rather than to this endpoint.
+    * The saving is negative anyway. One transaction costs one ``set_config`` for the tenant
+      binding; the collapsed version would add ``SAVEPOINT``, ``SET LOCAL``, ``RELEASE`` and
+      ``RESET`` — three more statements to remove one, for one fewer connection checkout.
+
+    So the boundary is the mechanism rather than an accident of how this was written: the timeout
+    applies to a transaction whose only contents are the reads it is allowed to cancel.
     """
     try:
         with tenant_transaction(current.merchant_id) as session:

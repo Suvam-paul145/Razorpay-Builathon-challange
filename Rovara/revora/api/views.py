@@ -34,7 +34,7 @@ arithmetic, free to disagree with the stored one.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
@@ -50,12 +50,13 @@ from revora.api.rendering import (
     rate,
     selected_action_label,
 )
-from revora.customer.arrangements import first_arrangement_request
+from revora.customer.arrangements import ArrangementRequest
 from revora.customer.suppression import scope_key_for_case
 from revora.domain.actions import CandidateAction
 from revora.domain.enums import (
     POLICY_CHECK_ORDER,
     CaseState,
+    CustomerSignalKind,
     EstimationMethod,
     SelectionReason,
     TerminalReason,
@@ -63,6 +64,7 @@ from revora.domain.enums import (
 from revora.domain.failure_taxonomy import EVIDENCE_SOURCE
 from revora.metrics.engine import CohortMetrics
 from revora.metrics.unresolved import unresolved_groups
+from revora.persistence.models import CustomerSignal, RecoveryCase
 from revora.persistence.repositories.audit import AuditRecordRepository
 from revora.persistence.repositories.cases import RecoveryCaseRepository
 from revora.persistence.repositories.consent import CustomerConsentRepository
@@ -83,7 +85,7 @@ from revora.persistence.repositories.experiments import (
 )
 from revora.persistence.repositories.policy import PolicyDecisionRepository
 from revora.persistence.repositories.recommendations import RecommendationRepository
-from revora.platform.clock import now
+from revora.platform.clock import ensure_utc, now
 from revora.timeline.stages import (
     REVIEW_DECISION_KEYS,
     AuditRecordView,
@@ -100,22 +102,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         AuditRecord,
         BaselineEstimate,
         Diagnosis,
+        ExecutionIntent,
         Experiment,
         ExperimentResult,
         PolicyCheckResult,
         PolicyDecision,
         Recommendation,
         RecommendationCandidate,
-        RecoveryCase,
+        RecoveryOutcome,
     )
     from revora.platform.config import Configuration
 
 __all__ = [
     "NULL_SELECTION_REASONS",
+    "CaseSummaryReads",
     "TimelineInputs",
     "audit_document",
     "case_detail",
     "case_summary",
+    "case_summary_reads",
     "experiment_document",
     "metrics_document",
     "timeline_inputs",
@@ -132,41 +137,167 @@ Both get the full refusal block. They are not interchangeable and the block says
 the same words for both learns nothing from either."""
 
 
+@dataclass(frozen=True, slots=True)
+class CaseSummaryReads:
+    """The five rows one summary row is built from, held as one value.
+
+    This type exists so that :func:`case_summary` can be handed its inputs instead of fetching
+    them, and so that the *fetching* is the only thing that differs between the case list and the
+    case detail. Everything downstream of it — which field is named what, which absence is a marker
+    and which is a ``None``, how the executed action is chosen — runs once, in one place, against
+    whichever of the two routes supplied the rows.
+
+    Frozen, because a read model that could amend its own inputs half way through rendering would
+    make "the same rows produce the same row" a claim about ordering rather than about data.
+
+    ``decisions`` is the decisions of **one** cycle, and which cycle is not this type's business.
+    The derivation lives in :func:`_decision_cycle`, both routes call it, and neither is allowed a
+    second opinion — see that function for why the number is not ``case.decision_cycle_count``.
+    """
+
+    recommendation: Recommendation | None
+    outcome: RecoveryOutcome | None
+    diagnosis: Diagnosis | None
+    intents: Sequence[ExecutionIntent]
+    decisions: Sequence[PolicyDecision]
+
+
+def _decision_cycle(case: RecoveryCase, recommendation: Recommendation | None) -> int:
+    """Which cycle this case's live policy decisions are filed under.
+
+    The recommendation's cycle when there is one, the case counter only when there is not. They are
+    different numbers: the counter increments when a cycle *starts*, and the optimizer writes its
+    recommendation — and everything filed beneath it — under the cycle it ran in. Reading the
+    counter finds nothing for a fully evaluated case, and finding nothing does not raise, it renders
+    as "no policy decision" on a case that has one.
+
+    One function, called by every route that needs the number, because a list column and the detail
+    page it links to disagreeing about which cycle is current is worse than either being wrong
+    alone. ``RecommendationRepository.active_decision_cycle`` answers the same question one layer
+    down, for callers that hold no recommendation yet; this is the same rule for callers that
+    already hold one, and it costs no second read.
+    """
+    if recommendation is None:
+        return int(case.decision_cycle_count)
+    return int(recommendation.decision_cycle)
+
+
+def case_summary_reads(
+    session: Session,
+    merchant_id: uuid.UUID,
+    cases: Sequence[RecoveryCase],
+) -> dict[uuid.UUID, CaseSummaryReads]:
+    """Every :class:`CaseSummaryReads` for a page of cases, in five statements total.
+
+    This is the batched half of :func:`case_summary`. Five reads for a hundred-row page rather than
+    five hundred, and the saving is entirely in the number of round trips: the same rows come back,
+    scoped to the same merchant by the same ``scoped()`` filter each singular method uses, and the
+    choosing of "which of several rows is *the* one" still happens in Python inside each repository
+    method rather than in a join, a ``DISTINCT ON`` or a window function.
+
+    **The order of the reads is load-bearing.** The policy read needs a cycle per case, and the
+    cycle comes from that case's recommendation — so the recommendations are fetched first, the
+    cycles are derived from them by :func:`_decision_cycle`, and only then are the decisions
+    fetched. That is five statements and not four, because collapsing the two into one query means
+    expressing the cycle derivation in SQL, and the derivation is the thing that has already been
+    got wrong three times in this codebase.
+
+    An empty ``cases`` issues no statements at all: every repository method below returns early on
+    an empty collection, so an empty page costs nothing rather than five queries whose answers are
+    known.
+
+    Returns a mapping keyed by case id, holding an entry for **every** case handed in — including
+    the ones with no recommendation, no outcome, no diagnosis, no attempt and no decision, whose
+    entry is a bundle of absences. A missing key would make a caller's ``get`` silently render a
+    case as though it had nothing, which is the same false-absence R14.C15 is about.
+    """
+    ids = [case.id for case in cases]
+    recommendations = RecommendationRepository(session).latest_for_cases(merchant_id, ids)
+    outcomes = RecoveryOutcomeRepository(session).for_cases(merchant_id, ids)
+    diagnoses = DiagnosisRepository(session).active_for_cases(merchant_id, ids)
+    intents = ExecutionIntentRepository(session).list_for_cases(merchant_id, ids)
+    decisions = PolicyDecisionRepository(session).for_cycles(
+        merchant_id,
+        {
+            case.id: _decision_cycle(case, recommendations.get(case.id))
+            for case in cases
+        },
+    )
+    return {
+        case.id: CaseSummaryReads(
+            recommendation=recommendations.get(case.id),
+            outcome=outcomes.get(case.id),
+            diagnosis=diagnoses.get(case.id),
+            intents=intents.get(case.id, ()),
+            decisions=decisions.get(case.id, ()),
+        )
+        for case in cases
+    }
+
+
+def _case_summary_reads(
+    session: Session, merchant_id: uuid.UUID, case: RecoveryCase
+) -> CaseSummaryReads:
+    """The same five rows for one case, as five separate reads.
+
+    The unbatched route, kept because :func:`case_summary` is called for a single case from places
+    that hold no page and should not have to build a bundle to ask for one row. :func:`case_detail`
+    is not one of them — it already holds four of these five and constructs a
+    :class:`CaseSummaryReads` from what it read.
+
+    Every read here is the singular repository method with the arguments the per-case version has
+    always passed, and the cycle comes from :func:`_decision_cycle` rather than from a second copy
+    of the rule.
+    """
+    recommendation = RecommendationRepository(session).latest_for_case(merchant_id, case.id)
+    return CaseSummaryReads(
+        recommendation=recommendation,
+        outcome=RecoveryOutcomeRepository(session).for_case(merchant_id, case.id),
+        diagnosis=DiagnosisRepository(session).active_for_case(merchant_id, case.id),
+        intents=ExecutionIntentRepository(session).list_for_case(merchant_id, case.id),
+        decisions=PolicyDecisionRepository(session).for_cycle(
+            merchant_id, case.id, _decision_cycle(case, recommendation)
+        ),
+    )
+
+
 def case_summary(
     session: Session,
     merchant_id: uuid.UUID,
     case: RecoveryCase,
     *,
     config: Configuration,
+    reads: CaseSummaryReads | None = None,
 ) -> dict[str, object]:
     """One row of the case list (R14.C2, R26.C14, R30.C13).
 
-    Deliberately a per-case read rather than one joined query. The list is bounded by
-    ``DASHBOARD_PAGE_SIZE`` — a hundred by default — and a hundred small indexed reads is a
-    cost worth paying for a list whose columns come from five tables and where a join would have to
-    pick, for each of them, which of several rows is "the" one. That choice is exactly what the
-    repository methods below already encode, and duplicating it in SQL is how a list column starts
-    disagreeing with the detail page it links to.
+    The row's columns come from five tables, and **which** of several rows is "the" recommendation,
+    "the" diagnosis or "the" decision is decided in Python by the repository methods — never by a
+    join, a ``DISTINCT ON`` or a window function. That is not a performance position, it is the
+    reason the list and the detail page cannot disagree: duplicating the choice in SQL is how a
+    list column starts contradicting the page it links to, and a column that disagrees with its own
+    detail view is worse than either being wrong alone.
+
+    What *is* a performance position is where the rows come from. ``reads`` supplies them
+    pre-fetched, and :func:`case_summary_reads` builds one bundle per case for a whole page in five
+    statements — so a hundred-row list costs five reads rather than five hundred. Omit it and this
+    function fetches its own, one case at a time, through :func:`_case_summary_reads`. **Both
+    routes render through the code below and only the code below.** A caller cannot get a different
+    row shape, a different absence marker or a different chosen action by choosing a different
+    route, because there is one renderer and the routes differ solely in how the five values were
+    obtained.
 
     ``config`` is here for one figure: the decision-cycle cap that R30.C13's *actively waiting*
     condition compares against. It is a per-merchant configured bound, so the row cannot answer it
     alone and the caller already holds the accessor.
     """
+    resolved = _case_summary_reads(session, merchant_id, case) if reads is None else reads
     currency = str(case.currency)
-    recommendation = RecommendationRepository(session).latest_for_case(merchant_id, case.id)
-    outcome = RecoveryOutcomeRepository(session).for_case(merchant_id, case.id)
-    diagnosis = DiagnosisRepository(session).active_for_case(merchant_id, case.id)
-    intents = ExecutionIntentRepository(session).list_for_case(merchant_id, case.id)
-    # Same cycle derivation as `case_detail`, for the same reason: the case counter and the cycle a
-    # decision was recorded under are not the same number, and a list column that disagreed with the
-    # detail page it links to is worse than either being wrong alone.
-    decisions = PolicyDecisionRepository(session).for_cycle(
-        merchant_id,
-        case.id,
-        int(recommendation.decision_cycle)
-        if recommendation is not None
-        else int(case.decision_cycle_count),
-    )
+    recommendation = resolved.recommendation
+    outcome = resolved.outcome
+    diagnosis = resolved.diagnosis
+    intents = resolved.intents
+    decisions = resolved.decisions
     state = str(case.state)
     selected = None if recommendation is None else str(recommendation.selected_action)
 
@@ -300,16 +431,9 @@ def case_detail(
     baseline = BaselineEstimateRepository(session).latest_for_case(merchant_id, case.id)
     recommendation = RecommendationRepository(session).latest_for_case(merchant_id, case.id)
     # The cycle to read decisions for comes from the recommendation when there is one, not from the
-    # case counter. They diverge: the counter is incremented when a cycle *starts*, and the
-    # recommendation and its policy decision are written under the cycle the optimizer ran in. Using
-    # the counter showed a fully evaluated case as having no policy decision — a false absence
-    # arriving through the read model rather than through a missing row, which is exactly the
-    # failure R14.C15 exists to prevent, one level up.
-    cycle = (
-        int(recommendation.decision_cycle)
-        if recommendation is not None
-        else int(case.decision_cycle_count)
-    )
+    # case counter. `_decision_cycle` holds that rule for every route that needs it — see there for
+    # why the counter is the wrong number and why finding nothing is the dangerous outcome.
+    cycle = _decision_cycle(case, recommendation)
     decisions = PolicyDecisionRepository(session).for_cycle(merchant_id, case.id, cycle)
     intents = ExecutionIntentRepository(session).list_for_case(merchant_id, case.id)
     reads = PaymentStateReadRepository(session).list_for_case(merchant_id, case.id)
@@ -317,9 +441,28 @@ def case_detail(
     consent = CustomerConsentRepository(session).for_customer(
         merchant_id, str(case.customer_key)
     )
+    # The summary's five rows are four of the reads above plus the outcome, so they are handed over
+    # rather than read a second time. Not only for the round trips: two reads of one table in one
+    # transaction can legitimately return different rows under `READ COMMITTED`, and a page whose
+    # header said one thing and whose summary row said another would have been reporting the gap
+    # between two instants as though it were one snapshot.
+    summary_reads = CaseSummaryReads(
+        recommendation=recommendation,
+        outcome=outcome,
+        diagnosis=diagnosis,
+        intents=intents,
+        decisions=decisions,
+    )
+    # The twelve check rows of every decision on this cycle, in one read rather than one per
+    # decision. `_policy_document` renders whichever it is given and never has to know which.
+    checks = PolicyDecisionRepository(session).check_results_for_decisions(
+        merchant_id, [decision.id for decision in decisions]
+    )
 
     return {
-        "case": case_summary(session, merchant_id, case, config=config),
+        "case": case_summary(
+            session, merchant_id, case, config=config, reads=summary_reads
+        ),
         "counters": {
             "executed_action_count": int(case.executed_action_count),
             "customer_message_count": int(case.customer_message_count),
@@ -375,7 +518,10 @@ def case_detail(
             config=config,
         ),
         "policy_decisions": [
-            _policy_document(session, merchant_id, decision) for decision in decisions
+            _policy_document(
+                session, merchant_id, decision, checks=checks.get(decision.id, ())
+            )
+            for decision in decisions
         ]
         or not_yet_recorded(state, "policy decision"),
         "executed_actions": [
@@ -828,15 +974,31 @@ named."""
 
 
 def _policy_document(
-    session: Session, merchant_id: uuid.UUID, decision: PolicyDecision
+    session: Session,
+    merchant_id: uuid.UUID,
+    decision: PolicyDecision,
+    *,
+    checks: Sequence[PolicyCheckResult] | None = None,
 ) -> dict[str, object]:
     """One policy decision and all twelve checks, in evaluation order (R14.C5).
 
     Twelve, not "the ones that ran". The evaluation order is fixed precisely so the stated reason
     cannot be an expensive or case-specific check, and a record showing fewer than twelve rows
     would be indistinguishable from an evaluation that stopped early and approved.
+
+    ``checks`` supplies the rows pre-fetched. A case can hold several decisions in one cycle — a
+    deferred one, then an approved one — so reading the check rows per decision made this a second
+    N+1 inside the case detail; the caller now reads every decision's twelve rows in one statement
+    and hands each document its own. Omit it and this function reads its own, which is what a caller
+    holding one decision and no batch does. Both routes hand the same sequence to
+    :func:`_check_documents`, so an absent row is rendered ``NOT_RECORDED`` either way rather than
+    shortening the list.
     """
-    checks = PolicyDecisionRepository(session).check_results_for(merchant_id, decision.id)
+    resolved = (
+        PolicyDecisionRepository(session).check_results_for(merchant_id, decision.id)
+        if checks is None
+        else checks
+    )
     return {
         "policy_decision_id": str(decision.id),
         "verdict": str(decision.verdict),
@@ -858,9 +1020,9 @@ def _policy_document(
             if decision.consumed_by_intent_id is None
             else str(decision.consumed_by_intent_id)
         ),
-        "checks": _check_documents(checks),
+        "checks": _check_documents(resolved),
         "expected_check_count": len(POLICY_CHECK_ORDER),
-        "recorded_check_count": len(checks),
+        "recorded_check_count": len(resolved),
     }
 
 
@@ -1227,6 +1389,87 @@ hundred suppressed cases still sees the correct count and the correct total and 
 every case listed."""
 
 
+def _cases_by_id(
+    session: Session, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+) -> dict[uuid.UUID, RecoveryCase]:
+    """Several cases by id, within one merchant, in one statement.
+
+    :meth:`~revora.persistence.repositories.base.MerchantScopedRepository.get` for a collection
+    rather than for one id, and the merchant filter is the repository's own ``scoped()`` rather than
+    a ``where`` written here — which is the point of building the statement through the repository
+    at all. A batch read that reached for ``select(RecoveryCase)`` directly would have to remember
+    the tenant clause, and a batch read that forgot it is the worst bug available on this surface.
+
+    A case id with no visible row is absent from the mapping, exactly as ``get`` returns ``None``.
+    An empty ``case_ids`` issues no statement.
+    """
+    ids = list(case_ids)
+    if not ids:
+        return {}
+    statement = RecoveryCaseRepository(session).scoped(merchant_id).where(
+        RecoveryCase.id.in_(ids)
+    )
+    return {row.id: row for row in session.execute(statement).scalars()}
+
+
+def _arrangement_requests(
+    session: Session, merchant_id: uuid.UUID, case_ids: Collection[uuid.UUID]
+) -> dict[uuid.UUID, ArrangementRequest]:
+    """:func:`~revora.customer.arrangements.first_arrangement_request` for several cases at once.
+
+    The batched form of a read that was being issued once per row of the arrangement queue. Same
+    answer per case: the **earliest** ``PARTIAL_ARRANGEMENT_REQUEST`` signal, ordered by
+    ``submitted_at`` then ``created_at`` — the earliest and not the latest, because a repeated
+    request is the same customer asking the same thing again rather than a correction, so the
+    instant that matters is when the case first became a person's problem.
+
+    The choosing is the ``setdefault`` below, in Python, against the same two sort keys the singular
+    read uses. Ordering by ``case_id`` first fixes the row order across cases without touching the
+    order within one, so the first row seen for a case is that case's ``LIMIT 1`` row.
+
+    A case with no request is absent from the mapping, matching the singular read's ``None``. An
+    empty ``case_ids`` issues no statement.
+
+    **This constructs the same record the singular read constructs, and that duplication is
+    deliberately covered by a test** rather than by care: ``tests/api/test_batched_reads.py``
+    asserts the two agree field for field on the same rows, so the day one of them starts reading a
+    different column the other one fails with it.
+    """
+    ids = list(case_ids)
+    if not ids:
+        return {}
+    statement = (
+        CustomerSignalRepository(session)
+        .scoped(merchant_id)
+        .where(
+            CustomerSignal.case_id.in_(ids),
+            CustomerSignal.kind == CustomerSignalKind.PARTIAL_ARRANGEMENT_REQUEST.value,
+        )
+        .order_by(
+            CustomerSignal.case_id,
+            CustomerSignal.submitted_at,
+            CustomerSignal.created_at,
+        )
+    )
+    earliest: dict[uuid.UUID, ArrangementRequest] = {}
+    for row in session.execute(statement).scalars():
+        earliest.setdefault(
+            row.case_id,
+            ArrangementRequest(
+                signal_id=row.id,
+                requested_at=ensure_utc(row.submitted_at),
+                note=row.delay_reason_note,
+                note_truncated=bool(row.note_truncated),
+                note_redacted_at=(
+                    None
+                    if row.note_redacted_at is None
+                    else ensure_utc(row.note_redacted_at)
+                ),
+            ),
+        )
+    return earliest
+
+
 def _suppressed_cases(
     session: Session, merchant_id: uuid.UUID, *, currency: str
 ) -> list[dict[str, object]]:
@@ -1244,12 +1487,15 @@ def _suppressed_cases(
     way to :func:`~revora.api.rendering.money`, for the reason ``unresolved_view`` gives at length:
     the browser must never divide by a hundred or pick a symbol.
     """
-    cases = RecoveryCaseRepository(session)
-    listed: list[dict[str, object]] = []
-    for suppression in ContactSuppressionRepository(session).list_in_force(
+    suppressions = ContactSuppressionRepository(session).list_in_force(
         merchant_id, limit=SUPPRESSED_CASE_LIMIT
-    ):
-        case = cases.get(merchant_id, suppression.origin_case_id)
+    )
+    cases = _cases_by_id(
+        session, merchant_id, [record.origin_case_id for record in suppressions]
+    )
+    listed: list[dict[str, object]] = []
+    for suppression in suppressions:
+        case = cases.get(suppression.origin_case_id)
         if case is None:  # pragma: no cover - RESTRICT makes the case undeletable
             continue
         listed.append(
@@ -1316,13 +1562,15 @@ def _arrangement_cases(
     and a missing row is reported as an absent note rather than as an absent request — the case
     ending for this reason is itself the record that the request happened.
     """
-    listed: list[dict[str, object]] = []
-    for case in RecoveryCaseRepository(session).list_by_terminal_reason(
+    cases = RecoveryCaseRepository(session).list_by_terminal_reason(
         merchant_id,
         TerminalReason.CUSTOMER_REQUESTED_PARTIAL_ARRANGEMENT,
         limit=ARRANGEMENT_CASE_LIMIT,
-    ):
-        request = first_arrangement_request(session, merchant_id, case.id)
+    )
+    requests = _arrangement_requests(session, merchant_id, [case.id for case in cases])
+    listed: list[dict[str, object]] = []
+    for case in cases:
+        request = requests.get(case.id)
         listed.append(
             {
                 "case_id": str(case.id),

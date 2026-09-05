@@ -56,7 +56,11 @@ from revora.audit.events import (
 )
 from revora.audit.writer import AuditEntry, AuditWriter
 from revora.persistence.repositories.config import ConfigurationRepository
-from revora.persistence.repositories.session import tenant_transaction, transaction
+from revora.persistence.repositories.session import (
+    set_tenant,
+    tenant_transaction,
+    transaction,
+)
 from revora.persistence.repositories.tenancy import merchant_by_slug
 from revora.persistence.repositories.users import (
     MerchantSessionRepository,
@@ -190,6 +194,22 @@ def authenticate(
         raise _UNAUTHENTICATED
     slug, secret = parts
 
+    digest = token_digest(secret)
+    moment = now()
+
+    # **One transaction for the whole lookup**, and it is still the *lookup* transaction the
+    # comment below the loop describes. It commits before any failure is recorded or raised, so
+    # the staleness touch on the success path persists and the failure record on the other path
+    # is written by its own transaction. Mixing the two would mean the 401 rolled back the
+    # evidence of itself — which is why there is more than one transaction here at all.
+    #
+    # The slug resolution used to have a transaction of its own, purely because it has to happen
+    # before the tenant is known and ``tenant_transaction`` binds the tenant on entry. That is a
+    # sequencing fact, not a boundary requirement: ``merchant`` is the tenant table and carries no
+    # tenant scope, so reading it before ``set_tenant`` is exactly what the previous untenanted
+    # transaction did. Binding the tenant in the middle of the transaction — ``SET LOCAL``, so it
+    # still reverts at commit and cannot ride a pooled connection into the next borrower — gets
+    # the same two reads in one round trip and one connection checkout instead of two.
     with transaction() as session:
         merchant = merchant_by_slug(session, slug)
         if merchant is None:
@@ -203,13 +223,11 @@ def authenticate(
         default_currency = str(merchant.default_currency)
         reporting_timezone = str(merchant.reporting_timezone)
 
-    digest = token_digest(secret)
-    moment = now()
+        # Every read past this point is tenant-scoped, and the RLS policies are what make that
+        # more than a convention. Set before the first of them, never before the slug lookup,
+        # because until the slug resolves there is no tenant to name.
+        set_tenant(session, merchant_id)
 
-    # The lookup transaction commits before any failure is recorded or raised, so ``touch`` on the
-    # success path persists and the failure record on the other path is written by its own
-    # transaction. Mixing the two would mean the 401 rolled back the evidence of itself.
-    with tenant_transaction(merchant_id) as session:
         config = ConfigurationRepository(session).load(merchant_id)
         sessions = MerchantSessionRepository(session)
         live = sessions.live_by_digest(merchant_id, digest, moment=moment)
@@ -218,7 +236,7 @@ def authenticate(
             verified = None
         else:
             refusal = None
-            sessions.touch(merchant_id, live.id, moment=moment)
+            sessions.touch_if_stale(merchant_id, live, moment=moment)
             verified = AuthenticatedSession(
                 session_id=live.id,
                 merchant_id=merchant_id,
@@ -316,6 +334,11 @@ def mint_session(
     """
     when = moment or now()
 
+    # The slug lookup, the key check and the user resolution share one read-only transaction, for
+    # the same reason they do in :func:`authenticate`: the slug has to resolve before there is a
+    # tenant to bind, which is a sequencing constraint rather than a transaction boundary. The
+    # boundary that *is* required is the one after this block — a refusal is audited in its own
+    # transaction rather than rolled back by the raise that follows it.
     with transaction() as session:
         merchant = merchant_by_slug(session, merchant_slug)
         if merchant is None:
@@ -324,18 +347,16 @@ def mint_session(
         merchant_id = merchant.id
         resolved_slug = str(merchant.slug)
 
-    try:
-        keys = get_secret_store().dashboard_keys(resolved_slug)
-    except CredentialUnavailableError:
-        # A merchant with no configured dashboard key is unreachable rather than open. Logged
-        # rather than audited as an authentication failure, because it is a deployment fault and
-        # counting it as an auth failure would bury the real ones.
-        _logger.error("no dashboard key configured for merchant", merchant_slug=resolved_slug)
-        raise _UNAUTHENTICATED from None
+        try:
+            keys = get_secret_store().dashboard_keys(resolved_slug)
+        except CredentialUnavailableError:
+            # A merchant with no configured dashboard key is unreachable rather than open. Logged
+            # rather than audited as an authentication failure, because it is a deployment fault
+            # and counting it as an auth failure would bury the real ones.
+            _logger.error("no dashboard key configured for merchant", merchant_slug=resolved_slug)
+            raise _UNAUTHENTICATED from None
 
-    # Configuration and the two refusals are resolved in a read-only transaction, so a refusal can
-    # be audited in its own transaction rather than rolled back by the raise that follows it.
-    with tenant_transaction(merchant_id) as session:
+        set_tenant(session, merchant_id)
         config = ConfigurationRepository(session).load(merchant_id)
         if not verify_dashboard_key(presented_key or "", keys):
             refusal: str | None = "dashboard key did not verify"

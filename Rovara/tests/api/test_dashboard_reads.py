@@ -48,6 +48,7 @@ from revora.audit.events import (
 from revora.domain.enums import POLICY_CHECK_ORDER
 from revora.domain.money import Minor, format_minor
 from revora.jobs.worker import run_once
+from revora.persistence.repositories.config import invalidate_configuration_cache
 from tests.api.conftest import WEBHOOK_SECRET, Tenant, insert_case
 
 pytestmark = pytest.mark.pg
@@ -545,6 +546,12 @@ def test_a_metrics_timeout_degrades_one_figure_and_keeps_its_caveat(
             ),
             {"m": str(tenant.merchant_id)},
         )
+    # Configuration is memoized per merchant with a short TTL, and ``_drive_pipeline`` above has
+    # already made authenticated requests, so this merchant's configuration is cached. Every
+    # writer of an ``app_config`` row has to say so, and this test is one — without the call the
+    # request below would read the pre-insert bound and this test would silently pass through its
+    # opportunistic skip rather than exercising the degradation path at all.
+    invalidate_configuration_cache(tenant.merchant_id)
 
     body = client.get("/metrics/summary", headers=tenant.auth).json()
     if body["incremental_available"]:

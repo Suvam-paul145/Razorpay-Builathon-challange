@@ -36,14 +36,12 @@ import { Timeline } from '../components/Timeline'
 export function CaseDetail() {
   const { caseId = '' } = useParams()
   const query = useCaseDetail(caseId)
-  // Started here rather than inside `AuditPanel`, and the only reason is when it starts. Called from
-  // the panel it could not begin until the detail read had resolved, because the early returns below
-  // mean the panel is not mounted while the detail is pending — so the two reads ran nose-to-tail and
-  // the reader waited for their sum. Hoisted, they run alongside each other and the reader waits for
-  // the slower one. The panel's own pending and error rendering is unchanged; it reads this query
-  // instead of owning it, which is why the arrangement R11.C5 describes still holds — a failed trail
-  // is still a failed panel and not a failed page.
-  const auditQuery = useAuditTrail(caseId)
+  // Started here rather than inside `AuditPanel`, and the position is the whole point. A hook called
+  // in the panel cannot run until the panel mounts, and the panel does not mount until the detail
+  // query has resolved past the early returns below — so the reader waited for one round trip and
+  // then, having seen the page appear, waited again for the trail. Both requests now leave together.
+  // The result is passed down whole and `AuditPanel` still renders every state it always did.
+  const audit = useAuditTrail(caseId)
 
   if (query.isPending) return <Loading what="the case" />
   if (query.isError) return <Failure error={query.error} what="the case" />
@@ -79,7 +77,7 @@ export function CaseDetail() {
       <PolicyPanel detail={detail} />
       <ExecutionPanel detail={detail} />
       <OutcomePanel detail={detail} />
-      <AuditPanel query={auditQuery} />
+      <AuditPanel query={audit} />
     </div>
   )
 }
@@ -952,12 +950,9 @@ function OutcomePanel({ detail }) {
 // The trail (R11.C5)
 // ---------------------------------------------------------------------------
 
-/**
- * @param {object} props
- * @param {object} props.query the `useAuditTrail` result, owned by `CaseDetail` so the read starts in
- *   parallel with the detail read rather than behind it. Every branch below is the same branch this
- *   panel rendered when it called the hook itself.
- */
+// The trail query lives in `CaseDetail` so it runs alongside the detail read instead of behind it.
+// This panel is handed the result and renders its own pending, error and empty states from it, so
+// the trail still fails on its own without touching any other section (R26.C10).
 function AuditPanel({ query }) {
   return (
     <Panel
