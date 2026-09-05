@@ -1,8 +1,10 @@
 """The API entrypoint. ``python -m revora.api.main``, which is what the container runs.
 
 Thin on purpose. Everything interesting is in :func:`revora.api.app.create_app`, and this module's
-only job is to decide the three things that are properties of the *process* rather than of the
-application: which port, how many workers, and where CORS origins come from.
+only job is to decide the four things that are properties of the *process* rather than of the
+application: which port, how many workers, where CORS origins come from, and whether the SQL tracer
+is running. The tracer is on this list rather than in the app factory for the same reason the worker
+count is — see :func:`install_sql_trace`.
 
 ``module:factory`` is passed to uvicorn as a string rather than an app object, because that is what
 lets ``--workers`` fork: uvicorn imports the factory in each child, and handing it an already-built
@@ -18,14 +20,17 @@ visible rather than hidden inside one.
 from __future__ import annotations
 
 import os
+import time
 from typing import Final
 
 import uvicorn
+from fastapi import FastAPI, Request
 
 from revora.api.app import create_app
+from revora.platform import sqltrace
 from revora.platform.logging import get_logger
 
-__all__ = ["cors_origins", "main", "make_app"]
+__all__ = ["cors_origins", "install_sql_trace", "main", "make_app"]
 
 _logger = get_logger(__name__)
 
@@ -65,9 +70,72 @@ def cors_origins(environ: dict[str, str] | None = None) -> tuple[str, ...]:
     return origins
 
 
+def install_sql_trace(app: FastAPI) -> bool:
+    """Wire the SQL tracer onto ``app``, if ``REVORA_SQL_TRACE`` asks for it.
+
+    Both halves of the tracer are decided by one call to
+    :func:`revora.platform.sqltrace.install`, and that is on purpose: a counter with the cursor
+    listeners attached but no request boundary would accumulate statements into a scope nobody ever
+    closes, and a request boundary with no listeners would log three zeroes. One env read, one
+    branch, so the two cannot disagree.
+
+    Wired here rather than inside :func:`revora.api.app.create_app` because the tracer is a property
+    of the *process* — like the port and the worker count, and unlike anything on the API surface. A
+    test that builds an application to assert on a response body has no interest in a timing log
+    line, and the endpoints' behaviour must not depend on whether the diagnostic is on.
+
+    **The trace line carries no correlation id, and that is the cost of wiring it here.** Starlette
+    treats the last-added middleware as the outermost, so this one wraps ``create_app``'s
+    correlation middleware rather than sitting inside it, and the id is only bound further in. The
+    trade is deliberate: from out here the wall time includes every middleware the request actually
+    passed through, which is the number somebody comparing against a browser's timing panel wants.
+    A trace line that could be joined to the audit records of the request it measured would be worth
+    more, and getting it means adding the middleware inside ``create_app`` — which is the version to
+    write if the tracer ever stops being a measurement tool and starts being something operators
+    read.
+
+    Nothing about the response changes. No header, no status, no body: the numbers leave through the
+    log stream only, because a timing field on a response is a field a client starts depending on.
+
+    Returns:
+        Whether the tracer was wired. ``False`` is the default and means no listener is attached
+        anywhere in this process.
+    """
+    if not sqltrace.install():
+        return False
+
+    @app.middleware("http")
+    async def _sql_trace(request: Request, call_next):  # type: ignore[no-untyped-def]
+        """Count this request's statements, its DB time and its wall time, and log once.
+
+        The scope is opened on the event loop thread and the counters are mutated in the worker
+        thread the sync handler runs in. That works because the context var holds a mutable object
+        rather than a number — see :class:`revora.platform.sqltrace.SqlTrace`.
+        """
+        started = time.perf_counter_ns()
+        with sqltrace.trace_scope() as trace:
+            response = await call_next(request)
+            wall_nanoseconds = time.perf_counter_ns() - started
+            _logger.info(
+                "sql trace",
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                sql_statements=trace.statements,
+                sql_micros=trace.db_micros,
+                wall_micros=wall_nanoseconds // 1_000,
+            )
+            return response
+
+    _logger.info("sql trace enabled", env_var=sqltrace.ENV_SQL_TRACE)
+    return True
+
+
 def make_app() -> object:
     """The factory uvicorn imports in each worker process."""
-    return create_app(cors_origins=cors_origins())
+    app = create_app(cors_origins=cors_origins())
+    install_sql_trace(app)
+    return app
 
 
 def main() -> None:

@@ -31,7 +31,6 @@ what makes it findable.
 
 from __future__ import annotations
 
-import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -45,11 +44,7 @@ from revora.api import webhooks
 from revora.api.routers import cases, consent, experiments, health, metrics, sessions
 from revora.api.routers.customer import CUSTOMER_MOUNT, build_customer_app
 from revora.api.spa import mount_spa
-from revora.persistence.repositories.engine import (
-    get_engine,
-    sql_trace_enabled,
-    sql_trace_scope,
-)
+from revora.persistence.repositories.engine import get_engine
 from revora.persistence.repositories.schema import EXPECTED_REVISION, verify_schema_revision
 from revora.platform.logging import correlation_context, get_logger
 
@@ -185,46 +180,6 @@ def create_app(
     # Nothing is mounted when `web/dist` does not exist, so an API-only deployment is unaffected.
     if serve_dashboard:
         mount_spa(app)
-
-    # The per-request half of the SQL tracer. Registered only when `REVORA_SQL_TRACE` is on, and
-    # `build_engine` reads the same variable to decide whether to attach its cursor listeners — so
-    # off means no middleware here and no hook there, rather than a hook that returns early.
-    #
-    # Added *before* `_correlate` so that it ends up inside it: Starlette treats the last-added
-    # middleware as the outermost, and a trace line emitted outside the correlation context would
-    # carry `correlation_id: unset` and be unjoinable to the audit records of the request it
-    # measured.
-    #
-    # Nothing about the response is touched. No header, no status, no body — the numbers leave
-    # through the log stream only, because a timing field on a response is a field a client can
-    # start depending on.
-    if sql_trace_enabled():
-
-        @app.middleware("http")
-        async def _sql_trace(request: Request, call_next):  # type: ignore[no-untyped-def]
-            """Count this request's statements, its DB time and its wall time; log once.
-
-            The scope is opened here and the accumulator is mutated in the worker thread the
-            sync handler runs in. That works because the context var holds a mutable object
-            rather than a number — see ``SqlTrace``.
-
-            Integers throughout, microseconds, no division into fractions: ``revora.api`` is a
-            no-float module and a duration is not the place to make an exception.
-            """
-            started = time.perf_counter_ns()
-            with sql_trace_scope() as trace:
-                response = await call_next(request)
-                wall_nanoseconds = time.perf_counter_ns() - started
-                _logger.info(
-                    "sql trace",
-                    method=request.method,
-                    path=request.url.path,
-                    status_code=response.status_code,
-                    sql_statements=trace.statements,
-                    sql_micros=trace.db_nanoseconds // 1_000,
-                    wall_micros=wall_nanoseconds // 1_000,
-                )
-                return response
 
     @app.middleware("http")
     async def _correlate(request: Request, call_next):  # type: ignore[no-untyped-def]
