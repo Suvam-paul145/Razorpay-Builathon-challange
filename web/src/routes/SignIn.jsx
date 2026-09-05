@@ -34,6 +34,11 @@ export function SignIn({ onSignedIn }) {
     )
   }
 
+  function fillJudgeCredentials() {
+    setMerchantSlug('razorpay-judge')
+    setDashboardKey('razorpay-pass')
+  }
+
   return (
     <main className="signin">
       <div className="signin__card">
@@ -54,6 +59,7 @@ export function SignIn({ onSignedIn }) {
               onChange={(event) => {
                 setMerchantSlug(event.target.value)
               }}
+              placeholder="e.g. razorpay-judge"
               autoComplete="username"
               required
             />
@@ -67,6 +73,7 @@ export function SignIn({ onSignedIn }) {
               onChange={(event) => {
                 setDashboardKey(event.target.value)
               }}
+              placeholder="e.g. razorpay-pass"
               autoComplete="current-password"
               required
             />
@@ -79,6 +86,22 @@ export function SignIn({ onSignedIn }) {
             {signIn.isPending ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
+
+        <div className="signin__evaluator">
+          <div className="signin__evaluator-header">
+            <span className="signin__evaluator-badge">Hackathon Evaluator</span>
+          </div>
+          <p className="signin__evaluator-desc">
+            Evaluating Revora? Use quick credentials supporting 5+ concurrent judges:
+          </p>
+          <button
+            type="button"
+            className="button button--secondary button--wide signin__evaluator-btn"
+            onClick={fillJudgeCredentials}
+          >
+            Fill Evaluator Credentials (<code>razorpay-judge</code>)
+          </button>
+        </div>
 
         {signIn.isError && (
           <p className="status status--error" role="alert">

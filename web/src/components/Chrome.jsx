@@ -66,9 +66,10 @@ export function Panel({ title, subtitle, aside, children }) {
 /** @param {{ what: string }} props */
 export function Loading({ what }) {
   return (
-    <p className="status status--loading" role="status">
-      Loading {what}…
-    </p>
+    <div className="status status--loading" role="status">
+      <span className="spinner" aria-hidden="true" />
+      <span className="status__text">Loading {what}…</span>
+    </div>
   )
 }
 

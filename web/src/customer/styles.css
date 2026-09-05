@@ -65,7 +65,30 @@ body {
 }
 
 .cp__loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   color: var(--cp-ink-soft);
+  padding: 32px 0;
+  font-size: 14px;
+}
+
+.cp__loading::before {
+  content: '';
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--cp-line);
+  border-top-color: var(--cp-accent, #1c4f3f);
+  border-radius: 50%;
+  animation: cp-spin 0.75s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  flex-shrink: 0;
+}
+
+@keyframes cp-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* --- the case ------------------------------------------------------------- */

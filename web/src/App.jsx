@@ -8,6 +8,7 @@
 
 import { useState } from 'react'
 import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { useIsFetching } from '@tanstack/react-query'
 
 import { clearToken, storedToken } from './api/client'
 import { CaseDetail } from './routes/CaseDetail'
@@ -20,19 +21,24 @@ import { Unresolved } from './routes/Unresolved'
 
 export function App() {
   const [signedIn, setSignedIn] = useState(() => storedToken() !== null)
+  const isFetching = useIsFetching()
 
   if (!signedIn) {
     return (
-      <SignIn
-        onSignedIn={() => {
-          setSignedIn(true)
-        }}
-      />
+      <>
+        {isFetching > 0 && <div className="top-loader" aria-hidden="true" />}
+        <SignIn
+          onSignedIn={() => {
+            setSignedIn(true)
+          }}
+        />
+      </>
     )
   }
 
   return (
     <div className="shell">
+      {isFetching > 0 && <div className="top-loader" aria-hidden="true" />}
       <Nav
         onSignOut={() => {
           clearToken()
