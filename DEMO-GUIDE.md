@@ -109,7 +109,13 @@ Sign in at the dashboard link with the slug and key above. You land on **Perform
 
 **Do:** Open the Vercel link: https://razorpay-builathon-challange.vercel.app/
 
-You'll see a "not found" style page — **this is correct**. The page only works when opened from a real payment link that carries a one-time token (the URL a customer receives looks like `.../pay/<token>`).
+You'll see a "not found" style page — **this is correct**. The page only works when opened from a real payment link carrying a one-time token. The URL a customer receives looks like:
+
+```
+https://razorpay-builathon-challange.vercel.app/pay/default-merchant/rvc_<26 chars>.<22 chars>
+```
+
+The token sits in the **path**, never a query string, so it stays out of `Referer` headers and analytics.
 
 **Say:**
 > "This is the page a customer opens from the payment message. It shows the amount and reason, a pay button, and lets them tell us *why* it's late or promise a date. It's a completely separate deployment from the dashboard — a payer never receives the admin app. It discloses exactly eight fields and nothing else: no internal probabilities, no costs, no other customer's data."

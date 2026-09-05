@@ -7,6 +7,57 @@ the money that came back *because of it* from the money that would have come bac
 
 That last separation is the product. Everything else is plumbing in service of it.
 
+**Live:** [dashboard](https://revora-api-h3aj.onrender.com/app) ·
+[customer page](https://razorpay-builathon-challange.vercel.app/) ·
+[API health](https://revora-api-h3aj.onrender.com/health)
+
+---
+
+## Start here
+
+Pick the door that matches why you came:
+
+| You want to… | Read |
+| --- | --- |
+| **See it working in 5 minutes** | [`DEMO-GUIDE.md`](DEMO-GUIDE.md) — a click-through script with the live links |
+| **Run it locally** | [`RUNBOOK.md`](RUNBOOK.md) — four terminals, copy-pasteable |
+| **Understand the argument** | This file. Start with *The problem* below, then *Three rules the code enforces structurally* |
+| **Understand it at a low level** | [`references/REVORA-SYSTEM-GUIDE.md`](references/REVORA-SYSTEM-GUIDE.md) — a 220 KB walkthrough: layer map, feature-by-feature, one payment traced end to end, glossary |
+| **Read the backend** | [`revora/README.md`](revora/README.md) — package map and the six import contracts |
+| **Check how it's proven** | [`tests/README.md`](tests/README.md) — six test tiers and the tests worth reading |
+| **Read the frontends** | [`web/README.md`](web/README.md) — two bundles, and why lint guards money instead of types |
+| **Read the schema** | [`alembic/README.md`](alembic/README.md) — 18 migrations and why downgrades refuse |
+| **Use the dev tools** | [`scripts/README.md`](scripts/README.md) — send a webhook, drive the schedule, seed a merchant |
+| **See what was verified about Razorpay** | [`docs/provider-findings.md`](docs/provider-findings.md) — measured provider behaviour, not assumed |
+| **Read the requirements and design** | [`.kiro/specs/`](.kiro/specs/) — two specs, with `[ASSUMPTION]` / `[EVIDENCE INSUFFICIENT]` tags intact |
+| **See the decisions and the mistakes** | [`EXECUTION-LEDGER.md`](EXECUTION-LEDGER.md) — every ruling, including the ones that were wrong first |
+| **See the original brief** | [`references/problem statement.png`](references/problem%20statement.png) |
+
+### Repository map
+
+```mermaid
+flowchart LR
+    subgraph code["Code"]
+        R["revora/<br/><i>backend, 23 packages</i>"]
+        W["web/<br/><i>dashboard + customer page</i>"]
+        A["alembic/<br/><i>18 migrations</i>"]
+        T["tests/<br/><i>~1400 tests, 6 tiers</i>"]
+        S["scripts/<br/><i>dev tools + 1 CI gate</i>"]
+    end
+    subgraph docs["Docs"]
+        RM["README.md<br/><i>the argument</i>"]
+        DG["DEMO-GUIDE.md<br/><i>how to present</i>"]
+        RB["RUNBOOK.md<br/><i>how to run</i>"]
+        SG["references/<br/>REVORA-SYSTEM-GUIDE.md<br/><i>the deep dive</i>"]
+        SP[".kiro/specs/<br/><i>requirements + design</i>"]
+        EL["EXECUTION-LEDGER.md<br/><i>decisions</i>"]
+    end
+    RM --> DG & RB & SG & SP & EL
+    R --> A
+    T --> R
+    W --> R
+```
+
 ---
 
 ## The problem, and why the obvious version of it is wrong
@@ -188,6 +239,34 @@ signed payment.failed webhook
   → memory observation written, atomically with the terminal transition
   → metrics
 ```
+
+The same thing as a state machine, with the parts that make it terminate:
+
+```mermaid
+stateDiagram-v2
+    [*] --> DETECTED
+    DETECTED --> DIAGNOSED
+    DIAGNOSED --> DECISION_PENDING
+    DECISION_PENDING --> POLICY_CHECK
+    POLICY_CHECK --> ACTION_SCHEDULED : approved, needs provider
+    POLICY_CHECK --> BLOCKED : a check said no
+    ACTION_SCHEDULED --> EXECUTING
+    EXECUTING --> WAITING_FOR_OUTCOME : effect confirmed
+    WAITING_FOR_OUTCOME --> RECOVERED : authoritative read says captured
+    WAITING_FOR_OUTCOME --> DECISION_PENDING : re-decide, +1 cycle
+    POLICY_CHECK --> DECISION_PENDING : review, restraint revisited, +1 cycle
+    POLICY_CHECK --> STOPPED : cycle budget spent
+    DECISION_PENDING --> ESCALATED : hand to a person
+    DETECTED --> EXPIRED : window elapsed
+    RECOVERED --> [*]
+    STOPPED --> [*]
+    BLOCKED --> [*]
+    EXPIRED --> [*]
+    ESCALATED --> [*]
+```
+
+*Simplified — the real table has 63 edges. `FAILED` and the verified-capture shortcuts from every
+non-terminal state are omitted for readability.*
 
 Fourteen case states, six of them terminal (`RECOVERED`, `STOPPED`, `BLOCKED`, `EXPIRED`,
 `ESCALATED`, `FAILED`), 63 legal edges, and nothing else. Every transition writes the new state, the
@@ -524,6 +603,10 @@ web/             two frontends: React 18 + Vite + TanStack Query, plain JavaScri
   dist/          the dashboard bundle          (built, never committed)
   dist-customer/ the customer page bundle      (built, never committed)
 ```
+
+Each of those directories has its own README with a map and the reasoning behind its layout:
+[`revora/`](revora/README.md) · [`web/`](web/README.md) · [`tests/`](tests/README.md) ·
+[`alembic/`](alembic/README.md) · [`scripts/`](scripts/README.md).
 
 166 source files, 23 top-level packages, 18 migrations. Six import contracts, all kept:
 
