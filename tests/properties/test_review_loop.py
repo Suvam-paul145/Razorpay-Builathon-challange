@@ -389,6 +389,7 @@ def test_p65_no_trigger_produces_a_second_cycle_while_one_is_unapplied(
 @pytest.mark.pg
 def test_p65_repeated_sweep_passes_over_an_unchanged_case_enqueue_one_cycle(
     owner_engine: Engine,
+    factory: sessionmaker[Session],
 ) -> None:
     """**Property 65**, clause one through the sweeper rather than through the enqueue.
 
@@ -407,7 +408,7 @@ def test_p65_repeated_sweep_passes_over_an_unchanged_case_enqueue_one_cycle(
         merchant_id = insert_merchant(owner_engine, display_name="Review sweep repeat")
         case_id = _seed_case_due_for_review(owner_engine, merchant_id, moment=clock.now())
 
-        counts = [sweep_due_reviews(merchant_id) for _ in range(4)]
+        counts = [sweep_due_reviews(merchant_id, factory=factory) for _ in range(4)]
 
         assert counts == [1, 0, 0, 0], (
             f"four sweeps over an unchanged case enqueued {counts}; R30.C9 allows one in total"

@@ -250,12 +250,12 @@ def beta_cdf(x: Decimal, alpha: int, beta: int) -> Decimal:
     trials = alpha + beta - 1
     with localcontext() as context:
         context.prec = WORKING_PRECISION
-        # Sum whichever tail has fewer terms. The lower form sums beta terms and
-        # the complement sums alpha, and they are equal identically, so taking the
-        # shorter one is free accuracy-wise and halves the worst case.
-        if beta <= alpha:
-            return +_upper_binomial_tail(x, trials=trials, first=alpha)
-        return +(_ONE - _upper_binomial_tail(_ONE - x, trials=trials, first=beta))
+        tail = +_upper_binomial_tail(x, trials=trials, first=alpha)
+        if tail > _ONE:
+            return _ONE
+        if tail < _ZERO:
+            return _ZERO
+        return tail
 
 
 def _upper_binomial_tail(x: Decimal, *, trials: int, first: int) -> Decimal:

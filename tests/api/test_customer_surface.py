@@ -1249,7 +1249,9 @@ def test_customer_origins_accepts_an_explicit_list_and_an_absent_variable() -> N
     )
 
 
-def test_require_tls_defaults_off_and_refuses_cleartext_when_on() -> None:
+def test_require_tls_defaults_off_and_refuses_cleartext_when_on(
+    installed_engine: Engine,
+) -> None:
     """R29.C5, and why the flag defaults off.
 
     With it on, every request whose forwarded protocol is not ``https`` is refused — including a

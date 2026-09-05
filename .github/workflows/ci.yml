@@ -212,6 +212,7 @@ jobs:
         # can be made against a fake, and all of them are about the database rather than
         # about the feature, which is why they run on every push rather than nightly.
         env:
+          REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
         run: pytest -m "pg and not harness and not smoke" -q
 
@@ -257,6 +258,7 @@ jobs:
         # reporting success over an empty selection. Do not add `continue-on-error`
         # here — a warning-only build gate is not a build gate.
         env:
+          REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
         run: >-
           pytest tests/synthetic/test_scenarios.py -m harness -q
@@ -311,5 +313,6 @@ jobs:
           pip install -e ".[dev,ml]"
       - name: Harness tier (synthetic scenarios and Demo_Batch)
         env:
+          REVORA_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
           REVORA_TEST_DATABASE_URL: postgresql+psycopg://revora:revora_ci@localhost:5432/revora
         run: pytest -m harness -q
