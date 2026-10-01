@@ -37,9 +37,9 @@ on:
   push:
     branches: ["**"]
   pull_request:
-  schedule:
-    # Nightly, after most working days in IST. The harness tier is slow, not urgent.
-    - cron: "0 19 * * *"
+  # schedule:
+  #   # Nightly, after most working days in IST. The harness tier is slow, not urgent.
+  #   - cron: "0 19 * * *"
   workflow_dispatch:
 
 # Every Postgres service below pins postgres:18 to match docker-compose and the managed
